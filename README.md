@@ -1,4 +1,40 @@
-# Score Entropy Discrete Diffusion
+# SEDD SFT on s1K-1.1
+
+This fork adds `sft_pipeline/` for matched QA/QAR supervised fine-tuning experiments on `simplescaling/s1K-1.1`, while keeping the original SEDD training code intact.
+
+## SFT Pipeline
+
+Generate matched local QA/QAR datasets:
+
+```bash
+python sft_pipeline/data_process.py
+```
+
+If the server is offline, pass a local Hugging Face Arrow cache file:
+
+```bash
+python sft_pipeline/data_process.py --arrow /path/to/s1_k-1.1-train.arrow
+```
+
+Preview training commands:
+
+```bash
+python sft_pipeline/pipeline.py --dataset QA --steps 20 --length 256 --batch-size 2
+python sft_pipeline/pipeline.py --dataset QAR --steps 20 --length 512 --batch-size 1
+```
+
+Run training:
+
+```bash
+python sft_pipeline/pipeline.py --dataset QA --steps 20 --length 256 --batch-size 2 --execute
+python sft_pipeline/pipeline.py --dataset QAR --steps 20 --length 512 --batch-size 1 --execute
+```
+
+The main comparison is QA vs QAR under the same train/validation split. The primary evaluation signal is validation Score Entropy loss and generation stability, not mathematical answer accuracy.
+
+---
+
+# Original Score Entropy Discrete Diffusion
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 This repo contains a PyTorch implementation for the paper [Discrete Diffusion Modeling by Estimating the Ratios of the Data Distribution
