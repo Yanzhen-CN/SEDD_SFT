@@ -1,0 +1,22 @@
+data:
+  build: true
+  arrow_path: null
+  valid_ratio: 0.05
+  seed: 42
+
+run:
+  dataset: QA
+  steps: 200
+  length: 256
+  batch_size: 2
+  execute: true
+
+sedd:
+  ngpus: 1
+  model: small
+  graph: absorb
+  noise: loglinear
+  accum: 1
+  snapshot_sampling: false
+  perplexity: false
+  cache_dir: sft_pipeline/cache

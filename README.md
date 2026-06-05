@@ -4,30 +4,32 @@ This fork adds `sft_pipeline/` for matched QA/QAR supervised fine-tuning experim
 
 ## SFT Pipeline
 
-Generate matched local QA/QAR datasets:
+Edit the config:
+
+```bash
+vim sft_pipeline/sft_config.yaml
+```
+
+Run data processing and SFT from one entry point:
+
+```bash
+python sft_pipeline/run_sft.py --config sft_pipeline/sft_config.yaml
+```
+
+Preview without launching training:
+
+```bash
+python sft_pipeline/run_sft.py --config sft_pipeline/sft_config.yaml --dry-run
+```
+
+If the server is offline, set `data.arrow_path` in `sft_config.yaml` to a local Hugging Face Arrow cache file.
+
+Advanced manual commands:
 
 ```bash
 python sft_pipeline/data_process.py
-```
-
-If the server is offline, pass a local Hugging Face Arrow cache file:
-
-```bash
-python sft_pipeline/data_process.py --arrow /path/to/s1_k-1.1-train.arrow
-```
-
-Preview training commands:
-
-```bash
 python sft_pipeline/pipeline.py --dataset QA --steps 20 --length 256 --batch-size 2
 python sft_pipeline/pipeline.py --dataset QAR --steps 20 --length 512 --batch-size 1
-```
-
-Run training:
-
-```bash
-python sft_pipeline/pipeline.py --dataset QA --steps 20 --length 256 --batch-size 2 --execute
-python sft_pipeline/pipeline.py --dataset QAR --steps 20 --length 512 --batch-size 1 --execute
 ```
 
 The main comparison is QA vs QAR under the same train/validation split. The primary evaluation signal is validation Score Entropy loss and generation stability, not mathematical answer accuracy.
