@@ -5,7 +5,7 @@ data:
   seed: 42
 
 run:
-  # Use "all", a single name like "QA", or a list like ["QA", "QAR"].
+  # Use "all", a single name like "QA", "QAR", or a list like ["QA", "QAR"].
   selected: all
   # If true, selected runs are launched at the same time.
   # For parallel runs, set different cuda_visible_devices when sharing one server.
@@ -14,8 +14,8 @@ run:
 
 defaults:
   steps: 200
-  length: 256
-  batch_size: 2
+  length: 512
+  batch_size: 1
   log_freq: 10
   eval_freq: 50
   snapshot_freq: 200
@@ -23,14 +23,10 @@ defaults:
 runs:
   QA:
     dataset: QA
-    length: 256
-    batch_size: 2
     cuda_visible_devices: "0"
 
   QAR:
     dataset: QAR
-    length: 512
-    batch_size: 1
     cuda_visible_devices: "1"
 
 sedd:
