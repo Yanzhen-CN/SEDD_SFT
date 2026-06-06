@@ -6,19 +6,19 @@ data:
 
 run:
   # Use "all", a single name like "QA", "QAR", or a list like ["QA", "QAR"].
-  selected: all
+  selected: QAR
   # If true, selected runs are launched at the same time.
   # For parallel runs, set different cuda_visible_devices when sharing one server.
-  parallel: true
+  parallel: false
   execute: true
 
 defaults:
-  steps: 200
+  steps: 1000
   length: 512
   batch_size: 1
-  log_freq: 10
-  eval_freq: 50
-  snapshot_freq: 200
+  log_freq: 20
+  eval_freq: 100
+  snapshot_freq: 500
 
 runs:
   QA:
@@ -32,11 +32,8 @@ runs:
 sedd:
   ngpus: 1
   # Pretrained weights must match the architecture name below.
-  # For medium, change both lines to:
-  # model: medium
-  # pretrained_model: louaaron/sedd-medium
-  model: small
-  pretrained_model: louaaron/sedd-small
+  model: medium
+  pretrained_model: louaaron/sedd-medium
   graph: absorb
   noise: loglinear
   accum: 1
