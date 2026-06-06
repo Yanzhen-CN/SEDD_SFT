@@ -31,7 +31,12 @@ runs:
 
 sedd:
   ngpus: 1
+  # Pretrained weights must match the architecture name below.
+  # For medium, change both lines to:
+  # model: medium
+  # pretrained_model: louaaron/sedd-medium
   model: small
+  pretrained_model: louaaron/sedd-small
   graph: absorb
   noise: loglinear
   accum: 1

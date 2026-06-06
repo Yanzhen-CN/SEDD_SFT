@@ -65,12 +65,14 @@ def build_train_command(config, run_cfg):
     data_dir = f"sft_pipeline/data/{dataset}"
     run_name = run_cfg.get("name", dataset)
     run_dir = f"exp_local/sft_{run_name}/${{now:%Y.%m.%d}}/${{now:%H%M%S}}"
+    model_name = run_cfg.get("model", sedd_cfg.get("model", "small"))
+    pretrained_model = run_cfg.get("pretrained_model", sedd_cfg.get("pretrained_model"))
 
-    return [
+    command = [
         "python",
         "train.py",
         f"ngpus={sedd_cfg.get('ngpus', 1)}",
-        f"model={sedd_cfg.get('model', 'small')}",
+        f"model={model_name}",
         f"model.length={run_cfg.get('length', 256)}",
         f"training.batch_size={run_cfg.get('batch_size', 2)}",
         f"eval.batch_size={run_cfg.get('batch_size', 2)}",
@@ -89,6 +91,9 @@ def build_train_command(config, run_cfg):
         f"graph.type={sedd_cfg.get('graph', 'absorb')}",
         f"hydra.run.dir={run_dir}",
     ]
+    if pretrained_model:
+        command.append(f"+pretrained_model={pretrained_model}")
+    return command
 
 
 def run_one(command, run_cfg, dry_run):

@@ -19,6 +19,7 @@ import utils
 from model import SEDD
 from model.ema import ExponentialMovingAverage
 from transformers import GPT2TokenizerFast, GPT2LMHeadModel
+from omegaconf import OmegaConf
 
 
 torch.backends.cudnn.benchmark = True
@@ -88,6 +89,14 @@ def _run(rank, world_size, cfg):
     
     # build score model
     score_model = SEDD(cfg).to(device)
+    pretrained_model = OmegaConf.select(cfg, "pretrained_model")
+    if pretrained_model:
+        mprint(f"Loading pretrained SEDD weights from {pretrained_model}")
+        pretrained_score_model = SEDD.from_pretrained(str(pretrained_model)).to(device)
+        score_model.load_state_dict(pretrained_score_model.state_dict(), strict=True)
+        del pretrained_score_model
+        mprint("Pretrained SEDD weights loaded.")
+
     score_model = DDP(score_model, device_ids=[rank], static_graph=True, find_unused_parameters=True)
 
     num_parameters = sum(p.numel() for p in score_model.parameters())
