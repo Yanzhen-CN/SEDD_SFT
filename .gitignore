@@ -20,3 +20,5 @@ assets/
 core
 **.log
 *.jsonl
+
+sft_pipeline/cache/

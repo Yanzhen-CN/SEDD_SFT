@@ -1,0 +1,48 @@
+data:
+  build: true
+  arrow_path: null
+  valid_ratio: 0.05
+  seed: 42
+
+run:
+  # Use "all", a single name like "QA", or a list like ["QA", "QAR"].
+  selected: all
+  # If true, selected runs are launched at the same time.
+  # For parallel runs, set different cuda_visible_devices when sharing one server.
+  parallel: true
+  execute: true
+
+defaults:
+  steps: 200
+  length: 256
+  batch_size: 2
+  log_freq: 10
+  eval_freq: 50
+  snapshot_freq: 200
+
+runs:
+  QA:
+    dataset: QA
+    length: 256
+    batch_size: 2
+    cuda_visible_devices: "0"
+
+  QAR:
+    dataset: QAR
+    length: 512
+    batch_size: 1
+    cuda_visible_devices: "1"
+
+sedd:
+  ngpus: 1
+  model: small
+  graph: absorb
+  noise: loglinear
+  accum: 1
+  snapshot_sampling: false
+  perplexity: false
+  cache_dir: sft_pipeline/cache
+
+results:
+  csv_log: false
+  save_best: false
