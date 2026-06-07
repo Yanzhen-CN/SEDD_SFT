@@ -5,6 +5,7 @@ import gc
 import json
 import logging
 import csv
+import shutil
 from itertools import chain
 
 import numpy as np
@@ -73,6 +74,10 @@ def _run(rank, world_size, cfg):
     pipeline_run_improvement_log_path = os.path.join(pipeline_run_dir, "improvement_log.jsonl") if pipeline_run_dir else None
     pipeline_run_metrics_path = os.path.join(pipeline_run_dir, "metrics.jsonl") if pipeline_run_dir else None
     pipeline_run_metrics_csv_path = os.path.join(pipeline_run_dir, "metrics.csv") if pipeline_run_dir else None
+    pipeline_global_best_metrics_path = os.path.join(pipeline_global_dir, "best_metrics.jsonl") if pipeline_global_dir else None
+    pipeline_global_best_metrics_csv_path = os.path.join(pipeline_global_dir, "best_metrics.csv") if pipeline_global_dir else None
+    pipeline_global_best_run_info_path = os.path.join(pipeline_global_dir, "best_run_info.json") if pipeline_global_dir else None
+    pipeline_global_best_pretrain_eval_path = os.path.join(pipeline_global_dir, "best_pretrain_eval.json") if pipeline_global_dir else None
     pipeline_global_best_checkpoint_dir = os.path.join(pipeline_global_dir, "best.pth") if pipeline_global_dir else None
     pipeline_global_best_eval_path = os.path.join(pipeline_global_dir, "best_eval.json") if pipeline_global_dir else None
     pipeline_global_improvement_log_path = os.path.join(pipeline_global_dir, "improvement_log.jsonl") if pipeline_global_dir else None
@@ -125,6 +130,18 @@ def _run(rank, world_size, cfg):
                 if not file_exists:
                     writer.writeheader()
                 writer.writerow(record)
+
+    def sync_global_best_metrics():
+        if rank != 0:
+            return
+        for source, target in [
+            (pipeline_run_metrics_path, pipeline_global_best_metrics_path),
+            (pipeline_run_metrics_csv_path, pipeline_global_best_metrics_csv_path),
+            (pipeline_run_info_path, pipeline_global_best_run_info_path),
+            (os.path.join(pipeline_run_dir, "pretrain_eval.json") if pipeline_run_dir else None, pipeline_global_best_pretrain_eval_path),
+        ]:
+            if source and target and os.path.exists(source):
+                shutil.copyfile(source, target)
 
     mprint(work_dir)
     mprint(cfg)
@@ -422,6 +439,7 @@ def _run(rank, world_size, cfg):
                         if pipeline_global_improvement_log_path:
                             with open(pipeline_global_improvement_log_path, "a", encoding="utf-8") as f:
                                 f.write(json.dumps(global_record) + "\n")
+                        sync_global_best_metrics()
                         mprint("new global best evaluation_loss: %.5e at step %d" % (eval_value, step))
 
             if step > 0 and step % cfg.training.snapshot_freq == 0 or step == num_train_steps:

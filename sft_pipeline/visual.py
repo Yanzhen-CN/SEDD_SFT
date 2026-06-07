@@ -1,12 +1,14 @@
 import argparse
 import csv
+import json
 from pathlib import Path
 
-# 获取当前脚本所在目录（假设 visual.py 位于 sft_pipeline/ 下）
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_ROOT = SCRIPT_DIR / "modelparameter"
-DEFAULT_TEST_CSV = SCRIPT_DIR / "reports" / "test_results.csv"
+DEFAULT_TEST_CSV = DEFAULT_MODEL_ROOT / "test_result" / "test_results.csv"
 DEFAULT_OUT_DIR = SCRIPT_DIR / "visualization"
+
 
 def read_csv(path):
     rows = []
@@ -15,6 +17,7 @@ def read_csv(path):
         for row in reader:
             rows.append(row)
     return rows
+
 
 def read_metrics(path):
     rows = []
@@ -27,18 +30,25 @@ def read_metrics(path):
         rows.append(row)
     return rows
 
+
 def split_series(rows, kind):
     selected = [row for row in rows if row.get("kind") == kind]
     return [row["step"] for row in selected], [row["loss"] for row in selected]
 
+
 def find_best_eval(rows):
-    eval_rows = [row for row in rows if row.get("kind") == "evaluation" and row.get("valid_for_best") != "False"]
+    eval_rows = [
+        row for row in rows
+        if row.get("kind") == "evaluation" and row.get("valid_for_best") != "False"
+    ]
     if not eval_rows:
         return None
     return min(eval_rows, key=lambda row: row["loss"])
 
+
 def plot_training_curve(metrics_csv, output_path, title):
     import matplotlib.pyplot as plt
+
     rows = read_metrics(metrics_csv)
     train_x, train_y = split_series(rows, "training")
     eval_x, eval_y = split_series(rows, "evaluation")
@@ -66,8 +76,42 @@ def plot_training_curve(metrics_csv, output_path, title):
     plt.close()
     print(f"Saved: {output_path}")
 
+
+def plot_qa_curve(model_root, out_dir):
+    metrics = find_best_metrics(Path(model_root) / "QA")
+    if metrics.exists():
+        plot_training_curve(metrics, Path(out_dir) / "qa_training_curve.png", "QA SFT Training Curve")
+    else:
+        print(f"Skip QA curve: {metrics} not found")
+
+
+def plot_qar_curve(model_root, out_dir):
+    metrics = find_best_metrics(Path(model_root) / "QAR")
+    if metrics.exists():
+        plot_training_curve(metrics, Path(out_dir) / "qar_training_curve.png", "QAR SFT Training Curve")
+    else:
+        print(f"Skip QAR curve: {metrics} not found")
+
+
+def find_best_metrics(run_root):
+    run_root = Path(run_root)
+    direct = run_root / "best_metrics.csv"
+    if direct.exists():
+        return direct
+
+    best_eval = run_root / "best_eval.json"
+    if best_eval.exists():
+        with open(best_eval, "r", encoding="utf-8") as f:
+            run_instance = json.load(f).get("run_instance")
+        if run_instance:
+            return run_root / run_instance / "metrics.csv"
+
+    return direct
+
+
 def plot_test_comparison(test_csv, output_path):
     import matplotlib.pyplot as plt
+
     rows = []
     for row in read_csv(test_csv):
         try:
@@ -79,7 +123,7 @@ def plot_test_comparison(test_csv, output_path):
         except (KeyError, TypeError, ValueError):
             continue
     if not rows:
-        raise ValueError("No valid rows in test CSV. Need columns: dataset, model, loss")
+        raise ValueError("No valid rows in test CSV. Need columns: dataset,model,loss")
 
     datasets = list(dict.fromkeys(row["dataset"] for row in rows))
     models = list(dict.fromkeys(row["model"] for row in rows))
@@ -89,7 +133,7 @@ def plot_test_comparison(test_csv, output_path):
 
     plt.figure(figsize=(10, 6))
     for i, model in enumerate(models):
-        offsets = [pos - 0.4 + width/2 + i*width for pos in x]
+        offsets = [pos - 0.4 + width / 2 + i * width for pos in x]
         y = [values.get((dataset, model), 0) for dataset in datasets]
         plt.bar(offsets, y, width=width, label=model)
 
@@ -105,36 +149,32 @@ def plot_test_comparison(test_csv, output_path):
     plt.close()
     print(f"Saved: {output_path}")
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate all available plots (QA, QAR, test comparison) by default.")
-    parser.add_argument("--model-root", default=str(DEFAULT_MODEL_ROOT), help="Root dir containing QA/, QAR/ subdirs with metrics.csv")
-    parser.add_argument("--test-csv", default=str(DEFAULT_TEST_CSV), help="CSV for test comparison (columns: dataset,model,loss)")
-    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output folder for images")
+    parser = argparse.ArgumentParser(description="Generate QA, QAR, and final test plots from saved result files.")
+    parser.add_argument("--model-root", default=str(DEFAULT_MODEL_ROOT))
+    parser.add_argument("--test-csv", default=str(DEFAULT_TEST_CSV))
+    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument("--qa", action="store_true", help="Plot QA best training curve.")
+    parser.add_argument("--qar", action="store_true", help="Plot QAR best training curve.")
+    parser.add_argument("--test", action="store_true", help="Plot final test comparison.")
     args = parser.parse_args()
 
+    plot_all = not any([args.qa, args.qar, args.test])
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. QA training curve
-    qa_metrics = Path(args.model_root) / "QA" / "metrics.csv"
-    if qa_metrics.exists():
-        plot_training_curve(qa_metrics, out_dir / "qa_training_curve.png", "QA SFT Training Curve")
-    else:
-        print(f"Skip QA curve: {qa_metrics} not found")
+    if plot_all or args.qa:
+        plot_qa_curve(args.model_root, out_dir)
+    if plot_all or args.qar:
+        plot_qar_curve(args.model_root, out_dir)
+    if plot_all or args.test:
+        test_csv = Path(args.test_csv)
+        if test_csv.exists():
+            plot_test_comparison(test_csv, out_dir / "test_comparison.png")
+        else:
+            print(f"Skip test comparison: {test_csv} not found")
 
-    # 2. QAR training curve
-    qar_metrics = Path(args.model_root) / "QAR" / "metrics.csv"
-    if qar_metrics.exists():
-        plot_training_curve(qar_metrics, out_dir / "qar_training_curve.png", "QAR SFT Training Curve")
-    else:
-        print(f"Skip QAR curve: {qar_metrics} not found")
-
-    # 3. Test comparison
-    test_csv = Path(args.test_csv)
-    if test_csv.exists():
-        plot_test_comparison(test_csv, out_dir / "test_comparison.png")
-    else:
-        print(f"Skip test comparison: {test_csv} not found")
 
 if __name__ == "__main__":
     main()

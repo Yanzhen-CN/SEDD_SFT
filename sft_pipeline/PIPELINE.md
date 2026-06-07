@@ -4,8 +4,8 @@
 
 - Build QA and QAR supervised text datasets from S1K.
 - Fine-tune from official pretrained SEDD weights, not from random initialization.
-- The current default experiment is `QAR + sedd-medium + louaaron/sedd-medium`.
-- Use validation score entropy loss to measure whether the model adapts to the QAR data distribution.
+- The current default experiment is controlled by `sft_pipeline/sft_config.yaml`.
+- Use validation score entropy loss to measure whether the model adapts to the QA/QAR data distribution.
 
 ## How To Run
 
@@ -34,6 +34,7 @@ sedd:
 results:
   save_best: true
   output_dir: sft_pipeline/modelparameter
+  csv_log: true
 ```
 
 The official README examples are pretraining examples. They use very large effective batch sizes and long training schedules. For this single-GPU SFT pipeline, the config uses gradient accumulation:
@@ -86,7 +87,7 @@ reasoning trajectory
 Final Answer: solution
 ```
 
-QA and QAR use the same examples and the same train/validation split.
+QA and QAR use the same examples and the same train/validation/test split.
 
 ## Training Flow
 
@@ -161,6 +162,8 @@ Global QAR directory:
 ```text
 sft_pipeline/modelparameter/QAR/best.pth
 sft_pipeline/modelparameter/QAR/best_eval.json
+sft_pipeline/modelparameter/QAR/best_metrics.csv
+sft_pipeline/modelparameter/QAR/best_metrics.jsonl
 sft_pipeline/modelparameter/QAR/improvement_log.jsonl
 sft_pipeline/modelparameter/QAR/latest_pretrain_eval.json
 sft_pipeline/modelparameter/pretrained/medium/model_info.json
@@ -171,6 +174,7 @@ Meaning:
 
 - `best.pth`: current global best QAR checkpoint.
 - `best_eval.json`: source run, step, and loss for the global best checkpoint.
+- `best_metrics.csv/jsonl`: metrics from the run that produced the global best checkpoint.
 - `improvement_log.jsonl`: history of global best updates.
 - `latest_pretrain_eval.json`: latest pretrained baseline validation loss.
 - `pretrained/medium/model_info.json`: pretrained model source; HF weights are not duplicated here.
@@ -188,7 +192,7 @@ This is the run baseline. The current config averages validation loss over sever
 
 ```yaml
 results:
-  eval_batches: 8
+  eval_batches: 16
   min_valid_loss: 1.0e-8
 ```
 
@@ -208,33 +212,73 @@ Use:
 Plot QA and QAR training curves with:
 
 ```bash
-python sft_pipeline/visual.py \
-  --plot-qa true \
-  --qa-metrics sft_pipeline/modelparameter/QA/YYYY.MM.DD_HHMMSS/metrics.csv
-
-python sft_pipeline/visual.py \
-  --plot-qar true \
-  --qar-metrics sft_pipeline/modelparameter/QAR/YYYY.MM.DD_HHMMSS/metrics.csv
+python sft_pipeline/visual.py
 ```
 
-Plot final test comparison with:
-
-```bash
-python sft_pipeline/visual.py \
-  --plot-test true \
-  --test-csv sft_pipeline/reports/test_eval.csv
-```
-
-The expected test CSV columns are:
+By default this tries to draw:
 
 ```text
-dataset,model,loss
+sft_pipeline/visualization/qa_training_curve.png
+sft_pipeline/visualization/qar_training_curve.png
+sft_pipeline/visualization/test_comparison.png
+```
+
+Before drawing the final test comparison, run:
+
+```bash
+python sft_pipeline/test_eval.py
+```
+
+This writes:
+
+```text
+sft_pipeline/modelparameter/test_result/test_results.csv
+sft_pipeline/modelparameter/test_result/test_results.json
+sft_pipeline/modelparameter/QA/best_test_result.json
+sft_pipeline/modelparameter/QAR/best_test_result.json
+```
+
+If older runs already have `best.pth` but are missing `best_metrics.csv/jsonl` or test results, run:
+
+```bash
+python sft_pipeline/backfill_results.py
+```
+
+This first backfills:
+
+```text
+sft_pipeline/modelparameter/QA/best_metrics.csv
+sft_pipeline/modelparameter/QA/best_metrics.jsonl
+sft_pipeline/modelparameter/QAR/best_metrics.csv
+sft_pipeline/modelparameter/QAR/best_metrics.jsonl
+```
+
+Then it evaluates all available best checkpoints on the test set and writes the `test_result` files above. If only QA has finished, it will still evaluate pretrained + QA-best first.
+
+Generate real output examples with:
+
+```bash
+python sft_pipeline/compare_models.py
+```
+
+By default it reads:
+
+```text
+sft_pipeline/modelparameter/QA/best.pth
+sft_pipeline/modelparameter/QAR/best.pth
+sft_pipeline/modelparameter/test_result/test_results.json
+```
+
+and writes:
+
+```text
+sft_pipeline/reports/model_comparison.md
 ```
 
 ## Next Steps
 
-- Run `QAR-medium-512-1000steps`.
-- If memory is insufficient, change `length: 512` to `length: 256`.
-- Plot curves from `metrics.jsonl`.
-- Check whether `best_eval.json` is lower than `pretrain_eval.json`.
-- Later, run QA as a matched control and compare pretrained, QA, and QAR samples with `compare_models.py`.
+- Run the selected QA or QAR experiment from `sft_config.yaml`.
+- If memory is insufficient, reduce `defaults.length` or `defaults.batch_size`.
+- Use `visual.py` for curves and final test loss plots.
+- Use `compare_models.py` for qualitative generated examples.
+- Compare whether `best_eval.json` and test loss are lower than the pretrained baseline.

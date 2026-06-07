@@ -56,6 +56,7 @@ results:
   min_valid_loss: 1.0e-8
 
 comparison:
+  model_root: sft_pipeline/modelparameter
   pretrained: louaaron/sedd-medium
   qa_run: null
   qar_run: null
