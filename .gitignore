@@ -20,5 +20,6 @@ assets/
 core
 **.log
 *.jsonl
-
+*.json
+*.tar
 sft_pipeline/cache/
