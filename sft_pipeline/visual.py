@@ -111,44 +111,84 @@ def find_best_metrics(run_root):
 
 def plot_test_comparison(test_csv, output_path):
     import matplotlib.pyplot as plt
+    import math
 
     rows = []
+
     for row in read_csv(test_csv):
         try:
-            rows.append({
-                "dataset": row["dataset"],
-                "model": row["model"],
-                "loss": float(row["loss"]),
-            })
+            rows.append(
+                {
+                    "dataset": row["dataset"],
+                    "model": row["model"],
+                    "loss": float(row["loss"]),
+                }
+            )
         except (KeyError, TypeError, ValueError):
             continue
+
     if not rows:
         raise ValueError("No valid rows in test CSV. Need columns: dataset,model,loss")
 
-    datasets = list(dict.fromkeys(row["dataset"] for row in rows))
-    models = list(dict.fromkeys(row["model"] for row in rows))
-    values = {(row["dataset"], row["model"]): row["loss"] for row in rows}
+    dataset_order = ["QA-test", "QAR-test"]
+    model_order = ["pretrained", "QA-best", "QAR-best"]
+
+    datasets = [name for name in dataset_order if any(row["dataset"] == name for row in rows)]
+    models = [name for name in model_order if any(row["model"] == name for row in rows)]
+
+    extra_datasets = [
+        row["dataset"]
+        for row in rows
+        if row["dataset"] not in datasets
+    ]
+    extra_models = [
+        row["model"]
+        for row in rows
+        if row["model"] not in models
+    ]
+
+    for item in extra_datasets:
+        if item not in datasets:
+            datasets.append(item)
+
+    for item in extra_models:
+        if item not in models:
+            models.append(item)
+
+    values = {
+        (row["dataset"], row["model"]): row["loss"]
+        for row in rows
+    }
+
     x = list(range(len(datasets)))
     width = 0.8 / max(1, len(models))
 
     plt.figure(figsize=(10, 6))
+
     for i, model in enumerate(models):
-        offsets = [pos - 0.4 + width / 2 + i * width for pos in x]
-        y = [values.get((dataset, model), 0) for dataset in datasets]
+        offsets = [
+            pos - 0.4 + width / 2 + i * width
+            for pos in x
+        ]
+        y = [
+            values.get((dataset, model), math.nan)
+            for dataset in datasets
+        ]
         plt.bar(offsets, y, width=width, label=model)
 
     plt.xticks(x, datasets)
     plt.xlabel("test split")
     plt.ylabel("score entropy loss")
-    plt.title("Final Test Loss Comparison")
+    plt.title("Final Test Loss on QA-test and QAR-test")
     plt.grid(axis="y", alpha=0.25)
     plt.legend()
     plt.tight_layout()
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=180)
     plt.close()
-    print(f"Saved: {output_path}")
 
+    print(f"Saved: {output_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Generate QA, QAR, and final test plots from saved result files.")
