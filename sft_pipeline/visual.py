@@ -2,6 +2,12 @@ import argparse
 import csv
 from pathlib import Path
 
+# 获取当前脚本所在目录（假设 visual.py 位于 sft_pipeline/ 下）
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_MODEL_ROOT = SCRIPT_DIR / "modelparameter"
+DEFAULT_TEST_CSV = SCRIPT_DIR / "reports" / "test_results.csv"
+DEFAULT_OUT_DIR = SCRIPT_DIR / "visualization"
+
 def read_csv(path):
     rows = []
     with open(path, "r", encoding="utf-8-sig") as f:
@@ -100,10 +106,10 @@ def plot_test_comparison(test_csv, output_path):
     print(f"Saved: {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate all available plots by default.")
-    parser.add_argument("--model-root", default="sft_pipeline/modelparameter", help="Root dir containing QA/, QAR/ subdirs with metrics.csv")
-    parser.add_argument("--test-csv", default="sft_pipeline/reports/test_results.csv", help="CSV for test comparison (dataset,model,loss)")
-    parser.add_argument("--out-dir", default="visualization", help="Output folder for images")
+    parser = argparse.ArgumentParser(description="Generate all available plots (QA, QAR, test comparison) by default.")
+    parser.add_argument("--model-root", default=str(DEFAULT_MODEL_ROOT), help="Root dir containing QA/, QAR/ subdirs with metrics.csv")
+    parser.add_argument("--test-csv", default=str(DEFAULT_TEST_CSV), help="CSV for test comparison (columns: dataset,model,loss)")
+    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output folder for images")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
