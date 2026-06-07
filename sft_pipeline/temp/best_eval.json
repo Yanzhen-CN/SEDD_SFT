@@ -1,14 +1,15 @@
 {
   "run_name": "QAR",
-  "run_instance": "2026.06.07_142210",
+  "run_instance": "2026.06.07_144602",
   "scope": "run",
-  "step": 0,
-  "pretrain_evaluation_loss": 1542.693115234375,
-  "previous_best_loss": 1542.693115234375,
-  "evaluation_loss": 0.0,
-  "loss_drop_from_pretrain": 1542.693115234375,
-  "loss_drop_from_previous_best": 1542.693115234375,
-  "source_run_dir": "exp_local/sft_QAR/2026.06.07/142210",
-  "source_checkpoint": "exp_local/sft_QAR/2026.06.07/142210/checkpoints/best.pth",
-  "path": "sft_pipeline/modelparameter/QAR/2026.06.07_142210/best.pth"
+  "step": 900,
+  "pretrain_evaluation_loss": 1014.5866088867188,
+  "eval_batches": 8,
+  "previous_best_loss": 991.6160888671875,
+  "evaluation_loss": 748.463623046875,
+  "loss_drop_from_pretrain": 266.12298583984375,
+  "loss_drop_from_previous_best": 243.1524658203125,
+  "source_run_dir": "exp_local/sft_QAR/2026.06.07/144602",
+  "source_checkpoint": "exp_local/sft_QAR/2026.06.07/144602/checkpoints/best.pth",
+  "path": "sft_pipeline/modelparameter/QAR/2026.06.07_144602/best.pth"
 }

@@ -239,12 +239,20 @@ def _run(rank, world_size, cfg):
     if rank == 0 and OmegaConf.select(cfg, "results.save_best", default=False):
         if os.path.exists(best_eval_path):
             with open(best_eval_path, "r", encoding="utf-8") as f:
-                run_best_eval_loss = float(json.load(f)["evaluation_loss"])
-            mprint("Loaded existing run best evaluation_loss: %.5e" % run_best_eval_loss)
+                loaded_run_best = float(json.load(f)["evaluation_loss"])
+            if np.isfinite(loaded_run_best) and loaded_run_best > min_valid_loss:
+                run_best_eval_loss = loaded_run_best
+                mprint("Loaded existing run best evaluation_loss: %.5e" % run_best_eval_loss)
+            else:
+                mprint("Ignored invalid existing run best evaluation_loss: %.5e" % loaded_run_best)
         if pipeline_global_best_eval_path and os.path.exists(pipeline_global_best_eval_path):
             with open(pipeline_global_best_eval_path, "r", encoding="utf-8") as f:
-                global_best_eval_loss = float(json.load(f)["evaluation_loss"])
-            mprint("Loaded existing global best evaluation_loss: %.5e" % global_best_eval_loss)
+                loaded_global_best = float(json.load(f)["evaluation_loss"])
+            if np.isfinite(loaded_global_best) and loaded_global_best > min_valid_loss:
+                global_best_eval_loss = loaded_global_best
+                mprint("Loaded existing global best evaluation_loss: %.5e" % global_best_eval_loss)
+            else:
+                mprint("Ignored invalid existing global best evaluation_loss: %.5e" % loaded_global_best)
 
     if OmegaConf.select(cfg, "results.save_best", default=False):
         pretrained_eval_loss_tensor = evaluate_loss(eval_batches)
