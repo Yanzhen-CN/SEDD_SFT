@@ -7,7 +7,7 @@ data:
 
 run:
   # Use "all", a single name like "QA", "QAR", or a list like ["QA", "QAR"].
-  selected: QAR
+  selected: QA
   # If true, selected runs are launched at the same time.
   # For parallel runs, set different cuda_visible_devices when sharing one server.
   parallel: false
@@ -43,8 +43,8 @@ sedd:
   cache_dir: sft_pipeline/cache
 
 optim:
-  lr: 1.0e-6
-  warmup: 300
+  lr: 3.0e-6
+  warmup: 500
   grad_clip: 1.0
 
 results:
