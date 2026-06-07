@@ -55,6 +55,17 @@ results:
   eval_batches: 16
   min_valid_loss: 1.0e-8
 
+test_eval:
+  output_root: sft_pipeline/modelparameter
+  qa_data: sft_pipeline/data/QA
+  qar_data: sft_pipeline/data/QAR
+  pretrained: louaaron/sedd-medium
+  # 0 means evaluate the full test split. Use a small number like 16 for quick checks.
+  eval_batches: 0
+  batch_size: 1
+  num_proc: 8
+  seed: 42
+
 comparison:
   model_root: sft_pipeline/modelparameter
   pretrained: louaaron/sedd-medium
