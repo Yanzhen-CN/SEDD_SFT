@@ -1,0 +1,59 @@
+data:
+  build: true
+  source_dataset: simplescaling/s1K-1.1
+  arrow_path: null
+  output_dir: sft_answer_pipeline/data
+  valid_ratio: 0.10
+  test_ratio: 0.10
+  seed: 42
+  reasoning_source_priority: ["deepseek", "gemini"]
+
+run:
+  # Use "QA", "QAR", or "all".
+  selected: QA
+  execute: true
+
+runs:
+  QA:
+    dataset: QA
+    cuda_visible_devices: "0"
+  QAR:
+    dataset: QAR
+    cuda_visible_devices: "0"
+
+model:
+  pretrained: louaaron/sedd-medium
+  name: medium
+  max_length: 512
+  min_target_tokens: 32
+
+training:
+  steps: 1500
+  batch_size: 1
+  accum: 8
+  lr: 3.0e-6
+  warmup: 500
+  weight_decay: 0.0
+  grad_clip: 1.0
+  ema: 0.9999
+  log_freq: 25
+  eval_freq: 100
+  eval_batches: 0
+  save_freq: 500
+  seed: 42
+  num_workers: 0
+
+results:
+  output_dir: sft_answer_pipeline/modelparameter
+
+eval:
+  batch_size: 1
+  eval_batches: 0
+  num_workers: 0
+
+generation:
+  num_examples: 5
+  steps: 128
+  max_length: 512
+  answer_token_budget: 256
+  output_dir: sft_answer_pipeline/reports

@@ -23,3 +23,10 @@ core
 *.json
 *.tar
 sft_pipeline/cache/
+sft_pipeline/modelparameter/
+sft_pipeline/reports/
+sft_pipeline/visualization/
+sft_answer_pipeline/data/
+sft_answer_pipeline/modelparameter/
+sft_answer_pipeline/reports/
+sft_answer_pipeline/visualization/
