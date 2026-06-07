@@ -40,17 +40,17 @@ The official README examples are pretraining examples. They use very large effec
 
 ```yaml
 defaults:
-  batch_size: 4
+  batch_size: 8
 
 sedd:
-  accum: 4
+  accum: 8
 
 optim:
-  lr: 3.0e-5
-  warmup: 100
+  lr: 3.0e-6
+  warmup: 500
 ```
 
-With `ngpus=1`, this keeps the per-step micro-batch at `batch_size / accum = 1`, while the optimizer update uses an effective batch size of 4.
+With `ngpus=1`, this keeps the per-step micro-batch at `batch_size / accum = 1`, while the optimizer update uses an effective batch size of 8.
 
 ## Data Flow
 
@@ -202,7 +202,34 @@ During training:
 Use:
 
 - `metrics.jsonl` for full training/evaluation curves.
+- `metrics.csv` for plotting.
 - `improvement_log.jsonl` to explain why and when best checkpoints changed.
+
+Plot QA and QAR training curves with:
+
+```bash
+python sft_pipeline/visual.py \
+  --plot-qa true \
+  --qa-metrics sft_pipeline/modelparameter/QA/YYYY.MM.DD_HHMMSS/metrics.csv
+
+python sft_pipeline/visual.py \
+  --plot-qar true \
+  --qar-metrics sft_pipeline/modelparameter/QAR/YYYY.MM.DD_HHMMSS/metrics.csv
+```
+
+Plot final test comparison with:
+
+```bash
+python sft_pipeline/visual.py \
+  --plot-test true \
+  --test-csv sft_pipeline/reports/test_eval.csv
+```
+
+The expected test CSV columns are:
+
+```text
+dataset,model,loss
+```
 
 ## Next Steps
 

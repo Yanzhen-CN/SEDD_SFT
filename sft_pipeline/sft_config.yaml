@@ -7,7 +7,7 @@ data:
 
 run:
   # Use "all", a single name like "QA", "QAR", or a list like ["QA", "QAR"].
-  selected: QA
+  selected: QAR
   # If true, selected runs are launched at the same time.
   # For parallel runs, set different cuda_visible_devices when sharing one server.
   parallel: false
