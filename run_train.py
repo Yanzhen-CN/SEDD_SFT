@@ -2,6 +2,7 @@ import datetime
 import os
 import os.path
 import gc
+import json
 from itertools import chain
 
 import numpy as np
@@ -56,10 +57,20 @@ def _run(rank, world_size, cfg):
     sample_dir = os.path.join(work_dir, "samples")
     checkpoint_dir = os.path.join(work_dir, "checkpoints")
     checkpoint_meta_dir = os.path.join(work_dir, "checkpoints-meta", "checkpoint.pth")
+    best_checkpoint_dir = os.path.join(work_dir, "checkpoints", "best.pth")
+    best_eval_path = os.path.join(work_dir, "best_eval.json")
+    pipeline_best_dir = OmegaConf.select(cfg, "results.best_dir")
+    pipeline_best_checkpoint_dir = None
+    pipeline_best_eval_path = None
+    if pipeline_best_dir:
+        pipeline_best_checkpoint_dir = os.path.join(str(pipeline_best_dir), "best.pth")
+        pipeline_best_eval_path = os.path.join(str(pipeline_best_dir), "best_eval.json")
     if rank == 0:
         utils.makedirs(sample_dir)
         utils.makedirs(checkpoint_dir)
         utils.makedirs(os.path.dirname(checkpoint_meta_dir))
+        if pipeline_best_checkpoint_dir:
+            utils.makedirs(os.path.dirname(pipeline_best_checkpoint_dir))
 
     # logging
     if rank == 0:
@@ -149,6 +160,14 @@ def _run(rank, world_size, cfg):
 
     num_train_steps = cfg.training.n_iters
     mprint(f"Starting training loop at step {initial_step}.")
+    best_eval_loss = None
+    if rank == 0 and OmegaConf.select(cfg, "results.save_best", default=False):
+        for existing_best_eval_path in [pipeline_best_eval_path, best_eval_path]:
+            if existing_best_eval_path and os.path.exists(existing_best_eval_path):
+                with open(existing_best_eval_path, "r", encoding="utf-8") as f:
+                    best_eval_loss = float(json.load(f)["evaluation_loss"])
+                mprint("Loaded existing best evaluation_loss: %.5e" % best_eval_loss)
+                break
 
 
     while state['step'] < num_train_steps + 1:
@@ -183,6 +202,34 @@ def _run(rank, world_size, cfg):
                 eval_loss /= world_size
 
                 mprint("step: %d, evaluation_loss: %.5e" % (step, eval_loss.item()))
+                if rank == 0 and OmegaConf.select(cfg, "results.save_best", default=False):
+                    eval_value = float(eval_loss.item())
+                    if best_eval_loss is None or eval_value < best_eval_loss:
+                        best_eval_loss = eval_value
+                        utils.save_checkpoint(best_checkpoint_dir, state)
+                        if pipeline_best_checkpoint_dir:
+                            utils.save_checkpoint(pipeline_best_checkpoint_dir, state)
+                        with open(best_eval_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                {"step": int(step), "evaluation_loss": eval_value, "path": best_checkpoint_dir},
+                                f,
+                                indent=2,
+                            )
+                        if pipeline_best_eval_path:
+                            with open(pipeline_best_eval_path, "w", encoding="utf-8") as f:
+                                json.dump(
+                                    {
+                                        "run_name": OmegaConf.select(cfg, "results.run_name"),
+                                        "step": int(step),
+                                        "evaluation_loss": eval_value,
+                                        "source_run_dir": work_dir,
+                                        "source_checkpoint": best_checkpoint_dir,
+                                        "path": pipeline_best_checkpoint_dir,
+                                    },
+                                    f,
+                                    indent=2,
+                                )
+                        mprint("new best evaluation_loss: %.5e at step %d" % (eval_value, step))
 
             if step > 0 and step % cfg.training.snapshot_freq == 0 or step == num_train_steps:
                 # Save the checkpoint.

@@ -43,4 +43,16 @@ sedd:
 
 results:
   csv_log: false
-  save_best: false
+  save_best: true
+  best_dir: sft_pipeline/best_models
+
+comparison:
+  pretrained: louaaron/sedd-medium
+  qa_run: null
+  qar_run: null
+  random_like: null
+  prefix: "User: Solve the problem carefully.\nAssistant:\n"
+  length: 512
+  steps: 128
+  no_sample: false
+  out: sft_pipeline/reports/model_comparison.md

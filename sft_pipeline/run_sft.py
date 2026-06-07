@@ -60,6 +60,7 @@ def merged_run_config(config, name):
 
 def build_train_command(config, run_cfg):
     sedd_cfg = config.get("sedd", {})
+    results_cfg = config.get("results", {})
 
     dataset = run_cfg.get("dataset", "QA")
     data_dir = f"sft_pipeline/data/{dataset}"
@@ -67,6 +68,8 @@ def build_train_command(config, run_cfg):
     run_dir = f"exp_local/sft_{run_name}/${{now:%Y.%m.%d}}/${{now:%H%M%S}}"
     model_name = run_cfg.get("model", sedd_cfg.get("model", "small"))
     pretrained_model = run_cfg.get("pretrained_model", sedd_cfg.get("pretrained_model"))
+    best_root = results_cfg.get("best_dir")
+    best_dir = f"{best_root}/{run_name}" if best_root else None
 
     command = [
         "python",
@@ -93,6 +96,11 @@ def build_train_command(config, run_cfg):
     ]
     if pretrained_model:
         command.append(f"+pretrained_model={pretrained_model}")
+    if "save_best" in results_cfg:
+        command.append(f"++results.save_best={str(results_cfg.get('save_best')).lower()}")
+    if best_dir:
+        command.append(f"++results.best_dir={best_dir}")
+    command.append(f"++results.run_name={run_name}")
     return command
 
 
