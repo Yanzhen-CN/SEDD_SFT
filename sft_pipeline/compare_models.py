@@ -28,7 +28,9 @@ def parse_losses(run_dir):
     run_path = Path(run_dir)
     log_path = run_path / "logs"
     if not log_path.exists():
-        return {"run_dir": str(run_path), "error": "logs file not found"}
+        log_path = run_path / "train.log"
+    if not log_path.exists():
+        return {"run_dir": str(run_path), "error": "logs/train.log file not found"}
 
     rows = []
     for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -70,7 +72,13 @@ def load_local_model(run_dir, device, checkpoint_name="best"):
     from model.ema import ExponentialMovingAverage
 
     run_path = Path(run_dir)
-    cfg = utils.load_hydra_config_from_run(str(run_path))
+    config_dir = run_path
+    run_info_path = run_path / "run_info.json"
+    if run_info_path.exists():
+        run_info = json.loads(run_info_path.read_text(encoding="utf-8"))
+        config_dir = Path(run_info["work_dir"])
+
+    cfg = utils.load_hydra_config_from_run(str(config_dir))
     model = SEDD(cfg).to(device)
     ema = ExponentialMovingAverage(model.parameters(), decay=cfg.training.ema)
     graph = graph_lib.get_graph(cfg, device)
@@ -78,6 +86,8 @@ def load_local_model(run_dir, device, checkpoint_name="best"):
 
     if checkpoint_name == "best":
         ckpt_path = run_path / "checkpoints" / "best.pth"
+        if not ckpt_path.exists():
+            ckpt_path = run_path / "best.pth"
         if not ckpt_path.exists():
             ckpt_path = run_path / "checkpoints-meta" / "checkpoint.pth"
     else:

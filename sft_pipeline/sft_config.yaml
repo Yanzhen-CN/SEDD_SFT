@@ -44,7 +44,8 @@ sedd:
 results:
   csv_log: false
   save_best: true
-  best_dir: sft_pipeline/best_models
+  output_dir: sft_pipeline/modelparameter
+  save_pretrained_reference: true
 
 comparison:
   pretrained: louaaron/sedd-medium

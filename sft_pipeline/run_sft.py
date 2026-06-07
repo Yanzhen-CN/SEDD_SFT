@@ -68,8 +68,7 @@ def build_train_command(config, run_cfg):
     run_dir = f"exp_local/sft_{run_name}/${{now:%Y.%m.%d}}/${{now:%H%M%S}}"
     model_name = run_cfg.get("model", sedd_cfg.get("model", "small"))
     pretrained_model = run_cfg.get("pretrained_model", sedd_cfg.get("pretrained_model"))
-    best_root = results_cfg.get("best_dir")
-    best_dir = f"{best_root}/{run_name}" if best_root else None
+    output_root = results_cfg.get("output_dir")
 
     command = [
         "python",
@@ -98,8 +97,10 @@ def build_train_command(config, run_cfg):
         command.append(f"+pretrained_model={pretrained_model}")
     if "save_best" in results_cfg:
         command.append(f"++results.save_best={str(results_cfg.get('save_best')).lower()}")
-    if best_dir:
-        command.append(f"++results.best_dir={best_dir}")
+    if output_root:
+        command.append(f"++results.output_dir={output_root}")
+    if "save_pretrained_reference" in results_cfg:
+        command.append(f"++results.save_pretrained_reference={str(results_cfg.get('save_pretrained_reference')).lower()}")
     command.append(f"++results.run_name={run_name}")
     return command
 

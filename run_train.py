@@ -3,6 +3,7 @@ import os
 import os.path
 import gc
 import json
+import logging
 from itertools import chain
 
 import numpy as np
@@ -52,6 +53,9 @@ def run_multiprocess(rank, world_size, cfg, port):
 def _run(rank, world_size, cfg):
     torch.cuda.set_device(rank)
     work_dir = cfg.work_dir
+    work_dir_parts = os.path.normpath(work_dir).split(os.sep)
+    run_instance = "_".join(work_dir_parts[-2:]) if len(work_dir_parts) >= 2 else os.path.basename(os.path.normpath(work_dir))
+    run_name = OmegaConf.select(cfg, "results.run_name") or os.path.basename(os.path.normpath(work_dir))
 
     # Create directories for experimental logs
     sample_dir = os.path.join(work_dir, "samples")
@@ -59,25 +63,44 @@ def _run(rank, world_size, cfg):
     checkpoint_meta_dir = os.path.join(work_dir, "checkpoints-meta", "checkpoint.pth")
     best_checkpoint_dir = os.path.join(work_dir, "checkpoints", "best.pth")
     best_eval_path = os.path.join(work_dir, "best_eval.json")
-    pipeline_best_dir = OmegaConf.select(cfg, "results.best_dir")
-    pipeline_best_checkpoint_dir = None
-    pipeline_best_eval_path = None
-    if pipeline_best_dir:
-        pipeline_best_checkpoint_dir = os.path.join(str(pipeline_best_dir), "best.pth")
-        pipeline_best_eval_path = os.path.join(str(pipeline_best_dir), "best_eval.json")
+    pipeline_output_dir = OmegaConf.select(cfg, "results.output_dir")
+    pipeline_global_dir = os.path.join(str(pipeline_output_dir), str(run_name)) if pipeline_output_dir else None
+    pipeline_run_dir = os.path.join(pipeline_global_dir, run_instance) if pipeline_global_dir else None
+    pipeline_run_best_checkpoint_dir = os.path.join(pipeline_run_dir, "best.pth") if pipeline_run_dir else None
+    pipeline_run_best_eval_path = os.path.join(pipeline_run_dir, "best_eval.json") if pipeline_run_dir else None
+    pipeline_run_improvement_log_path = os.path.join(pipeline_run_dir, "improvement_log.jsonl") if pipeline_run_dir else None
+    pipeline_run_metrics_path = os.path.join(pipeline_run_dir, "metrics.jsonl") if pipeline_run_dir else None
+    pipeline_global_best_checkpoint_dir = os.path.join(pipeline_global_dir, "best.pth") if pipeline_global_dir else None
+    pipeline_global_best_eval_path = os.path.join(pipeline_global_dir, "best_eval.json") if pipeline_global_dir else None
+    pipeline_global_improvement_log_path = os.path.join(pipeline_global_dir, "improvement_log.jsonl") if pipeline_global_dir else None
+    pipeline_log_path = os.path.join(pipeline_run_dir, "train.log") if pipeline_run_dir else None
+    pipeline_run_info_path = os.path.join(pipeline_run_dir, "run_info.json") if pipeline_run_dir else None
+    pretrained_reference_dir = os.path.join(pipeline_global_dir, "pretrained") if pipeline_global_dir else None
     if rank == 0:
         utils.makedirs(sample_dir)
         utils.makedirs(checkpoint_dir)
         utils.makedirs(os.path.dirname(checkpoint_meta_dir))
-        if pipeline_best_checkpoint_dir:
-            utils.makedirs(os.path.dirname(pipeline_best_checkpoint_dir))
+        if pipeline_run_dir:
+            utils.makedirs(pipeline_run_dir)
+        if pipeline_global_dir:
+            utils.makedirs(pipeline_global_dir)
 
     # logging
     if rank == 0:
         logger = utils.get_logger(os.path.join(work_dir, "logs"))
+        if pipeline_log_path:
+            pipeline_handler = logging.FileHandler(pipeline_log_path, mode="w")
+            pipeline_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+            logger.addHandler(pipeline_handler)
     def mprint(msg):
         if rank == 0:
             logger.info(msg)
+
+    def write_metric(record):
+        if rank != 0 or not pipeline_run_metrics_path:
+            return
+        with open(pipeline_run_metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
 
     mprint(work_dir)
     mprint(cfg)
@@ -107,6 +130,18 @@ def _run(rank, world_size, cfg):
         score_model.load_state_dict(pretrained_score_model.state_dict(), strict=True)
         del pretrained_score_model
         mprint("Pretrained SEDD weights loaded.")
+        if rank == 0 and pretrained_reference_dir and OmegaConf.select(cfg, "results.save_pretrained_reference", default=True):
+            utils.makedirs(pretrained_reference_dir)
+            with open(os.path.join(pretrained_reference_dir, "model_info.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "pretrained_model": str(pretrained_model),
+                        "architecture": str(OmegaConf.select(cfg, "model.name") or OmegaConf.select(cfg, "model")),
+                        "note": "Weights are loaded from this Hugging Face model at training time; they are not duplicated here.",
+                    },
+                    f,
+                    indent=2,
+                )
 
     score_model = DDP(score_model, device_ids=[rank], static_graph=True, find_unused_parameters=True)
 
@@ -130,6 +165,27 @@ def _run(rank, world_size, cfg):
     scaler = torch.cuda.amp.GradScaler()
     mprint(f"Scaler: {scaler}")
     state = dict(optimizer=optimizer, scaler=scaler, model=score_model, noise=noise, ema=ema, step=0) 
+    if rank == 0 and pipeline_run_info_path:
+        with open(pipeline_run_info_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "run_name": run_name,
+                    "run_instance": run_instance,
+                    "work_dir": work_dir,
+                    "pipeline_run_dir": pipeline_run_dir,
+                    "pipeline_global_dir": pipeline_global_dir,
+                    "model": str(OmegaConf.select(cfg, "model.name") or OmegaConf.select(cfg, "model")),
+                    "pretrained_model": str(pretrained_model) if pretrained_model else None,
+                    "train_data": str(cfg.data.train),
+                    "valid_data": str(cfg.data.valid),
+                    "length": int(cfg.model.length),
+                    "steps": int(cfg.training.n_iters),
+                    "batch_size": int(cfg.training.batch_size),
+                },
+                f,
+                indent=2,
+            )
 
 
     # load in state
@@ -160,14 +216,58 @@ def _run(rank, world_size, cfg):
 
     num_train_steps = cfg.training.n_iters
     mprint(f"Starting training loop at step {initial_step}.")
-    best_eval_loss = None
+    run_best_eval_loss = None
+    global_best_eval_loss = None
+    pretrained_eval_loss = None
     if rank == 0 and OmegaConf.select(cfg, "results.save_best", default=False):
-        for existing_best_eval_path in [pipeline_best_eval_path, best_eval_path]:
-            if existing_best_eval_path and os.path.exists(existing_best_eval_path):
-                with open(existing_best_eval_path, "r", encoding="utf-8") as f:
-                    best_eval_loss = float(json.load(f)["evaluation_loss"])
-                mprint("Loaded existing best evaluation_loss: %.5e" % best_eval_loss)
-                break
+        if os.path.exists(best_eval_path):
+            with open(best_eval_path, "r", encoding="utf-8") as f:
+                run_best_eval_loss = float(json.load(f)["evaluation_loss"])
+            mprint("Loaded existing run best evaluation_loss: %.5e" % run_best_eval_loss)
+        if pipeline_global_best_eval_path and os.path.exists(pipeline_global_best_eval_path):
+            with open(pipeline_global_best_eval_path, "r", encoding="utf-8") as f:
+                global_best_eval_loss = float(json.load(f)["evaluation_loss"])
+            mprint("Loaded existing global best evaluation_loss: %.5e" % global_best_eval_loss)
+
+    if OmegaConf.select(cfg, "results.save_best", default=False):
+        if cfg.data.valid != "text8":
+            eval_batch = next(eval_iter)['input_ids'].to(device)
+        else:
+            eval_batch = next(train_iter).to(device)
+        pretrained_eval_loss_tensor = eval_step_fn(state, eval_batch)
+        dist.all_reduce(pretrained_eval_loss_tensor)
+        pretrained_eval_loss_tensor /= world_size
+        pretrained_eval_loss = float(pretrained_eval_loss_tensor.item())
+        mprint("pretrain_evaluation_loss: %.5e" % pretrained_eval_loss)
+        if rank == 0:
+            pretrained_record = {
+                "run_name": run_name,
+                "run_instance": run_instance,
+                "step": int(initial_step),
+                "pretrain_evaluation_loss": pretrained_eval_loss,
+                "work_dir": work_dir,
+                "pretrained_model": str(pretrained_model) if pretrained_model else None,
+            }
+            with open(os.path.join(work_dir, "pretrain_eval.json"), "w", encoding="utf-8") as f:
+                json.dump(pretrained_record, f, indent=2)
+            if pipeline_run_dir:
+                with open(os.path.join(pipeline_run_dir, "pretrain_eval.json"), "w", encoding="utf-8") as f:
+                    json.dump(pretrained_record, f, indent=2)
+            if pipeline_global_dir:
+                with open(os.path.join(pipeline_global_dir, "latest_pretrain_eval.json"), "w", encoding="utf-8") as f:
+                    json.dump(pretrained_record, f, indent=2)
+            if run_best_eval_loss is None:
+                run_best_eval_loss = pretrained_eval_loss
+            if global_best_eval_loss is None:
+                global_best_eval_loss = pretrained_eval_loss
+            write_metric({
+                "run_name": run_name,
+                "run_instance": run_instance,
+                "kind": "pretrain_evaluation",
+                "step": int(initial_step),
+                "loss": pretrained_eval_loss,
+                "pretrained_model": str(pretrained_model) if pretrained_model else None,
+            })
 
 
     while state['step'] < num_train_steps + 1:
@@ -186,7 +286,15 @@ def _run(rank, world_size, cfg):
                 dist.all_reduce(loss)
                 loss /= world_size
 
-                mprint("step: %d, training_loss: %.5e" % (step, loss.item()))
+                train_value = float(loss.item())
+                mprint("step: %d, training_loss: %.5e" % (step, train_value))
+                write_metric({
+                    "run_name": run_name,
+                    "run_instance": run_instance,
+                    "kind": "training",
+                    "step": int(step),
+                    "loss": train_value,
+                })
             
             if step % cfg.training.snapshot_freq_for_preemption == 0 and rank == 0:
                 utils.save_checkpoint(checkpoint_meta_dir, state)
@@ -201,35 +309,75 @@ def _run(rank, world_size, cfg):
                 dist.all_reduce(eval_loss)
                 eval_loss /= world_size
 
-                mprint("step: %d, evaluation_loss: %.5e" % (step, eval_loss.item()))
+                eval_value = float(eval_loss.item())
+                mprint("step: %d, evaluation_loss: %.5e" % (step, eval_value))
+                write_metric({
+                    "run_name": run_name,
+                    "run_instance": run_instance,
+                    "kind": "evaluation",
+                    "step": int(step),
+                    "loss": eval_value,
+                    "loss_drop_from_pretrain": pretrained_eval_loss - eval_value if pretrained_eval_loss is not None else None,
+                    "run_best_before": run_best_eval_loss,
+                    "global_best_before": global_best_eval_loss,
+                })
                 if rank == 0 and OmegaConf.select(cfg, "results.save_best", default=False):
-                    eval_value = float(eval_loss.item())
-                    if best_eval_loss is None or eval_value < best_eval_loss:
-                        best_eval_loss = eval_value
+                    if run_best_eval_loss is None or eval_value < run_best_eval_loss:
+                        previous_best = run_best_eval_loss
+                        run_best_eval_loss = eval_value
                         utils.save_checkpoint(best_checkpoint_dir, state)
-                        if pipeline_best_checkpoint_dir:
-                            utils.save_checkpoint(pipeline_best_checkpoint_dir, state)
+                        if pipeline_run_best_checkpoint_dir:
+                            utils.save_checkpoint(pipeline_run_best_checkpoint_dir, state)
+                        run_record = {
+                            "run_name": run_name,
+                            "run_instance": run_instance,
+                            "scope": "run",
+                            "step": int(step),
+                            "pretrain_evaluation_loss": pretrained_eval_loss,
+                            "previous_best_loss": previous_best,
+                            "evaluation_loss": eval_value,
+                            "loss_drop_from_pretrain": pretrained_eval_loss - eval_value if pretrained_eval_loss is not None else None,
+                            "loss_drop_from_previous_best": previous_best - eval_value if previous_best is not None else None,
+                            "source_run_dir": work_dir,
+                            "source_checkpoint": best_checkpoint_dir,
+                            "path": pipeline_run_best_checkpoint_dir,
+                        }
                         with open(best_eval_path, "w", encoding="utf-8") as f:
-                            json.dump(
-                                {"step": int(step), "evaluation_loss": eval_value, "path": best_checkpoint_dir},
-                                f,
-                                indent=2,
-                            )
-                        if pipeline_best_eval_path:
-                            with open(pipeline_best_eval_path, "w", encoding="utf-8") as f:
-                                json.dump(
-                                    {
-                                        "run_name": OmegaConf.select(cfg, "results.run_name"),
-                                        "step": int(step),
-                                        "evaluation_loss": eval_value,
-                                        "source_run_dir": work_dir,
-                                        "source_checkpoint": best_checkpoint_dir,
-                                        "path": pipeline_best_checkpoint_dir,
-                                    },
-                                    f,
-                                    indent=2,
-                                )
-                        mprint("new best evaluation_loss: %.5e at step %d" % (eval_value, step))
+                            json.dump(run_record, f, indent=2)
+                        if pipeline_run_best_eval_path:
+                            with open(pipeline_run_best_eval_path, "w", encoding="utf-8") as f:
+                                json.dump(run_record, f, indent=2)
+                        if pipeline_run_improvement_log_path:
+                            with open(pipeline_run_improvement_log_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(run_record) + "\n")
+                        mprint("new run best evaluation_loss: %.5e at step %d" % (eval_value, step))
+
+                    if global_best_eval_loss is None or eval_value < global_best_eval_loss:
+                        previous_global_best = global_best_eval_loss
+                        global_best_eval_loss = eval_value
+                        if pipeline_global_best_checkpoint_dir:
+                            utils.save_checkpoint(pipeline_global_best_checkpoint_dir, state)
+                        global_record = {
+                            "run_name": run_name,
+                            "run_instance": run_instance,
+                            "scope": "global",
+                            "step": int(step),
+                            "pretrain_evaluation_loss": pretrained_eval_loss,
+                            "previous_best_loss": previous_global_best,
+                            "evaluation_loss": eval_value,
+                            "loss_drop_from_pretrain": pretrained_eval_loss - eval_value if pretrained_eval_loss is not None else None,
+                            "loss_drop_from_previous_best": previous_global_best - eval_value if previous_global_best is not None else None,
+                            "source_run_dir": work_dir,
+                            "source_checkpoint": best_checkpoint_dir,
+                            "path": pipeline_global_best_checkpoint_dir,
+                        }
+                        if pipeline_global_best_eval_path:
+                            with open(pipeline_global_best_eval_path, "w", encoding="utf-8") as f:
+                                json.dump(global_record, f, indent=2)
+                        if pipeline_global_improvement_log_path:
+                            with open(pipeline_global_improvement_log_path, "a", encoding="utf-8") as f:
+                                f.write(json.dumps(global_record) + "\n")
+                        mprint("new global best evaluation_loss: %.5e at step %d" % (eval_value, step))
 
             if step > 0 and step % cfg.training.snapshot_freq == 0 or step == num_train_steps:
                 # Save the checkpoint.
