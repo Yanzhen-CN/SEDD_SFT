@@ -61,6 +61,14 @@ sft_pipeline/data_process.py
   -> write sft_pipeline/data/QAR
 ```
 
+Current split is 800/100/100 for the 1000-row S1K dataset:
+
+```yaml
+data:
+  valid_ratio: 0.10
+  test_ratio: 0.10
+```
+
 QA format:
 
 ```text
@@ -130,6 +138,7 @@ Per-run directory:
 run_info.json
 pretrain_eval.json
 metrics.jsonl
+metrics.csv
 improvement_log.jsonl
 best_eval.json
 best.pth
@@ -141,6 +150,7 @@ Meaning:
 - `run_info.json`: model, data, length, step count, and official output directory.
 - `pretrain_eval.json`: validation loss before any SFT update.
 - `metrics.jsonl`: full curve data, including pretrain, training, and evaluation records.
+- `metrics.csv`: same curve data in CSV form for plotting.
 - `improvement_log.jsonl`: only records evaluation points that improve the best loss.
 - `best_eval.json`: best validation loss for this run.
 - `best.pth`: best checkpoint for this run.

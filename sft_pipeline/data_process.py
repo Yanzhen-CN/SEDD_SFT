@@ -45,12 +45,16 @@ def load_s1k(args):
     return load_dataset("simplescaling/s1K-1.1", split="train")
 
 
-def split_indices(n_rows, valid_ratio, seed):
+def split_indices(n_rows, valid_ratio, test_ratio, seed):
     indices = list(range(n_rows))
     random.Random(seed).shuffle(indices)
     n_valid = max(1, int(n_rows * valid_ratio)) if n_rows > 1 else 0
+    n_test = max(1, int(n_rows * test_ratio)) if n_rows > 1 and test_ratio > 0 else 0
+    if n_valid + n_test >= n_rows:
+        raise ValueError("valid_ratio + test_ratio leaves no training data.")
     valid = set(indices[:n_valid])
-    return valid
+    test = set(indices[n_valid:n_valid + n_test])
+    return valid, test
 
 
 def write_jsonl(path, rows):
@@ -81,27 +85,33 @@ def length_stats(rows):
     }
 
 
-def save_split(name, rows, valid_indices):
+def save_split(name, rows, valid_indices, test_indices):
     train_rows = []
     valid_rows = []
+    test_rows = []
     for idx, row in enumerate(rows):
         if idx in valid_indices:
             valid_rows.append({"text": row["text"]})
+        elif idx in test_indices:
+            test_rows.append({"text": row["text"]})
         else:
             train_rows.append({"text": row["text"]})
 
     output_dir = DATA_ROOT / name
     write_jsonl(output_dir / "train.jsonl", train_rows)
     write_jsonl(output_dir / "validation.jsonl", valid_rows)
+    write_jsonl(output_dir / "test.jsonl", test_rows)
 
     return {
         "name": name,
         "train": len(train_rows),
         "validation": len(valid_rows),
+        "test": len(test_rows),
         "total": len(rows),
         "all": length_stats(rows),
         "train_stats": length_stats(train_rows),
         "validation_stats": length_stats(valid_rows),
+        "test_stats": length_stats(test_rows),
     }
 
 
@@ -135,19 +145,20 @@ def build_datasets(args):
             **meta,
         })
 
-    valid_indices = split_indices(len(qa_rows), args.valid_ratio, args.seed)
+    valid_indices, test_indices = split_indices(len(qa_rows), args.valid_ratio, args.test_ratio, args.seed)
     stats = {
         "source_dataset": "simplescaling/s1K-1.1",
         "raw_rows": len(raw),
         "usable_rows": len(qa_rows),
         "skipped_rows": skipped,
         "valid_ratio": args.valid_ratio,
+        "test_ratio": args.test_ratio,
         "seed": args.seed,
         "reasoning_source_counts": source_counts,
-        "split_note": "QA and QAR use exactly the same sample order and train/validation split.",
+        "split_note": "QA and QAR use exactly the same sample order and train/validation/test split.",
         "datasets": [
-            save_split("QA", qa_rows, valid_indices),
-            save_split("QAR", qar_rows, valid_indices),
+            save_split("QA", qa_rows, valid_indices, test_indices),
+            save_split("QAR", qar_rows, valid_indices, test_indices),
         ],
         "notes": [
             "QA uses question + gold solution.",
@@ -165,6 +176,7 @@ def build_datasets(args):
 def main():
     parser = argparse.ArgumentParser(description="Convert s1K-1.1 into matched QA/QAR local JSONL datasets.")
     parser.add_argument("--valid-ratio", type=float, default=0.05)
+    parser.add_argument("--test-ratio", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--arrow", default=None, help="Optional local Arrow cache file for offline conversion.")
     args = parser.parse_args()

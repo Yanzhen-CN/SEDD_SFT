@@ -4,6 +4,7 @@ import os.path
 import gc
 import json
 import logging
+import csv
 from itertools import chain
 
 import numpy as np
@@ -71,6 +72,7 @@ def _run(rank, world_size, cfg):
     pipeline_run_best_eval_path = os.path.join(pipeline_run_dir, "best_eval.json") if pipeline_run_dir else None
     pipeline_run_improvement_log_path = os.path.join(pipeline_run_dir, "improvement_log.jsonl") if pipeline_run_dir else None
     pipeline_run_metrics_path = os.path.join(pipeline_run_dir, "metrics.jsonl") if pipeline_run_dir else None
+    pipeline_run_metrics_csv_path = os.path.join(pipeline_run_dir, "metrics.csv") if pipeline_run_dir else None
     pipeline_global_best_checkpoint_dir = os.path.join(pipeline_global_dir, "best.pth") if pipeline_global_dir else None
     pipeline_global_best_eval_path = os.path.join(pipeline_global_dir, "best_eval.json") if pipeline_global_dir else None
     pipeline_global_improvement_log_path = os.path.join(pipeline_global_dir, "improvement_log.jsonl") if pipeline_global_dir else None
@@ -98,10 +100,31 @@ def _run(rank, world_size, cfg):
             logger.info(msg)
 
     def write_metric(record):
-        if rank != 0 or not pipeline_run_metrics_path:
+        if rank != 0:
             return
-        with open(pipeline_run_metrics_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        if pipeline_run_metrics_path:
+            with open(pipeline_run_metrics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        if pipeline_run_metrics_csv_path and OmegaConf.select(cfg, "results.csv_log", default=False):
+            fieldnames = [
+                "run_name",
+                "run_instance",
+                "kind",
+                "step",
+                "loss",
+                "eval_batches",
+                "valid_for_best",
+                "loss_drop_from_pretrain",
+                "run_best_before",
+                "global_best_before",
+                "pretrained_model",
+            ]
+            file_exists = os.path.exists(pipeline_run_metrics_csv_path)
+            with open(pipeline_run_metrics_csv_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(record)
 
     mprint(work_dir)
     mprint(cfg)

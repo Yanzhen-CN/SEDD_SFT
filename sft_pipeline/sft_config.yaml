@@ -1,7 +1,8 @@
 data:
   build: true
   arrow_path: null
-  valid_ratio: 0.05
+  valid_ratio: 0.10
+  test_ratio: 0.10
   seed: 42
 
 run:
@@ -47,7 +48,7 @@ optim:
   grad_clip: 1.0
 
 results:
-  csv_log: false
+  csv_log: true
   save_best: true
   output_dir: sft_pipeline/modelparameter
   save_pretrained_reference: true

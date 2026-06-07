@@ -28,6 +28,7 @@ def maybe_build_data(config):
 
     args = argparse.Namespace(
         valid_ratio=data_cfg.get("valid_ratio", 0.05),
+        test_ratio=data_cfg.get("test_ratio", 0.0),
         seed=data_cfg.get("seed", 42),
         arrow=data_cfg.get("arrow_path"),
     )
@@ -106,6 +107,8 @@ def build_train_command(config, run_cfg):
         command.append(f"++results.eval_batches={int(results_cfg.get('eval_batches'))}")
     if "min_valid_loss" in results_cfg:
         command.append(f"++results.min_valid_loss={results_cfg.get('min_valid_loss')}")
+    if "csv_log" in results_cfg:
+        command.append(f"++results.csv_log={str(results_cfg.get('csv_log')).lower()}")
     for key, value in optim_cfg.items():
         command.append(f"optim.{key}={value}")
     command.append(f"++results.run_name={run_name}")
