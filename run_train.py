@@ -56,6 +56,7 @@ def _run(rank, world_size, cfg):
     work_dir_parts = os.path.normpath(work_dir).split(os.sep)
     run_instance = "_".join(work_dir_parts[-2:]) if len(work_dir_parts) >= 2 else os.path.basename(os.path.normpath(work_dir))
     run_name = OmegaConf.select(cfg, "results.run_name") or os.path.basename(os.path.normpath(work_dir))
+    model_name = str(OmegaConf.select(cfg, "model.name") or OmegaConf.select(cfg, "model"))
 
     # Create directories for experimental logs
     sample_dir = os.path.join(work_dir, "samples")
@@ -75,7 +76,7 @@ def _run(rank, world_size, cfg):
     pipeline_global_improvement_log_path = os.path.join(pipeline_global_dir, "improvement_log.jsonl") if pipeline_global_dir else None
     pipeline_log_path = os.path.join(pipeline_run_dir, "train.log") if pipeline_run_dir else None
     pipeline_run_info_path = os.path.join(pipeline_run_dir, "run_info.json") if pipeline_run_dir else None
-    pretrained_reference_dir = os.path.join(pipeline_global_dir, "pretrained") if pipeline_global_dir else None
+    pretrained_reference_dir = os.path.join(str(pipeline_output_dir), "pretrained", model_name) if pipeline_output_dir else None
     if rank == 0:
         utils.makedirs(sample_dir)
         utils.makedirs(checkpoint_dir)
@@ -136,7 +137,7 @@ def _run(rank, world_size, cfg):
                 json.dump(
                     {
                         "pretrained_model": str(pretrained_model),
-                        "architecture": str(OmegaConf.select(cfg, "model.name") or OmegaConf.select(cfg, "model")),
+                        "architecture": model_name,
                         "note": "Weights are loaded from this Hugging Face model at training time; they are not duplicated here.",
                     },
                     f,
@@ -175,7 +176,7 @@ def _run(rank, world_size, cfg):
                     "work_dir": work_dir,
                     "pipeline_run_dir": pipeline_run_dir,
                     "pipeline_global_dir": pipeline_global_dir,
-                    "model": str(OmegaConf.select(cfg, "model.name") or OmegaConf.select(cfg, "model")),
+                    "model": model_name,
                     "pretrained_model": str(pretrained_model) if pretrained_model else None,
                     "train_data": str(cfg.data.train),
                     "valid_data": str(cfg.data.valid),
@@ -209,6 +210,22 @@ def _run(rank, world_size, cfg):
     train_step_fn = losses.get_step_fn(noise, graph, True, optimize_fn, cfg.training.accum)
     eval_step_fn = losses.get_step_fn(noise, graph, False, optimize_fn, cfg.training.accum)
 
+    eval_batches = int(OmegaConf.select(cfg, "results.eval_batches", default=1))
+    min_valid_loss = float(OmegaConf.select(cfg, "results.min_valid_loss", default=0.0))
+
+    def evaluate_loss(num_batches):
+        total_eval_loss = 0
+        for _ in range(max(1, num_batches)):
+            if cfg.data.valid != "text8":
+                eval_batch = next(eval_iter)['input_ids'].to(device)
+            else:
+                eval_batch = next(train_iter).to(device)
+            this_eval_loss = eval_step_fn(state, eval_batch)
+            dist.all_reduce(this_eval_loss)
+            this_eval_loss /= world_size
+            total_eval_loss = total_eval_loss + this_eval_loss
+        return total_eval_loss / max(1, num_batches)
+
 
     if cfg.training.snapshot_sampling:
         sampling_shape = (cfg.training.batch_size // (cfg.ngpus * cfg.training.accum), cfg.model.length)
@@ -230,23 +247,19 @@ def _run(rank, world_size, cfg):
             mprint("Loaded existing global best evaluation_loss: %.5e" % global_best_eval_loss)
 
     if OmegaConf.select(cfg, "results.save_best", default=False):
-        if cfg.data.valid != "text8":
-            eval_batch = next(eval_iter)['input_ids'].to(device)
-        else:
-            eval_batch = next(train_iter).to(device)
-        pretrained_eval_loss_tensor = eval_step_fn(state, eval_batch)
-        dist.all_reduce(pretrained_eval_loss_tensor)
-        pretrained_eval_loss_tensor /= world_size
+        pretrained_eval_loss_tensor = evaluate_loss(eval_batches)
         pretrained_eval_loss = float(pretrained_eval_loss_tensor.item())
-        mprint("pretrain_evaluation_loss: %.5e" % pretrained_eval_loss)
+        mprint("pretrain_evaluation_loss: %.5e over %d batch(es)" % (pretrained_eval_loss, eval_batches))
         if rank == 0:
             pretrained_record = {
                 "run_name": run_name,
                 "run_instance": run_instance,
                 "step": int(initial_step),
                 "pretrain_evaluation_loss": pretrained_eval_loss,
+                "eval_batches": eval_batches,
                 "work_dir": work_dir,
                 "pretrained_model": str(pretrained_model) if pretrained_model else None,
+                "model": model_name,
             }
             with open(os.path.join(work_dir, "pretrain_eval.json"), "w", encoding="utf-8") as f:
                 json.dump(pretrained_record, f, indent=2)
@@ -255,6 +268,9 @@ def _run(rank, world_size, cfg):
                     json.dump(pretrained_record, f, indent=2)
             if pipeline_global_dir:
                 with open(os.path.join(pipeline_global_dir, "latest_pretrain_eval.json"), "w", encoding="utf-8") as f:
+                    json.dump(pretrained_record, f, indent=2)
+            if pretrained_reference_dir:
+                with open(os.path.join(pretrained_reference_dir, "latest_eval.json"), "w", encoding="utf-8") as f:
                     json.dump(pretrained_record, f, indent=2)
             if run_best_eval_loss is None:
                 run_best_eval_loss = pretrained_eval_loss
@@ -300,28 +316,24 @@ def _run(rank, world_size, cfg):
                 utils.save_checkpoint(checkpoint_meta_dir, state)
 
             if step % cfg.training.eval_freq == 0:
-                if cfg.data.valid != "text8":
-                    eval_batch = next(eval_iter)['input_ids'].to(device)
-                else:
-                    eval_batch = next(train_iter).to(device)
-                eval_loss = eval_step_fn(state, eval_batch)
-
-                dist.all_reduce(eval_loss)
-                eval_loss /= world_size
+                eval_loss = evaluate_loss(eval_batches)
 
                 eval_value = float(eval_loss.item())
-                mprint("step: %d, evaluation_loss: %.5e" % (step, eval_value))
+                is_valid_eval_loss = np.isfinite(eval_value) and eval_value > min_valid_loss
+                mprint("step: %d, evaluation_loss: %.5e over %d batch(es)" % (step, eval_value, eval_batches))
                 write_metric({
                     "run_name": run_name,
                     "run_instance": run_instance,
                     "kind": "evaluation",
                     "step": int(step),
                     "loss": eval_value,
+                    "eval_batches": eval_batches,
+                    "valid_for_best": bool(is_valid_eval_loss),
                     "loss_drop_from_pretrain": pretrained_eval_loss - eval_value if pretrained_eval_loss is not None else None,
                     "run_best_before": run_best_eval_loss,
                     "global_best_before": global_best_eval_loss,
                 })
-                if rank == 0 and OmegaConf.select(cfg, "results.save_best", default=False):
+                if rank == 0 and OmegaConf.select(cfg, "results.save_best", default=False) and is_valid_eval_loss:
                     if run_best_eval_loss is None or eval_value < run_best_eval_loss:
                         previous_best = run_best_eval_loss
                         run_best_eval_loss = eval_value
@@ -334,6 +346,7 @@ def _run(rank, world_size, cfg):
                             "scope": "run",
                             "step": int(step),
                             "pretrain_evaluation_loss": pretrained_eval_loss,
+                            "eval_batches": eval_batches,
                             "previous_best_loss": previous_best,
                             "evaluation_loss": eval_value,
                             "loss_drop_from_pretrain": pretrained_eval_loss - eval_value if pretrained_eval_loss is not None else None,
@@ -363,6 +376,7 @@ def _run(rank, world_size, cfg):
                             "scope": "global",
                             "step": int(step),
                             "pretrain_evaluation_loss": pretrained_eval_loss,
+                            "eval_batches": eval_batches,
                             "previous_best_loss": previous_global_best,
                             "evaluation_loss": eval_value,
                             "loss_drop_from_pretrain": pretrained_eval_loss - eval_value if pretrained_eval_loss is not None else None,

@@ -1,0 +1,8 @@
+{
+  "run_name": "QAR",
+  "run_instance": "2026.06.07_142210",
+  "step": 0,
+  "pretrain_evaluation_loss": 1542.693115234375,
+  "work_dir": "exp_local/sft_QAR/2026.06.07/142210",
+  "pretrained_model": "louaaron/sedd-medium"
+}

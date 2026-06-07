@@ -1,0 +1,14 @@
+{
+  "run_name": "QAR",
+  "run_instance": "2026.06.07_142210",
+  "scope": "run",
+  "step": 0,
+  "pretrain_evaluation_loss": 1542.693115234375,
+  "previous_best_loss": 1542.693115234375,
+  "evaluation_loss": 0.0,
+  "loss_drop_from_pretrain": 1542.693115234375,
+  "loss_drop_from_previous_best": 1542.693115234375,
+  "source_run_dir": "exp_local/sft_QAR/2026.06.07/142210",
+  "source_checkpoint": "exp_local/sft_QAR/2026.06.07/142210/checkpoints/best.pth",
+  "path": "sft_pipeline/modelparameter/QAR/2026.06.07_142210/best.pth"
+}

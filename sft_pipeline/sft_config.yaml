@@ -15,7 +15,7 @@ run:
 defaults:
   steps: 1000
   length: 512
-  batch_size: 1
+  batch_size: 4
   log_freq: 20
   eval_freq: 100
   snapshot_freq: 500
@@ -36,16 +36,23 @@ sedd:
   pretrained_model: louaaron/sedd-medium
   graph: absorb
   noise: loglinear
-  accum: 1
+  accum: 4
   snapshot_sampling: false
   perplexity: false
   cache_dir: sft_pipeline/cache
+
+optim:
+  lr: 3.0e-5
+  warmup: 100
+  grad_clip: 1.0
 
 results:
   csv_log: false
   save_best: true
   output_dir: sft_pipeline/modelparameter
   save_pretrained_reference: true
+  eval_batches: 8
+  min_valid_loss: 1.0e-8
 
 comparison:
   pretrained: louaaron/sedd-medium

@@ -1,0 +1,15 @@
+{
+  "started_at": "2026-06-07T14:26:39",
+  "run_name": "QAR",
+  "run_instance": "2026.06.07_142210",
+  "work_dir": "exp_local/sft_QAR/2026.06.07/142210",
+  "pipeline_run_dir": "sft_pipeline/modelparameter/QAR/2026.06.07_142210",
+  "pipeline_global_dir": "sft_pipeline/modelparameter/QAR",
+  "model": "medium",
+  "pretrained_model": "louaaron/sedd-medium",
+  "train_data": "sft_pipeline/data/QAR",
+  "valid_data": "sft_pipeline/data/QAR",
+  "length": 512,
+  "steps": 1000,
+  "batch_size": 1
+}

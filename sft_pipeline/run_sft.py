@@ -61,6 +61,7 @@ def merged_run_config(config, name):
 def build_train_command(config, run_cfg):
     sedd_cfg = config.get("sedd", {})
     results_cfg = config.get("results", {})
+    optim_cfg = config.get("optim", {})
 
     dataset = run_cfg.get("dataset", "QA")
     data_dir = f"sft_pipeline/data/{dataset}"
@@ -101,6 +102,12 @@ def build_train_command(config, run_cfg):
         command.append(f"++results.output_dir={output_root}")
     if "save_pretrained_reference" in results_cfg:
         command.append(f"++results.save_pretrained_reference={str(results_cfg.get('save_pretrained_reference')).lower()}")
+    if "eval_batches" in results_cfg:
+        command.append(f"++results.eval_batches={int(results_cfg.get('eval_batches'))}")
+    if "min_valid_loss" in results_cfg:
+        command.append(f"++results.min_valid_loss={results_cfg.get('min_valid_loss')}")
+    for key, value in optim_cfg.items():
+        command.append(f"optim.{key}={value}")
     command.append(f"++results.run_name={run_name}")
     return command
 

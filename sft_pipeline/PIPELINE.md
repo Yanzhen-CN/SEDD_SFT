@@ -36,6 +36,22 @@ results:
   output_dir: sft_pipeline/modelparameter
 ```
 
+The official README examples are pretraining examples. They use very large effective batch sizes and long training schedules. For this single-GPU SFT pipeline, the config uses gradient accumulation:
+
+```yaml
+defaults:
+  batch_size: 4
+
+sedd:
+  accum: 4
+
+optim:
+  lr: 3.0e-5
+  warmup: 100
+```
+
+With `ngpus=1`, this keeps the per-step micro-batch at `batch_size / accum = 1`, while the optimizer update uses an effective batch size of 4.
+
 ## Data Flow
 
 ```text
@@ -100,6 +116,12 @@ Global best across QAR runs:
 sft_pipeline/modelparameter/QAR/
 ```
 
+Pretrained model reference:
+
+```text
+sft_pipeline/modelparameter/pretrained/medium/
+```
+
 ## Important Files
 
 Per-run directory:
@@ -131,7 +153,8 @@ sft_pipeline/modelparameter/QAR/best.pth
 sft_pipeline/modelparameter/QAR/best_eval.json
 sft_pipeline/modelparameter/QAR/improvement_log.jsonl
 sft_pipeline/modelparameter/QAR/latest_pretrain_eval.json
-sft_pipeline/modelparameter/QAR/pretrained/model_info.json
+sft_pipeline/modelparameter/pretrained/medium/model_info.json
+sft_pipeline/modelparameter/pretrained/medium/latest_eval.json
 ```
 
 Meaning:
@@ -140,7 +163,8 @@ Meaning:
 - `best_eval.json`: source run, step, and loss for the global best checkpoint.
 - `improvement_log.jsonl`: history of global best updates.
 - `latest_pretrain_eval.json`: latest pretrained baseline validation loss.
-- `pretrained/model_info.json`: pretrained model source; HF weights are not duplicated here.
+- `pretrained/medium/model_info.json`: pretrained model source; HF weights are not duplicated here.
+- `pretrained/medium/latest_eval.json`: latest pretrained baseline validation loss for the medium model.
 
 ## Loss Logic
 
@@ -150,13 +174,20 @@ Before SFT, the script computes:
 pretrain_evaluation_loss
 ```
 
-This is the run baseline.
+This is the run baseline. The current config averages validation loss over several batches:
+
+```yaml
+results:
+  eval_batches: 8
+  min_valid_loss: 1.0e-8
+```
 
 During training:
 
 - If `evaluation_loss` is lower than the current run best, save to `QAR/YYYY.MM.DD_HHMMSS/best.pth`.
 - If `evaluation_loss` is lower than the current global best, save to `QAR/best.pth`.
 - If loss does not improve, do not overwrite best checkpoints.
+- If loss is non-finite or too close to zero, do not use it for best checkpoint selection.
 
 Use:
 
