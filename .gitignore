@@ -30,3 +30,6 @@ sft_answer_pipeline/data/
 sft_answer_pipeline/modelparameter/
 sft_answer_pipeline/reports/
 sft_answer_pipeline/visualization/
+SFT_RL/modelparameter/
+SFT_RL/reports/
+SFT_RL/visualization/

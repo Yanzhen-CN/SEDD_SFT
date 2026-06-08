@@ -1,0 +1,75 @@
+data:
+  data_dir: sft_rl_pipeline/data/QAR
+
+model:
+  pretrained: louaaron/sedd-medium
+  init_checkpoint: SFT_RL/modelparameter/best-QAR/best_QAR.pth
+  max_length: 512
+  min_target_tokens: 32
+
+reward:
+  # Rule reward for fast exploration. Higher is better.
+  # Only enabled rules are used. Weights are normalized automatically by default.
+  length_min: 64
+  length_max: 900
+  repeat_ngram: 4
+  max_char_run: 5
+  normalize_weights: true
+  rules:
+    - name: nonempty
+      enabled: true
+      weight: 1.0
+    - name: format
+      enabled: true
+      weight: 0.4
+    - name: length
+      enabled: true
+      weight: 0.3
+    - name: no_repeat
+      enabled: true
+      weight: 0.3
+    - name: reference_overlap
+      enabled: true
+      weight: 0.5
+    - name: no_mojibake
+      enabled: true
+      weight: 0.8
+    - name: no_char_repeat
+      enabled: true
+      weight: 0.2
+    - name: balanced_symbols
+      enabled: true
+      weight: 0.3
+    - name: readability
+      enabled: true
+      weight: 0.25
+    - name: low_symbol_noise
+      enabled: true
+      weight: 0.3
+
+best_of_k:
+  split: test
+  num_examples: 20
+  k: 4
+  steps: 128
+  answer_token_budget: 256
+
+training:
+  # Reward-weighted DWDSE continuation from best-QAR.
+  steps: 300
+  batch_size: 1
+  accum: 8
+  lr: 1.0e-6
+  warmup: 50
+  weight_decay: 0.0
+  grad_clip: 1.0
+  ema: 0.9999
+  log_freq: 10
+  eval_freq: 50
+  eval_batches: 0
+  seed: 42
+  num_workers: 0
+
+results:
+  output_dir: SFT_RL/modelparameter/sft_rl
+  report_dir: SFT_RL/reports
