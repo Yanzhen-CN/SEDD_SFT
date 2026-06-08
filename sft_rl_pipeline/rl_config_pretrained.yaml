@@ -3,7 +3,7 @@ data:
 
 model:
   pretrained: louaaron/sedd-medium
-  init_checkpoint: pretrained.pth
+  init_checkpoint: sft_rl_pipeline/modelparameter/startpoint/pretrained.pth
   max_length: 512
   min_target_tokens: 32
 
@@ -39,10 +39,10 @@ reward:
       enabled: true
       weight: 0.3
     - name: readability
-      enabled: true
+      enabled: false
       weight: 0.25
     - name: low_symbol_noise
-      enabled: true
+      enabled: false
       weight: 0.3
 
 best_of_k:

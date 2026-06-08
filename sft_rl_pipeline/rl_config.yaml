@@ -3,7 +3,7 @@ data:
 
 model:
   pretrained: louaaron/sedd-medium
-  init_checkpoint: SFT_RL/modelparameter/best-QAR/best_QAR.pth
+  init_checkpoint: sft_rl_pipeline/modelparameter/startpoint/QAR-best.pth
   max_length: 512
   min_target_tokens: 32
 
@@ -41,10 +41,10 @@ reward:
       enabled: true
       weight: 0.3
     - name: readability
-      enabled: true
+      enabled: false
       weight: 0.25
     - name: low_symbol_noise
-      enabled: true
+      enabled: false
       weight: 0.3
 
 best_of_k:

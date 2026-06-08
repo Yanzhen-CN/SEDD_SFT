@@ -10,8 +10,8 @@ from rl_utils import load_config, load_policy
 
 
 DEFAULT_ITEMS = [
-    ("pretrained", "sft_rl_pipeline/rl_config_pretrained.yaml", "pretrained.pth"),
-    ("best_QAR", "sft_rl_pipeline/rl_config.yaml", "SFT_RL/modelparameter/best-QAR/best_QAR.pth"),
+    ("pretrained", "sft_rl_pipeline/rl_config_pretrained.yaml", "sft_rl_pipeline/modelparameter/startpoint/pretrained.pth"),
+    ("QAR_best", "sft_rl_pipeline/rl_config.yaml", "sft_rl_pipeline/modelparameter/startpoint/QAR-best.pth"),
     ("pretrain_rl", "sft_rl_pipeline/rl_config_pretrained.yaml", "SFT_RL/modelparameter/pretrain_rl/best_RL_QAR.pth"),
     ("sft_rl", "sft_rl_pipeline/rl_config.yaml", "SFT_RL/modelparameter/sft_rl/best_RL_QAR.pth"),
 ]
