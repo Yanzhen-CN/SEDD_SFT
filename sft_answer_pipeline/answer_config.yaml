@@ -36,7 +36,7 @@ training:
   weight_decay: 0.0
   grad_clip: 1.0
   ema: 0.9999
-  log_freq: 25
+  log_freq: 1
   eval_freq: 100
   eval_batches: 0
   save_freq: 500
