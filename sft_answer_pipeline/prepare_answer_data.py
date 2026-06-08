@@ -53,17 +53,17 @@ def split_indices(n_rows, valid_ratio, test_ratio, seed):
 
 
 def make_qa(row_id, question, answer, meta):
-    prompt = f"User: {question}\nAssistant:\nAnswer:\n"
-    target = clean(answer)
+    prompt = f"User: {question}\nAssistant:\n"
+    assistant_text = clean(answer)
     return {
         "id": row_id,
         "mode": "QA",
         "prompt": prompt,
-        "target": target,
-        "text": prompt + target,
+        "target": assistant_text,
+        "text": prompt + assistant_text,
         "segments": [
             {"text": prompt, "loss": False, "name": "prompt"},
-            {"text": target, "loss": True, "name": "answer"},
+            {"text": assistant_text, "loss": True, "name": "assistant"},
         ],
         "question": question,
         "answer": answer,
@@ -72,11 +72,11 @@ def make_qa(row_id, question, answer, meta):
 
 
 def make_qar(row_id, question, reasoning, answer, meta):
-    prompt = f"User: {question}\nAssistant:\nAnswer:\n"
-    answer_text = clean(answer)
-    reason_cue = "\n\nReason:\n"
+    prompt = f"User: {question}\nAssistant:\n"
+    assistant_text = clean(answer)
+    reasoning_cue = "\nReasoning:\n"
     reasoning_text = clean(reasoning)
-    target = answer_text + reason_cue + reasoning_text
+    target = assistant_text + reasoning_cue + reasoning_text
     return {
         "id": row_id,
         "mode": "QAR",
@@ -85,8 +85,8 @@ def make_qar(row_id, question, reasoning, answer, meta):
         "text": prompt + target,
         "segments": [
             {"text": prompt, "loss": False, "name": "prompt"},
-            {"text": answer_text, "loss": True, "name": "answer"},
-            {"text": reason_cue, "loss": False, "name": "reason_cue"},
+            {"text": assistant_text, "loss": True, "name": "assistant"},
+            {"text": reasoning_cue, "loss": False, "name": "reasoning_cue"},
             {"text": reasoning_text, "loss": True, "name": "reasoning"},
         ],
         "question": question,
@@ -182,7 +182,7 @@ def build(config):
         "usable_rows": len(qa_rows),
         "skipped_rows": skipped,
         "split_note": "QA and QAR use the same sample ids and split; samples are never concatenated into blocks.",
-        "loss_note": "Training uses prompt as condition and computes score entropy only on target tokens.",
+        "loss_note": "Training keeps User/Assistant/Reasoning labels as condition and computes score entropy only on Assistant and Reasoning contents.",
         "reasoning_source_counts": source_counts,
         "datasets": [
             save_dataset(qa_rows, valid_indices, test_indices, output_dir, "QA"),

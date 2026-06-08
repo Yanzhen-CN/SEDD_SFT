@@ -102,27 +102,29 @@ class AnswerJsonlDataset(Dataset):
 
         by_name = {item["name"]: item for item in encoded}
         prompt = by_name.get("prompt", {"ids": [], "loss": False})
+        assistant = by_name.get("assistant", by_name.get("answer", {"ids": [], "loss": True}))
         reasoning = by_name.get("reasoning", {"ids": [], "loss": True})
-        cue = by_name.get("reason_cue", {"ids": [], "loss": False})
-        answer = by_name.get("answer", {"ids": [], "loss": True})
+        cue = by_name.get("reasoning_cue", by_name.get("reason_cue", {"ids": [], "loss": False}))
 
-        if "answer" not in by_name:
+        if "assistant" not in by_name and "answer" not in by_name:
             return self._truncate_generic_segments(encoded)
 
-        reserved_answer = min(len(answer["ids"]), max(self.min_target_tokens, self.max_length // 3))
-        answer_ids = answer["ids"][:reserved_answer]
-        answer_mask = [1] * len(answer_ids)
-
-        prompt_budget = max(1, self.max_length - len(answer_ids) - len(cue["ids"]) - self.min_target_tokens)
+        has_reasoning = len(reasoning["ids"]) > 0
+        reserved_reasoning = self.min_target_tokens if has_reasoning else 0
+        prompt_budget = max(1, self.max_length - reserved_reasoning - len(cue["ids"]) - self.min_target_tokens)
         prompt_ids = prompt["ids"][-prompt_budget:]
         prompt_mask = [0] * len(prompt_ids)
 
-        remaining = self.max_length - len(prompt_ids) - len(answer_ids) - len(cue["ids"])
+        assistant_budget = self.max_length - len(prompt_ids) - len(cue["ids"]) - reserved_reasoning
+        assistant_ids = assistant["ids"][:max(1, assistant_budget)]
+        assistant_mask = [1] * len(assistant_ids)
+
+        remaining = self.max_length - len(prompt_ids) - len(assistant_ids) - len(cue["ids"])
         reasoning_ids = reasoning["ids"][:max(0, remaining)]
         reasoning_mask = [1] * len(reasoning_ids)
 
-        ids = prompt_ids + answer_ids + cue["ids"] + reasoning_ids
-        mask = prompt_mask + answer_mask + [0] * len(cue["ids"]) + reasoning_mask
+        ids = prompt_ids + assistant_ids + cue["ids"] + reasoning_ids
+        mask = prompt_mask + assistant_mask + [0] * len(cue["ids"]) + reasoning_mask
         return ids[:self.max_length], mask[:self.max_length]
 
     def _truncate_generic_segments(self, encoded):
