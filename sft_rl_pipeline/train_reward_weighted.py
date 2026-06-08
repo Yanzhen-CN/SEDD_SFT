@@ -74,6 +74,7 @@ def reward_weights(batch, reward_cfg, device):
 def main():
     parser = argparse.ArgumentParser(description="Reward-weighted masked DWDSE continuation from best-QAR.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--run-name", default="")
     args = parser.parse_args()
     config = load_config(args.config)
     from answer_dataset import make_answer_loader
@@ -81,6 +82,17 @@ def main():
 
     set_seed(int(config["training"].get("seed", 42)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_root = Path(config["results"].get("output_dir", "SFT_RL/modelparameter/RL-QAR"))
+    timestamp = dt.datetime.now().strftime("%Y.%m.%d_%H%M%S")
+    run_dir_name = timestamp if not args.run_name else f"{timestamp}_{args.run_name}"
+    run_dir = out_root / run_dir_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_log = run_dir / "train.log"
+
+    def log(message):
+        print(message, flush=True)
+        with open(run_log, "a", encoding="utf-8") as f:
+            f.write(str(message) + "\n")
 
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
@@ -116,13 +128,13 @@ def main():
     scaler = GradScaler(enabled=(device.type == "cuda"))
     loss_fn = get_answer_loss_fn(noise, graph, train=True)
 
-    out_root = Path(config["results"].get("output_dir", "SFT_RL/modelparameter/RL-QAR"))
-    run_dir = out_root / dt.datetime.now().strftime("%Y.%m.%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
     dump_json(run_dir / "run_info.json", {
         "init_checkpoint": checkpoint,
         "objective": "reward-weighted masked DWDSE",
         "data_dir": str(data_dir),
+        "config": args.config,
+        "device": str(device),
+        "run_name": args.run_name,
     })
 
     steps = int(config["training"].get("steps", 300))
@@ -137,7 +149,8 @@ def main():
 
     pre_loss, pre_batches = evaluate_answer_loss(model, ema, noise, graph, valid_loader, device, eval_batches)
     append_csv(run_dir / "metrics.csv", {"step": 0, "split": "pretrain_validation", "loss": pre_loss, "reward": "", "weighted_loss": "", "batches": pre_batches, "lr": 0.0})
-    print(f"pretrain_validation_loss={pre_loss:.6f}")
+    log(f"run_dir={run_dir}")
+    log(f"pretrain_validation_loss={pre_loss:.6f}")
 
     train_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
@@ -188,14 +201,14 @@ def main():
                 "lr": lr,
             }
             append_csv(run_dir / "metrics.csv", row)
-            print(f"step={step} loss={row['loss']:.6f} weighted={row['weighted_loss']:.6f} reward={row['reward']:.3f}")
+            log(f"step={step} loss={row['loss']:.6f} weighted={row['weighted_loss']:.6f} reward={row['reward']:.3f}")
             running_loss = running_weighted = running_reward = 0.0
             running_count = 0
 
         if step % eval_freq == 0 or step == steps:
             val, batches = evaluate_answer_loss(model, ema, noise, graph, valid_loader, device, eval_batches)
             append_csv(run_dir / "metrics.csv", {"step": step, "split": "validation", "loss": val, "reward": "", "weighted_loss": "", "batches": batches, "lr": lr})
-            print(f"step={step} validation_loss={val:.6f}")
+            log(f"step={step} validation_loss={val:.6f}")
             if val < best:
                 best = val
                 state = {"model": model.state_dict(), "ema": ema.state_dict(), "optimizer": optimizer.state_dict(), "step": step}
@@ -204,9 +217,9 @@ def main():
                 torch.save(state, checkpoint_path)
                 dump_json(run_dir / "best_eval.json", best_info)
                 if update_global_best(out_root, run_dir, checkpoint_path, best_info):
-                    print(f"new global best validation_loss={val:.6f} at step={step}")
+                    log(f"new global best validation_loss={val:.6f} at step={step}")
 
-    print(f"done: {run_dir}")
+    log(f"done: {run_dir}")
 
 
 if __name__ == "__main__":

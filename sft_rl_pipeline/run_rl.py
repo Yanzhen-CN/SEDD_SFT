@@ -15,13 +15,17 @@ def main():
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--best-of-k", action="store_true", help="Run reward-guided best-of-K sampling.")
     parser.add_argument("--train", action="store_true", help="Run reward-weighted DWDSE training.")
+    parser.add_argument("--run-name", default="", help="Optional suffix for the training run directory.")
     args = parser.parse_args()
 
     run_all = not args.best_of_k and not args.train
     if run_all or args.best_of_k:
         subprocess.check_call([sys.executable, str(SCRIPT_DIR / "best_of_k.py"), "--config", args.config], cwd=str(REPO_DIR))
     if run_all or args.train:
-        subprocess.check_call([sys.executable, str(SCRIPT_DIR / "train_reward_weighted.py"), "--config", args.config], cwd=str(REPO_DIR))
+        cmd = [sys.executable, str(SCRIPT_DIR / "train_reward_weighted.py"), "--config", args.config]
+        if args.run_name:
+            cmd.extend(["--run-name", args.run_name])
+        subprocess.check_call(cmd, cwd=str(REPO_DIR))
 
 
 if __name__ == "__main__":
