@@ -20,11 +20,10 @@ def load_config(path):
 
 
 def load_s1k(data_cfg):
-    arrow_path = data_cfg.get("arrow_path")
-    if arrow_path:
+    if data_cfg.get("arrow_path"):
         from datasets import Dataset
 
-        return Dataset.from_file(arrow_path)
+        return Dataset.from_file(data_cfg["arrow_path"])
 
     from datasets import load_dataset
 
@@ -32,13 +31,13 @@ def load_s1k(data_cfg):
 
 
 def choose_reasoning(row, priority):
-    mapping = {
+    reasoning_fields = {
         "deepseek": clean(row.get("deepseek_thinking_trajectory")),
         "gemini": clean(row.get("gemini_thinking_trajectory")),
     }
     for source in priority:
-        if mapping.get(source):
-            return source, mapping[source]
+        if reasoning_fields.get(source):
+            return source, reasoning_fields[source]
     return None, None
 
 
@@ -52,68 +51,47 @@ def split_indices(n_rows, valid_ratio, test_ratio, seed):
     return set(indices[:n_valid]), set(indices[n_valid:n_valid + n_test])
 
 
-def join_segments(segments):
-    return "".join(segment["text"] for segment in segments)
-
-
-def fixed_text(segments):
-    return "".join(segment["text"] for segment in segments if not segment["loss"])
-
-
-def target_text(segments):
-    return "".join(segment["text"] for segment in segments if segment["loss"])
-
-
-def make_qa(row_id, question, answer, meta):
-    user_text = clean(question)
-    assistant_text = clean(answer)
-    segments = [
-        {"text": "User: ", "loss": False, "name": "user_label"},
-        {"text": user_text, "loss": False, "name": "user"},
-        {"text": "\nAssistant:\n", "loss": False, "name": "assistant_label"},
-        {"text": assistant_text, "loss": True, "name": "assistant"},
+def make_qa(question, answer):
+    question = clean(question)
+    answer = clean(answer)
+    return [
+        {"text": "User: ", "train": False, "name": "user_label"},
+        {"text": question, "train": False, "name": "user"},
+        {"text": "\nAssistant:\n", "train": False, "name": "assistant_label"},
+        {"text": answer, "train": True, "name": "assistant"},
     ]
-    return {
-        "id": row_id,
-        "mode": "QA",
-        "text": join_segments(segments),
-        "segments": segments,
-        "prompt": fixed_text(segments),
-        "target": target_text(segments),
-        "user": user_text,
-        "assistant": assistant_text,
-        "question": question,
-        "answer": answer,
-        **meta,
-    }
 
 
-def make_qar(row_id, question, reasoning, answer, meta):
-    user_text = clean(question)
-    assistant_text = clean(answer)
-    reasoning_text = clean(reasoning)
-    segments = [
-        {"text": "User: ", "loss": False, "name": "user_label"},
-        {"text": user_text, "loss": False, "name": "user"},
-        {"text": "\nAssistant:\n", "loss": False, "name": "assistant_label"},
-        {"text": assistant_text, "loss": True, "name": "assistant"},
-        {"text": "\nReasoning:\n", "loss": False, "name": "reasoning_label"},
-        {"text": reasoning_text, "loss": True, "name": "reasoning"},
-    ]
+def make_qar(question, answer, reasoning):
+    segments = make_qa(question, answer)
+    segments.extend([
+        {"text": "\nReasoning:\n", "train": False, "name": "reasoning_label"},
+        {"text": clean(reasoning), "train": True, "name": "reasoning"},
+    ])
+    return segments
+
+
+def segment_text(segments, train=None):
+    selected = segments
+    if train is not None:
+        selected = [segment for segment in segments if bool(segment["train"]) is train]
+    return "".join(segment["text"] for segment in selected)
+
+
+def length_stats(rows):
+    lengths = sorted(len(segment_text(row)) for row in rows)
+    train_lengths = sorted(len(segment_text(row, train=True)) for row in rows)
+    if not lengths:
+        return {"count": 0}
     return {
-        "id": row_id,
-        "mode": "QAR",
-        "text": join_segments(segments),
-        "segments": segments,
-        "prompt": "User: " + user_text + "\nAssistant:\n",
-        "target": assistant_text + "\nReasoning:\n" + reasoning_text,
-        "user": user_text,
-        "assistant": assistant_text,
-        "reasoning": reasoning_text,
-        "question": question,
-        "reasoning": reasoning,
-        "answer": answer,
-        **meta,
+        "count": len(rows),
+        "avg_chars": round(sum(lengths) / len(lengths), 1),
+        "p50_chars": lengths[len(lengths) // 2],
+        "p90_chars": lengths[int(len(lengths) * 0.9)],
+        "max_chars": lengths[-1],
+        "avg_train_chars": round(sum(train_lengths) / len(train_lengths), 1),
+        "p90_train_chars": train_lengths[int(len(train_lengths) * 0.9)],
+        "max_train_chars": train_lengths[-1],
     }
 
 
@@ -124,24 +102,7 @@ def write_jsonl(path, rows):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def char_stats(rows):
-    lengths = sorted(len(row["text"]) for row in rows)
-    target_lengths = sorted(len(row["target"]) for row in rows)
-    if not lengths:
-        return {"count": 0}
-    return {
-        "count": len(rows),
-        "avg_chars": round(sum(lengths) / len(lengths), 1),
-        "p50_chars": lengths[len(lengths) // 2],
-        "p90_chars": lengths[int(len(lengths) * 0.9)],
-        "max_chars": lengths[-1],
-        "avg_target_chars": round(sum(target_lengths) / len(target_lengths), 1),
-        "p90_target_chars": target_lengths[int(len(target_lengths) * 0.9)],
-        "max_target_chars": target_lengths[-1],
-    }
-
-
-def save_dataset(rows, valid_indices, test_indices, output_dir, name):
+def save_dataset(name, rows, valid_indices, test_indices, output_dir):
     splits = {"train": [], "validation": [], "test": []}
     for idx, row in enumerate(rows):
         if idx in valid_indices:
@@ -160,10 +121,10 @@ def save_dataset(rows, valid_indices, test_indices, output_dir, name):
         "train": len(splits["train"]),
         "validation": len(splits["validation"]),
         "test": len(splits["test"]),
-        "all_stats": char_stats(rows),
-        "train_stats": char_stats(splits["train"]),
-        "validation_stats": char_stats(splits["validation"]),
-        "test_stats": char_stats(splits["test"]),
+        "all_stats": length_stats(rows),
+        "train_stats": length_stats(splits["train"]),
+        "validation_stats": length_stats(splits["validation"]),
+        "test_stats": length_stats(splits["test"]),
     }
 
 
@@ -176,7 +137,7 @@ def build(config):
     source_counts = {"deepseek": 0, "gemini": 0}
     skipped = 0
 
-    for raw_idx, row in enumerate(raw):
+    for row in raw:
         question = clean(row.get("question"))
         answer = clean(row.get("solution"))
         source, reasoning = choose_reasoning(row, priority)
@@ -185,10 +146,8 @@ def build(config):
             continue
 
         source_counts[source] += 1
-        row_id = f"s1k_{raw_idx}"
-        meta = {"source_index": raw_idx, "reasoning_source": source}
-        qa_rows.append(make_qa(row_id, question, answer, meta))
-        qar_rows.append(make_qar(row_id, question, reasoning, answer, meta))
+        qa_rows.append(make_qa(question, answer))
+        qar_rows.append(make_qar(question, answer, reasoning))
 
     valid_indices, test_indices = split_indices(
         len(qa_rows),
@@ -202,14 +161,15 @@ def build(config):
         "raw_rows": len(raw),
         "usable_rows": len(qa_rows),
         "skipped_rows": skipped,
-        "split_note": "QA and QAR use the same sample ids and split; samples are never concatenated into blocks.",
-        "loss_note": "Training keeps User/Assistant/Reasoning labels as condition and computes score entropy only on Assistant and Reasoning contents.",
+        "split_note": "QA and QAR use the same order and split; each JSONL line is one segment list.",
+        "train_note": "Segments with train=true are noised and used for score entropy loss; train=false segments are fixed conditions.",
         "reasoning_source_counts": source_counts,
         "datasets": [
-            save_dataset(qa_rows, valid_indices, test_indices, output_dir, "QA"),
-            save_dataset(qar_rows, valid_indices, test_indices, output_dir, "QAR"),
+            save_dataset("QA", qa_rows, valid_indices, test_indices, output_dir),
+            save_dataset("QAR", qar_rows, valid_indices, test_indices, output_dir),
         ],
     }
+
     manifest_path = Path(output_dir) / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -217,7 +177,7 @@ def build(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare answer-conditioned QA/QAR datasets.")
+    parser = argparse.ArgumentParser(description="Prepare answer SFT segment-list datasets.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     build(load_config(args.config))

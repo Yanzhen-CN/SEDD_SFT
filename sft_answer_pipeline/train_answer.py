@@ -223,9 +223,9 @@ def train_one(config, run_name):
                 batch = next(train_iter)
 
             input_ids = batch["input_ids"].to(device, non_blocking=True)
-            answer_mask = batch["answer_mask"].to(device, non_blocking=True)
+            train_mask = batch["train_mask"].to(device, non_blocking=True)
             with autocast(enabled=(device.type == "cuda"), dtype=torch.bfloat16):
-                loss = loss_fn(model, input_ids, answer_mask).mean() / accum
+                loss = loss_fn(model, input_ids, train_mask).mean() / accum
             scaler.scale(loss).backward()
             running += float(loss.detach().item()) * accum
             running_count += 1

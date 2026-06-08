@@ -30,6 +30,22 @@ def read_jsonl(path, limit):
     return rows
 
 
+def segment_text(segments, train=None):
+    selected = segments
+    if train is not None:
+        selected = [segment for segment in segments if bool(segment["train"]) is train]
+    return "".join(segment["text"] for segment in selected)
+
+
+def prompt_until_assistant(segments):
+    parts = []
+    for segment in segments:
+        parts.append(segment["text"])
+        if segment.get("name") == "assistant_label":
+            break
+    return "".join(parts)
+
+
 def load_model_tuple(config, kind, device):
     import graph_lib
     import noise_lib
@@ -140,15 +156,20 @@ def main():
             loaded[kind] = model_tuple
 
     records = []
-    for row in rows:
-        item = {"id": row["id"], "prompt": row["prompt"], "reference": row["target"], "generations": {}}
+    for idx, row in enumerate(rows):
+        item = {
+            "id": str(idx),
+            "prompt": prompt_until_assistant(row),
+            "reference": segment_text(row, train=True),
+            "generations": {},
+        }
         for model_name, (model, graph, noise, _) in loaded.items():
             sample = sample_answer(
                 model,
                 graph,
                 noise,
                 tokenizer,
-                row["prompt"],
+                item["prompt"],
                 int(config["generation"].get("max_length", 512)),
                 int(config["generation"].get("answer_token_budget", 256)),
                 int(config["generation"].get("steps", 128)),

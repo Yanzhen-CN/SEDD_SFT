@@ -5,182 +5,152 @@ import torch
 from torch.utils.data import Dataset
 
 
-class AnswerJsonlDataset(Dataset):
+def segment_text(segments, train=None):
+    selected = segments
+    if train is not None:
+        selected = [segment for segment in segments if bool(segment["train"]) is train]
+    return "".join(segment["text"] for segment in selected)
+
+
+class AnswerSegmentDataset(Dataset):
     def __init__(self, path, tokenizer, max_length, min_target_tokens=1):
         self.path = Path(path)
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
         self.min_target_tokens = int(min_target_tokens)
-        self.rows = []
+        self.samples = []
 
         with open(self.path, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
-                    self.rows.append(json.loads(line))
+                    sample = json.loads(line)
+                    if not isinstance(sample, list):
+                        raise TypeError(f"Expected one segment list per JSONL line in {self.path}")
+                    self.samples.append(sample)
 
-        if not self.rows:
-            raise ValueError(f"No rows found in {self.path}")
+        if not self.samples:
+            raise ValueError(f"No samples found in {self.path}")
 
     def __len__(self):
-        return len(self.rows)
+        return len(self.samples)
 
-    def _encode(self, row):
-        if row.get("segments"):
-            return self._encode_segments(row)
-
-        prompt_ids = self.tokenizer(row["prompt"], add_special_tokens=False).input_ids
-        target_ids = self.tokenizer(row["target"], add_special_tokens=False).input_ids
-
-        if len(prompt_ids) + self.min_target_tokens > self.max_length:
-            keep_prompt = max(1, self.max_length - self.min_target_tokens)
-            prompt_ids = prompt_ids[-keep_prompt:]
-
-        target_budget = self.max_length - len(prompt_ids)
-        target_ids = target_ids[:target_budget]
-        if not target_ids:
-            target_ids = [self.tokenizer.eos_token_id]
-
-        input_ids = prompt_ids + target_ids
-        answer_mask = [0] * len(prompt_ids) + [1] * len(target_ids)
-        attention_mask = [1] * len(input_ids)
-
-        pad_len = self.max_length - len(input_ids)
-        if pad_len > 0:
-            input_ids += [self.tokenizer.eos_token_id] * pad_len
-            answer_mask += [0] * pad_len
-            attention_mask += [0] * pad_len
-
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "answer_mask": torch.tensor(answer_mask, dtype=torch.bool),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.bool),
-            "prompt_len": len(prompt_ids),
-            "target_len": int(sum(answer_mask)),
-        }
-
-    def _encode_segments(self, row):
+    def _encode_segments(self, segments):
         encoded = []
-        for segment in row["segments"]:
-            segment_ids = self.tokenizer(segment["text"], add_special_tokens=False).input_ids
+        for segment in segments:
+            token_ids = self.tokenizer(segment["text"], add_special_tokens=False).input_ids
             encoded.append({
                 "name": segment.get("name", "segment"),
-                "ids": segment_ids,
-                "loss": bool(segment.get("loss")),
+                "ids": token_ids,
+                "train": bool(segment["train"]),
             })
 
-        ids, mask = self._truncate_encoded_segments(encoded)
-        segment_token_counts = {item["name"]: len(item["ids"]) for item in encoded}
-
-        if sum(mask) == 0:
+        ids, train_mask = self._truncate(encoded)
+        if sum(train_mask) == 0:
             ids = ids[: self.max_length - 1] + [self.tokenizer.eos_token_id]
-            mask = mask[: self.max_length - 1] + [1]
+            train_mask = train_mask[: self.max_length - 1] + [1]
 
         attention_mask = [1] * len(ids)
         pad_len = self.max_length - len(ids)
         if pad_len > 0:
             ids += [self.tokenizer.eos_token_id] * pad_len
-            mask += [0] * pad_len
+            train_mask += [0] * pad_len
             attention_mask += [0] * pad_len
 
         return {
             "input_ids": torch.tensor(ids, dtype=torch.long),
-            "answer_mask": torch.tensor(mask, dtype=torch.bool),
+            "train_mask": torch.tensor(train_mask, dtype=torch.bool),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.bool),
-            "prompt_len": int(
-                segment_token_counts.get("prompt", 0)
-                + segment_token_counts.get("user_label", 0)
-                + segment_token_counts.get("user", 0)
-                + segment_token_counts.get("assistant_label", 0)
-            ),
-            "target_len": int(sum(mask)),
+            "prompt_len": sum(len(item["ids"]) for item in encoded if not item["train"]),
+            "train_len": int(sum(train_mask)),
         }
 
-    def _truncate_encoded_segments(self, encoded):
+    def _truncate(self, encoded):
         total_len = sum(len(item["ids"]) for item in encoded)
         if total_len <= self.max_length:
             ids = []
-            mask = []
+            train_mask = []
             for item in encoded:
                 ids.extend(item["ids"])
-                mask.extend([1 if item["loss"] else 0] * len(item["ids"]))
-            return ids, mask
+                train_mask.extend([1 if item["train"] else 0] * len(item["ids"]))
+            return ids, train_mask
 
-        by_name = {item["name"]: item for item in encoded}
-        prompt = by_name.get("prompt")
-        if prompt is None:
-            prompt_ids = []
-            for item in encoded:
-                if item["name"] == "assistant":
-                    break
-                if not item["loss"]:
-                    prompt_ids.extend(item["ids"])
-            prompt = {"ids": prompt_ids, "loss": False}
-        assistant = by_name.get("assistant", by_name.get("answer", {"ids": [], "loss": True}))
-        reasoning = by_name.get("reasoning", {"ids": [], "loss": True})
-        cue = by_name.get(
-            "reasoning_label",
-            by_name.get("reasoning_cue", by_name.get("reason_cue", {"ids": [], "loss": False})),
-        )
+        fixed_before_assistant = []
+        assistant = []
+        reasoning_label = []
+        reasoning = []
+        seen_assistant = False
 
-        if "assistant" not in by_name and "answer" not in by_name:
-            return self._truncate_generic_segments(encoded)
+        for item in encoded:
+            if item["name"] == "assistant":
+                seen_assistant = True
+                assistant = item["ids"]
+            elif item["name"] == "reasoning_label":
+                reasoning_label = item["ids"]
+            elif item["name"] == "reasoning":
+                reasoning = item["ids"]
+            elif not seen_assistant:
+                fixed_before_assistant.extend(item["ids"])
 
-        has_reasoning = len(reasoning["ids"]) > 0
+        if not assistant:
+            return self._truncate_generic(encoded)
+
+        has_reasoning = len(reasoning) > 0
         reserved_reasoning = self.min_target_tokens if has_reasoning else 0
-        prompt_budget = max(1, self.max_length - reserved_reasoning - len(cue["ids"]) - self.min_target_tokens)
-        prompt_ids = prompt["ids"][-prompt_budget:]
-        prompt_mask = [0] * len(prompt_ids)
+        prompt_budget = max(1, self.max_length - reserved_reasoning - len(reasoning_label) - self.min_target_tokens)
+        prompt_ids = fixed_before_assistant[-prompt_budget:]
+        assistant_budget = self.max_length - len(prompt_ids) - len(reasoning_label) - reserved_reasoning
+        assistant_ids = assistant[:max(1, assistant_budget)]
+        remaining = self.max_length - len(prompt_ids) - len(assistant_ids) - len(reasoning_label)
+        reasoning_ids = reasoning[:max(0, remaining)]
 
-        assistant_budget = self.max_length - len(prompt_ids) - len(cue["ids"]) - reserved_reasoning
-        assistant_ids = assistant["ids"][:max(1, assistant_budget)]
-        assistant_mask = [1] * len(assistant_ids)
+        ids = prompt_ids + assistant_ids + reasoning_label + reasoning_ids
+        train_mask = (
+            [0] * len(prompt_ids)
+            + [1] * len(assistant_ids)
+            + [0] * len(reasoning_label)
+            + [1] * len(reasoning_ids)
+        )
+        return ids[:self.max_length], train_mask[:self.max_length]
 
-        remaining = self.max_length - len(prompt_ids) - len(assistant_ids) - len(cue["ids"])
-        reasoning_ids = reasoning["ids"][:max(0, remaining)]
-        reasoning_mask = [1] * len(reasoning_ids)
-
-        ids = prompt_ids + assistant_ids + cue["ids"] + reasoning_ids
-        mask = prompt_mask + assistant_mask + [0] * len(cue["ids"]) + reasoning_mask
-        return ids[:self.max_length], mask[:self.max_length]
-
-    def _truncate_generic_segments(self, encoded):
+    def _truncate_generic(self, encoded):
         ids = []
-        mask = []
+        train_mask = []
         remaining = self.max_length
         for item in encoded:
             if remaining <= 0:
                 break
             take = min(len(item["ids"]), remaining)
-            current = item["ids"][-take:] if not item["loss"] else item["ids"][:take]
-            ids.extend(current)
-            mask.extend([1 if item["loss"] else 0] * take)
+            ids.extend(item["ids"][:take])
+            train_mask.extend([1 if item["train"] else 0] * take)
             remaining -= take
-        return ids, mask
+        return ids, train_mask
 
     def __getitem__(self, idx):
-        row = self.rows[idx]
-        item = self._encode(row)
-        item["id"] = row.get("id", str(idx))
-        item["prompt"] = row["prompt"]
-        item["target"] = row["target"]
-        item["answer"] = row.get("answer", "")
+        segments = self.samples[idx]
+        item = self._encode_segments(segments)
+        item["id"] = str(idx)
+        item["prompt"] = segment_text(segments, train=False)
+        item["target"] = segment_text(segments, train=True)
+        item["answer"] = next((segment["text"] for segment in segments if segment.get("name") == "assistant"), "")
+        item["segments"] = segments
         return item
 
 
 def collate_answer_batch(items):
-    tensor_keys = ["input_ids", "answer_mask", "attention_mask"]
+    tensor_keys = ["input_ids", "train_mask", "attention_mask"]
     batch = {key: torch.stack([item[key] for item in items], dim=0) for key in tensor_keys}
     batch["ids"] = [item["id"] for item in items]
     batch["prompts"] = [item["prompt"] for item in items]
     batch["targets"] = [item["target"] for item in items]
     batch["answers"] = [item["answer"] for item in items]
+    batch["segments"] = [item["segments"] for item in items]
     batch["prompt_lens"] = torch.tensor([item["prompt_len"] for item in items], dtype=torch.long)
-    batch["target_lens"] = torch.tensor([item["target_len"] for item in items], dtype=torch.long)
+    batch["train_lens"] = torch.tensor([item["train_len"] for item in items], dtype=torch.long)
     return batch
 
 
 def make_answer_loader(path, tokenizer, max_length, min_target_tokens, batch_size, shuffle, num_workers):
-    dataset = AnswerJsonlDataset(path, tokenizer, max_length, min_target_tokens=min_target_tokens)
+    dataset = AnswerSegmentDataset(path, tokenizer, max_length, min_target_tokens=min_target_tokens)
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
