@@ -24,11 +24,11 @@ defaults:
 runs:
   QA:
     dataset: QA
-    cuda_visible_devices: "0"
+    cuda_visible_devices: null
 
   QAR:
     dataset: QAR
-    cuda_visible_devices: "1"
+    cuda_visible_devices: null
 
 sedd:
   ngpus: 1

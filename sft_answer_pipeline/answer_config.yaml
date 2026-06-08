@@ -16,10 +16,10 @@ run:
 runs:
   QA:
     dataset: QA
-    cuda_visible_devices: "0"
+    cuda_visible_devices:
   QAR:
     dataset: QAR
-    cuda_visible_devices: "0"
+    cuda_visible_devices:
 
 model:
   pretrained: louaaron/sedd-medium
