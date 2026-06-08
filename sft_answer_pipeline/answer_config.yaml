@@ -37,9 +37,10 @@ training:
   grad_clip: 1.0
   ema: 0.9999
   log_freq: 1
-  eval_freq: 100
+  eval_freq: 25
   eval_batches: 0
-  save_freq: 500
+  # 0 disables periodic step checkpoints. Best checkpoints are still saved.
+  save_freq: 0
   seed: 42
   num_workers: 0
 
