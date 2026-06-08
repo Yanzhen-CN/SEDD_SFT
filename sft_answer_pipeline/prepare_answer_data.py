@@ -8,6 +8,7 @@ import yaml
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
+SEGMENT_ORDER = ["user_label", "user", "assistant_label", "assistant", "reasoning_label", "reasoning"]
 
 
 def clean(text):
@@ -51,40 +52,49 @@ def split_indices(n_rows, valid_ratio, test_ratio, seed):
     return set(indices[:n_valid]), set(indices[n_valid:n_valid + n_test])
 
 
-def make_qa(question, answer):
-    question = clean(question)
-    answer = clean(answer)
-    return [
-        {"text": "User: ", "train": False, "name": "user_label"},
-        {"text": question, "train": False, "name": "user"},
-        {"text": "\nAssistant:\n", "train": False, "name": "assistant_label"},
-        {"text": answer, "train": True, "name": "assistant"},
-    ]
+def segment(text, train):
+    return {"text": clean(text) if train else str(text), "train": bool(train)}
 
 
-def make_qar(question, answer, reasoning):
-    segments = make_qa(question, answer)
-    segments.extend([
-        {"text": "\nReasoning:\n", "train": False, "name": "reasoning_label"},
-        {"text": clean(reasoning), "train": True, "name": "reasoning"},
-    ])
-    return segments
+def make_sample(row_id, mode, question, answer, reasoning=None, meta=None):
+    segments = {
+        "user_label": segment("User: ", False),
+        "user": segment(question, False),
+        "assistant_label": segment("\nAssistant:\n", False),
+        "assistant": segment(answer, True),
+    }
+    if reasoning is not None:
+        segments["reasoning_label"] = segment("\nReasoning:\n", False)
+        segments["reasoning"] = segment(reasoning, True)
+
+    return {
+        "id": row_id,
+        "mode": mode,
+        "segments": segments,
+        **(meta or {}),
+    }
 
 
-def segment_text(segments, train=None):
-    selected = segments
-    if train is not None:
-        selected = [segment for segment in segments if bool(segment["train"]) is train]
-    return "".join(segment["text"] for segment in selected)
+def ordered_segments(sample):
+    segments = sample["segments"]
+    return [(name, segments[name]) for name in SEGMENT_ORDER if name in segments]
 
 
-def length_stats(rows):
-    lengths = sorted(len(segment_text(row)) for row in rows)
-    train_lengths = sorted(len(segment_text(row, train=True)) for row in rows)
+def sample_text(sample, train=None):
+    parts = []
+    for _, seg in ordered_segments(sample):
+        if train is None or bool(seg["train"]) is train:
+            parts.append(seg["text"])
+    return "".join(parts)
+
+
+def length_stats(samples):
+    lengths = sorted(len(sample_text(sample)) for sample in samples)
+    train_lengths = sorted(len(sample_text(sample, train=True)) for sample in samples)
     if not lengths:
         return {"count": 0}
     return {
-        "count": len(rows),
+        "count": len(samples),
         "avg_chars": round(sum(lengths) / len(lengths), 1),
         "p50_chars": lengths[len(lengths) // 2],
         "p90_chars": lengths[int(len(lengths) * 0.9)],
@@ -95,33 +105,33 @@ def length_stats(rows):
     }
 
 
-def write_jsonl(path, rows):
+def write_jsonl(path, samples):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for sample in samples:
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
 
 
-def save_dataset(name, rows, valid_indices, test_indices, output_dir):
+def save_dataset(name, samples, valid_indices, test_indices, output_dir):
     splits = {"train": [], "validation": [], "test": []}
-    for idx, row in enumerate(rows):
+    for idx, sample in enumerate(samples):
         if idx in valid_indices:
-            splits["validation"].append(row)
+            splits["validation"].append(sample)
         elif idx in test_indices:
-            splits["test"].append(row)
+            splits["test"].append(sample)
         else:
-            splits["train"].append(row)
+            splits["train"].append(sample)
 
     base = Path(output_dir) / name
-    for split, split_rows in splits.items():
-        write_jsonl(base / f"{split}.jsonl", split_rows)
+    for split, split_samples in splits.items():
+        write_jsonl(base / f"{split}.jsonl", split_samples)
 
     return {
         "name": name,
         "train": len(splits["train"]),
         "validation": len(splits["validation"]),
         "test": len(splits["test"]),
-        "all_stats": length_stats(rows),
+        "all_stats": length_stats(samples),
         "train_stats": length_stats(splits["train"]),
         "validation_stats": length_stats(splits["validation"]),
         "test_stats": length_stats(splits["test"]),
@@ -132,12 +142,12 @@ def build(config):
     data_cfg = config.get("data", {})
     raw = load_s1k(data_cfg)
     priority = data_cfg.get("reasoning_source_priority", ["deepseek", "gemini"])
-    qa_rows = []
-    qar_rows = []
+    qa_samples = []
+    qar_samples = []
     source_counts = {"deepseek": 0, "gemini": 0}
     skipped = 0
 
-    for row in raw:
+    for raw_idx, row in enumerate(raw):
         question = clean(row.get("question"))
         answer = clean(row.get("solution"))
         source, reasoning = choose_reasoning(row, priority)
@@ -146,11 +156,13 @@ def build(config):
             continue
 
         source_counts[source] += 1
-        qa_rows.append(make_qa(question, answer))
-        qar_rows.append(make_qar(question, answer, reasoning))
+        row_id = f"s1k_{raw_idx}"
+        meta = {"source_index": raw_idx, "reasoning_source": source}
+        qa_samples.append(make_sample(row_id, "QA", question, answer, meta=meta))
+        qar_samples.append(make_sample(row_id, "QAR", question, answer, reasoning=reasoning, meta=meta))
 
     valid_indices, test_indices = split_indices(
-        len(qa_rows),
+        len(qa_samples),
         float(data_cfg.get("valid_ratio", 0.1)),
         float(data_cfg.get("test_ratio", 0.1)),
         int(data_cfg.get("seed", 42)),
@@ -159,14 +171,15 @@ def build(config):
     manifest = {
         "source_dataset": data_cfg.get("source_dataset", "simplescaling/s1K-1.1"),
         "raw_rows": len(raw),
-        "usable_rows": len(qa_rows),
+        "usable_rows": len(qa_samples),
         "skipped_rows": skipped,
-        "split_note": "QA and QAR use the same order and split; each JSONL line is one segment list.",
-        "train_note": "Segments with train=true are noised and used for score entropy loss; train=false segments are fixed conditions.",
+        "segment_order": SEGMENT_ORDER,
+        "split_note": "QA and QAR use the same order and split. Each JSONL line is one sample object.",
+        "train_note": "segments.*.train=true tokens are noised and used for score entropy loss; train=false tokens are fixed conditions.",
         "reasoning_source_counts": source_counts,
         "datasets": [
-            save_dataset("QA", qa_rows, valid_indices, test_indices, output_dir),
-            save_dataset("QAR", qar_rows, valid_indices, test_indices, output_dir),
+            save_dataset("QA", qa_samples, valid_indices, test_indices, output_dir),
+            save_dataset("QAR", qar_samples, valid_indices, test_indices, output_dir),
         ],
     }
 
@@ -177,7 +190,7 @@ def build(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare answer SFT segment-list datasets.")
+    parser = argparse.ArgumentParser(description="Prepare answer SFT JSON-object datasets.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     build(load_config(args.config))

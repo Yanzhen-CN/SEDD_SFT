@@ -12,6 +12,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
+SEGMENT_ORDER = ["user_label", "user", "assistant_label", "assistant", "reasoning_label", "reasoning"]
 
 
 def load_config(path):
@@ -30,18 +31,23 @@ def read_jsonl(path, limit):
     return rows
 
 
-def segment_text(segments, train=None):
-    selected = segments
+def get_segments(sample):
+    segments = sample["segments"]
+    return [(name, segments[name]) for name in SEGMENT_ORDER if name in segments]
+
+
+def segment_text(sample, train=None):
+    selected = get_segments(sample)
     if train is not None:
-        selected = [segment for segment in segments if bool(segment["train"]) is train]
-    return "".join(segment["text"] for segment in selected)
+        selected = [(name, segment) for name, segment in selected if bool(segment["train"]) is train]
+    return "".join(segment["text"] for _, segment in selected)
 
 
-def prompt_until_assistant(segments):
+def prompt_until_assistant(sample):
     parts = []
-    for segment in segments:
+    for name, segment in get_segments(sample):
         parts.append(segment["text"])
-        if segment.get("name") == "assistant_label":
+        if name == "assistant_label":
             break
     return "".join(parts)
 
@@ -158,7 +164,7 @@ def main():
     records = []
     for idx, row in enumerate(rows):
         item = {
-            "id": str(idx),
+            "id": row.get("id", str(idx)),
             "prompt": prompt_until_assistant(row),
             "reference": segment_text(row, train=True),
             "generations": {},

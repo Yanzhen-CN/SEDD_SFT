@@ -144,7 +144,7 @@ def plot_curve(root, name, out_dir, bin_size=25, show_raw=False):
 
     plt.title(f"{name} Answer SFT Loss")
     plt.xlabel("step")
-    plt.ylabel("answer-token score entropy loss")
+    plt.ylabel("train-token score entropy loss")
     plt.grid(alpha=0.25)
     plt.legend()
 
@@ -211,7 +211,7 @@ def plot_test(root, out_dir):
         )
 
     plt.xticks(x, datasets)
-    plt.ylabel("answer-token score entropy loss")
+    plt.ylabel("train-token score entropy loss")
     plt.title("Answer SFT Test Loss")
     plt.grid(axis="y", alpha=0.25)
     plt.legend()
