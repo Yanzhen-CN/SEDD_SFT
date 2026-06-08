@@ -25,7 +25,7 @@ if [[ ! -f "$QAR_CKPT" ]]; then
 fi
 
 if [[ ! -f "$QAR_DATA" ]]; then
-  echo "Missing $QAR_DATA. Run: python sft_rl_pipeline/prepare_rl_assets.py"
+  echo "Missing $QAR_DATA. Run: python sft_rl_pipeline/copy_rl_data.py"
   exit 1
 fi
 
