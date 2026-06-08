@@ -3,7 +3,6 @@ import csv
 import json
 from pathlib import Path
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_ROOT = SCRIPT_DIR / "modelparameter"
 DEFAULT_TEST_CSV = DEFAULT_MODEL_ROOT / "test_result" / "test_results.csv"
@@ -11,6 +10,7 @@ DEFAULT_OUT_DIR = SCRIPT_DIR / "visualization"
 
 
 def read_csv(path):
+    """Read CSV and return list of dicts."""
     rows = []
     with open(path, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -19,81 +19,14 @@ def read_csv(path):
     return rows
 
 
-def read_metrics(path):
-    rows = []
-    for row in read_csv(path):
-        try:
-            row["step"] = int(row["step"])
-            row["loss"] = float(row["loss"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        rows.append(row)
-    return rows
-
-
-def split_series(rows, kind):
-    selected = [row for row in rows if row.get("kind") == kind]
-    return [row["step"] for row in selected], [row["loss"] for row in selected]
-
-
-def find_best_eval(rows):
-    eval_rows = [
-        row for row in rows
-        if row.get("kind") == "evaluation" and row.get("valid_for_best") != "False"
-    ]
-    if not eval_rows:
-        return None
-    return min(eval_rows, key=lambda row: row["loss"])
-
-
-def plot_training_curve(metrics_csv, output_path, title):
-    import matplotlib.pyplot as plt
-
-    rows = read_metrics(metrics_csv)
-    train_x, train_y = split_series(rows, "training")
-    eval_x, eval_y = split_series(rows, "evaluation")
-    _, pretrain_y = split_series(rows, "pretrain_evaluation")
-    best_eval = find_best_eval(rows)
-
-    plt.figure(figsize=(10, 6))
-    if train_x:
-        plt.plot(train_x, train_y, label="train loss", linewidth=1.4, alpha=0.72)
-    if eval_x:
-        plt.plot(eval_x, eval_y, marker="o", label="validation loss", linewidth=1.8)
-    if pretrain_y:
-        plt.axhline(pretrain_y[0], linestyle="--", linewidth=1.2, label="pretrain baseline")
-    if best_eval:
-        plt.scatter([best_eval["step"]], [best_eval["loss"]], s=80, label=f"best validation @ {best_eval['step']}")
-
-    plt.xlabel("step")
-    plt.ylabel("score entropy loss")
-    plt.title(title)
-    plt.grid(alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=180)
-    plt.close()
-    print(f"Saved: {output_path}")
-
-
-def plot_qa_curve(model_root, out_dir):
-    metrics = find_best_metrics(Path(model_root) / "QA")
-    if metrics.exists():
-        plot_training_curve(metrics, Path(out_dir) / "qa_training_curve.png", "QA SFT Training Curve")
-    else:
-        print(f"Skip QA curve: {metrics} not found")
-
-
-def plot_qar_curve(model_root, out_dir):
-    metrics = find_best_metrics(Path(model_root) / "QAR")
-    if metrics.exists():
-        plot_training_curve(metrics, Path(out_dir) / "qar_training_curve.png", "QAR SFT Training Curve")
-    else:
-        print(f"Skip QAR curve: {metrics} not found")
-
-
 def find_best_metrics(run_root):
+    """
+    Find the best metrics.csv file for a run (QA or QAR).
+    Priority:
+      1. best_metrics.csv (if exists)
+      2. run_instance subdirectory from best_eval.json
+      3. fallback to metrics.csv in run_root
+    """
     run_root = Path(run_root)
     direct = run_root / "best_metrics.csv"
     if direct.exists():
@@ -102,19 +35,169 @@ def find_best_metrics(run_root):
     best_eval = run_root / "best_eval.json"
     if best_eval.exists():
         with open(best_eval, "r", encoding="utf-8") as f:
-            run_instance = json.load(f).get("run_instance")
+            data = json.load(f)
+            run_instance = data.get("run_instance")
         if run_instance:
-            return run_root / run_instance / "metrics.csv"
+            candidate = run_root / run_instance / "metrics.csv"
+            if candidate.exists():
+                return candidate
 
-    return direct
+    return run_root / "metrics.csv"
 
 
-def plot_test_comparison(test_csv, output_path):
+def step_bin_end(step, bin_size):
+    """
+    Map steps 1..bin_size to bin_size,
+    steps bin_size+1..2*bin_size to 2*bin_size, etc.
+    Step 0 stays 0.
+    """
+    if step <= 0:
+        return 0
+    return ((step - 1) // bin_size + 1) * bin_size
+
+
+def aggregate_by_step_mean(rows, split, bin_size):
+    """
+    Average all rows of a split within each fixed step window.
+    """
+    buckets = {}
+    for row in rows:
+        if row["split"] != split:
+            continue
+        b = step_bin_end(row["step"], bin_size)
+        buckets.setdefault(b, []).append(row["loss"])
+
+    aggregated = []
+    for b in sorted(buckets):
+        losses = buckets[b]
+        aggregated.append(
+            {
+                "step": b,
+                "loss": sum(losses) / len(losses),
+                "count": len(losses),
+            }
+        )
+    return aggregated
+
+
+def plot_curve(name, model_root, out_dir, bin_size=25, show_raw=False):
     import matplotlib.pyplot as plt
-    import math
+
+    run_root = Path(model_root) / name
+    metrics_path = find_best_metrics(run_root)
+    if not metrics_path.exists():
+        print(f"Skip {name}: metrics file not found at {metrics_path}")
+        return
 
     rows = []
+    for row in read_csv(metrics_path):
+        try:
+            step = int(row["step"])
+            kind = row.get("kind", row.get("split", ""))
+            loss = float(row["loss"])
+            # Map kind to split name used in plotting
+            if kind == "training":
+                split = "train"
+            elif kind == "evaluation":
+                split = "validation"
+            elif kind == "pretrain_evaluation":
+                split = "pretrain_validation"
+            else:
+                split = kind  # fallback
+            rows.append({"step": step, "split": split, "loss": loss})
+        except (KeyError, ValueError):
+            continue
 
+    if not rows:
+        print(f"Skip {name}: no valid data in {metrics_path}")
+        return
+
+    plt.figure(figsize=(10, 6))
+
+    # Raw train points
+    train_raw = [r for r in rows if r["split"] == "train"]
+    if show_raw and train_raw:
+        train_raw_sorted = sorted(train_raw, key=lambda r: r["step"])
+        plt.scatter(
+            [r["step"] for r in train_raw_sorted],
+            [r["loss"] for r in train_raw_sorted],
+            s=8,
+            alpha=0.20,
+            label=f"train raw ({len(train_raw_sorted)} points)",
+        )
+
+    # Binned train mean
+    train_mean = aggregate_by_step_mean(rows, "train", bin_size)
+    if train_mean:
+        plt.plot(
+            [r["step"] for r in train_mean],
+            [r["loss"] for r in train_mean],
+            marker="o",
+            markersize=4,
+            linewidth=1.8,
+            label=f"train mean per {bin_size} steps ({len(train_mean)} points)",
+        )
+
+    # Validation points
+    validation = [r for r in rows if r["split"] == "validation"]
+    if validation:
+        validation_sorted = sorted(validation, key=lambda r: r["step"])
+        plt.plot(
+            [r["step"] for r in validation_sorted],
+            [r["loss"] for r in validation_sorted],
+            marker="o",
+            markersize=5,
+            linewidth=2.0,
+            label=f"validation ({len(validation_sorted)} points)",
+        )
+
+    # Pretrained baseline
+    baseline = [r for r in rows if r["split"] == "pretrain_validation"]
+    if baseline:
+        plt.axhline(
+            baseline[0]["loss"],
+            linestyle="--",
+            linewidth=1.8,
+            label=f"pretrained validation = {baseline[0]['loss']:.4f}",
+        )
+
+    plt.title(f"{name} SFT Training Curve")
+    plt.xlabel("step")
+    plt.ylabel("score entropy loss")
+    plt.grid(alpha=0.25)
+    plt.legend()
+
+    out_path = Path(out_dir) / f"{name.lower()}_training_curve.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+
+    print(f"Saved {out_path}")
+
+    if validation:
+        best_val = min(validation, key=lambda r: r["loss"])
+        last_val = validation[-1]
+        print(
+            f"{name} validation: best step={best_val['step']} loss={best_val['loss']:.4f}; "
+            f"last step={last_val['step']} loss={last_val['loss']:.4f}"
+        )
+    if train_mean:
+        print(
+            f"{name} train mean: last window step={train_mean[-1]['step']} "
+            f"loss={train_mean[-1]['loss']:.4f}, points in last window={train_mean[-1]['count']}"
+        )
+
+
+def plot_test_comparison(test_csv, out_dir):
+    import matplotlib.pyplot as plt
+
+    test_csv = Path(test_csv)
+    if not test_csv.exists():
+        print(f"Skip test comparison: {test_csv} not found")
+        return
+
+    rows = []
     for row in read_csv(test_csv):
         try:
             rows.append(
@@ -128,92 +211,74 @@ def plot_test_comparison(test_csv, output_path):
             continue
 
     if not rows:
-        raise ValueError("No valid rows in test CSV. Need columns: dataset,model,loss")
+        print("No valid rows in test CSV.")
+        return
 
+    # Prefer order: QA-test, QAR-test
     dataset_order = ["QA-test", "QAR-test"]
     model_order = ["pretrained", "QA-best", "QAR-best"]
 
-    datasets = [name for name in dataset_order if any(row["dataset"] == name for row in rows)]
-    models = [name for name in model_order if any(row["model"] == name for row in rows)]
+    datasets = [d for d in dataset_order if any(r["dataset"] == d for r in rows)]
+    models = [m for m in model_order if any(r["model"] == m for r in rows)]
 
-    extra_datasets = [
-        row["dataset"]
-        for row in rows
-        if row["dataset"] not in datasets
-    ]
-    extra_models = [
-        row["model"]
-        for row in rows
-        if row["model"] not in models
-    ]
+    # Add any extra datasets/models not in predefined order
+    for r in rows:
+        if r["dataset"] not in datasets:
+            datasets.append(r["dataset"])
+        if r["model"] not in models:
+            models.append(r["model"])
 
-    for item in extra_datasets:
-        if item not in datasets:
-            datasets.append(item)
-
-    for item in extra_models:
-        if item not in models:
-            models.append(item)
-
-    values = {
-        (row["dataset"], row["model"]): row["loss"]
-        for row in rows
-    }
+    values = {(r["dataset"], r["model"]): r["loss"] for r in rows}
 
     x = list(range(len(datasets)))
     width = 0.8 / max(1, len(models))
 
     plt.figure(figsize=(10, 6))
-
     for i, model in enumerate(models):
-        offsets = [
-            pos - 0.4 + width / 2 + i * width
-            for pos in x
-        ]
-        y = [
-            values.get((dataset, model), math.nan)
-            for dataset in datasets
-        ]
+        offsets = [pos - 0.4 + width / 2 + i * width for pos in x]
+        y = [values.get((dataset, model), float("nan")) for dataset in datasets]
         plt.bar(offsets, y, width=width, label=model)
 
     plt.xticks(x, datasets)
     plt.xlabel("test split")
     plt.ylabel("score entropy loss")
-    plt.title("Final Test Loss on QA-test and QAR-test")
+    plt.title("Final Test Loss Comparison")
     plt.grid(axis="y", alpha=0.25)
     plt.legend()
     plt.tight_layout()
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=180)
+    out_path = Path(out_dir) / "test_comparison.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=180)
     plt.close()
+    print(f"Saved {out_path}")
 
-    print(f"Saved: {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate QA, QAR, and final test plots from saved result files.")
-    parser.add_argument("--model-root", default=str(DEFAULT_MODEL_ROOT))
-    parser.add_argument("--test-csv", default=str(DEFAULT_TEST_CSV))
-    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
-    parser.add_argument("--qa", action="store_true", help="Plot QA best training curve.")
-    parser.add_argument("--qar", action="store_true", help="Plot QAR best training curve.")
-    parser.add_argument("--test", action="store_true", help="Plot final test comparison.")
+    parser = argparse.ArgumentParser(
+        description="Plot SFT training curves (QA/QAR) and test comparison from saved results."
+    )
+    parser.add_argument("--model-root", default=str(DEFAULT_MODEL_ROOT), help="Root directory containing QA/ and QAR/ subdirs")
+    parser.add_argument("--test-csv", default=str(DEFAULT_TEST_CSV), help="Path to test_results.csv")
+    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory for images")
+    parser.add_argument("--qa", action="store_true", help="Plot QA training curve")
+    parser.add_argument("--qar", action="store_true", help="Plot QAR training curve")
+    parser.add_argument("--test", action="store_true", help="Plot test comparison bar chart")
+    parser.add_argument("--bin-size", type=int, default=25, help="Window size for averaging train loss (default 25)")
+    parser.add_argument("--show-raw", action="store_true", help="Show raw train points as faint scatter")
     args = parser.parse_args()
 
     plot_all = not any([args.qa, args.qar, args.test])
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if plot_all or args.qa:
-        plot_qa_curve(args.model_root, out_dir)
+        plot_curve("QA", args.model_root, out_dir, bin_size=args.bin_size, show_raw=args.show_raw)
     if plot_all or args.qar:
-        plot_qar_curve(args.model_root, out_dir)
+        plot_curve("QAR", args.model_root, out_dir, bin_size=args.bin_size, show_raw=args.show_raw)
     if plot_all or args.test:
-        test_csv = Path(args.test_csv)
-        if test_csv.exists():
-            plot_test_comparison(test_csv, out_dir / "test_comparison.png")
-        else:
-            print(f"Skip test comparison: {test_csv} not found")
+        plot_test_comparison(args.test_csv, out_dir)
 
 
 if __name__ == "__main__":
