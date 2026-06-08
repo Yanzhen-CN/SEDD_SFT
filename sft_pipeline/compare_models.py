@@ -41,106 +41,35 @@ def cleanup_cuda():
     gc.collect()
     try:
         import torch
-
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
     except Exception:
         pass
 
 
 def parse_losses(run_dir):
-    run_path = Path(run_dir)
-    metrics_path = run_path / "best_metrics.csv"
-    if not metrics_path.exists():
-        metrics_path = run_path / "metrics.csv"
-
-    if metrics_path.exists():
-        import csv
-
-        rows = []
-        with open(metrics_path, "r", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                try:
-                    kind = row.get("kind") or row.get("split")
-                    if kind:
-                        kind = kind.replace("_loss", "")
-                    rows.append(
-                        {
-                            "step": int(row["step"]),
-                            "kind": kind,
-                            "loss": float(row["loss"]),
-                        }
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
-
-        eval_rows = [r for r in rows if r["kind"] in {"evaluation", "validation"}]
-        train_rows = [r for r in rows if r["kind"] in {"training", "train"}]
-
-        return {
-            "run_dir": str(run_path),
-            "metrics_file": str(metrics_path),
-            "best_eval_from_metrics": min(eval_rows, key=lambda r: r["loss"]) if eval_rows else None,
-            "final_eval": eval_rows[-1] if eval_rows else None,
-            "final_train": train_rows[-1] if train_rows else None,
-            "num_loss_points": len(rows),
-        }
-
-    log_path = run_path / "logs"
-    if not log_path.exists():
-        log_path = run_path / "train.log"
-    if not log_path.exists():
-        return {"run_dir": str(run_path), "error": "metrics.csv/train.log file not found"}
-
-    rows = []
-    for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        match = LOSS_RE.search(line)
-        if match:
-            rows.append(
-                {
-                    "step": int(match.group(1)),
-                    "kind": match.group(2),
-                    "loss": float(match.group(3)),
-                }
-            )
-
-    eval_rows = [r for r in rows if r["kind"] == "evaluation"]
-    train_rows = [r for r in rows if r["kind"] == "training"]
-
-    best_file = run_path / "best_eval.json"
-    saved_best = json.loads(best_file.read_text(encoding="utf-8")) if best_file.exists() else None
-
-    return {
-        "run_dir": str(run_path),
-        "best_eval_from_log": min(eval_rows, key=lambda r: r["loss"]) if eval_rows else None,
-        "best_eval_saved": saved_best,
-        "final_eval": eval_rows[-1] if eval_rows else None,
-        "final_train": train_rows[-1] if train_rows else None,
-        "num_loss_points": len(rows),
-    }
+    # kept for potential internal use, but not used in output
+    pass
 
 
 def get_source_run_dir(run_dir):
     run_path = Path(run_dir)
-
     best_eval_path = run_path / "best_eval.json"
     if best_eval_path.exists():
         best_eval = json.loads(best_eval_path.read_text(encoding="utf-8"))
         if best_eval.get("source_run_dir"):
             return best_eval["source_run_dir"]
-
     run_info_path = run_path / "run_info.json"
     if run_info_path.exists():
         run_info = json.loads(run_info_path.read_text(encoding="utf-8"))
         if run_info.get("work_dir"):
             return run_info["work_dir"]
-
     return str(run_path)
 
 
 def find_checkpoint(run_dir, checkpoint_name="best"):
     run_path = Path(run_dir)
-
     if checkpoint_name == "best":
         candidates = [
             run_path / "best.pth",
@@ -149,12 +78,10 @@ def find_checkpoint(run_dir, checkpoint_name="best"):
         ]
     else:
         candidates = [run_path / checkpoint_name]
-
     for path in candidates:
         if path.exists():
             return path
-
-    raise FileNotFoundError(f"No checkpoint found under {run_path}")
+    raise FileNotFoundError(f"No checkpoint found under {run_dir}")
 
 
 def load_local_model(run_dir, device, checkpoint_name="best"):
@@ -217,7 +144,6 @@ def load_local_model(run_dir, device, checkpoint_name="best"):
 def row_to_raw_sample(row):
     if row.get("text"):
         return row["text"], extract_prompt(row["text"])
-
     prompt = row.get("prompt", "")
     target = row.get("target", "")
     raw = prompt + target
@@ -226,17 +152,14 @@ def row_to_raw_sample(row):
 
 def load_jsonl_example(data_dir, split="test", index=0):
     data_dir = Path(data_dir)
-
     candidate_splits = [split]
     for fallback in ["validation", "train"]:
         if fallback not in candidate_splits:
             candidate_splits.append(fallback)
-
     for split_name in candidate_splits:
         path = data_dir / f"{split_name}.jsonl"
         if not path.exists():
             continue
-
         rows = []
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -246,7 +169,6 @@ def load_jsonl_example(data_dir, split="test", index=0):
                 row = json.loads(line)
                 if row.get("text") or row.get("prompt") or row.get("target"):
                     rows.append(row)
-
         if rows:
             idx = index % len(rows)
             raw_sample, prompt = row_to_raw_sample(rows[idx])
@@ -257,7 +179,6 @@ def load_jsonl_example(data_dir, split="test", index=0):
                 "raw_sample": raw_sample,
                 "prompt": prompt,
             }
-
     raise FileNotFoundError(f"No usable jsonl split found under {data_dir}")
 
 
@@ -266,32 +187,25 @@ def extract_prompt(raw_text):
     pos = raw_text.find(marker)
     if pos < 0:
         return raw_text[: min(len(raw_text), 256)]
-
     end = pos + len(marker)
-
     if end < len(raw_text) and raw_text[end] in {" ", "\n"}:
         end += 1
-
     return raw_text[:end]
 
 
 def completion_after_prompt(generated_text, prompt):
     if generated_text.startswith(prompt):
         return generated_text[len(prompt):]
-
     marker = "Assistant:"
     pos = generated_text.find(marker)
     if pos >= 0:
         return generated_text[pos + len(marker):]
-
     return generated_text
 
 
 def read_test_results(model_root):
-    test_path = Path(model_root) / "test_result" / "test_results.json"
-    if not test_path.exists():
-        return None
-    return json.loads(test_path.read_text(encoding="utf-8"))
+    # Not used in compact output
+    pass
 
 
 def sample_text(model, graph, noise, tokenizer, prompt, length, steps, device, seed=None):
@@ -331,44 +245,52 @@ def sample_text(model, graph, noise, tokenizer, prompt, length, steps, device, s
     return tokenizer.batch_decode(sample)[0]
 
 
-def add_model_generations(
-    examples,
-    model_key,
-    checkpoint,
-    model,
-    graph,
-    noise,
-    tokenizer,
-    length,
-    steps,
-    device,
-    seed,
-):
-    for example_idx, example in enumerate(examples):
-        prompt = example["prompt"]
+def run_model_inference(model_key, checkpoint_path, examples, tokenizer, length, steps, device, seed):
+    import copy
+    import torch
+    from load_model import load_model
 
-        restored_text = sample_text(
-            model=model,
-            graph=graph,
-            noise=noise,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            length=length,
-            steps=steps,
-            device=device,
-            seed=seed + example_idx,
-        )
+    new_examples = copy.deepcopy(examples)
 
-        example["model_outputs"][model_key] = {
-            "checkpoint": checkpoint,
-            "restored_text": restored_text,
-            "generated_after_prompt": completion_after_prompt(restored_text, prompt),
-        }
+    model = graph = noise = None
+    try:
+        print(f"\n=== Running {model_key} from {checkpoint_path} ===")
+        if checkpoint_path.startswith("louaaron/"):
+            model, graph, noise = load_model(checkpoint_path, device)
+        else:
+            model, graph, noise, _ = load_local_model(checkpoint_path, device)
+
+        if hasattr(noise, "eval"):
+            noise.eval()
+
+        for ex in new_examples:
+            prompt = ex["prompt"]
+            restored_text = sample_text(
+                model=model,
+                graph=graph,
+                noise=noise,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                length=length,
+                steps=steps,
+                device=device,
+                seed=seed + ex["index"],
+            )
+            ex["model_outputs"][model_key] = {
+                "checkpoint": checkpoint_path,
+                "restored_text": restored_text,
+                "generated_after_prompt": completion_after_prompt(restored_text, prompt),
+            }
+        return new_examples
+    finally:
+        del model, graph, noise
+        cleanup_cuda()
+        print(f"Cleared GPU memory after {model_key}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="JSON comparison for pretrained, QA-best, and QAR-best on one QA sample and one QAR sample."
+        description="Generate compact JSON comparison: for each dataset, show prompt and model outputs."
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--pretrained", default=None)
@@ -406,122 +328,73 @@ def main():
     if out_path.suffix.lower() != ".json":
         out_path = out_path.with_suffix(".json")
 
+    # Auto-detect run directories if not given
     if qa_run is None and (model_root / "QA" / "best.pth").exists():
         qa_run = str(model_root / "QA")
     if qar_run is None and (model_root / "QAR" / "best.pth").exists():
         qar_run = str(model_root / "QAR")
 
-    losses = {}
-    if qa_run:
-        losses["QA"] = parse_losses(qa_run)
-    if qar_run:
-        losses["QAR"] = parse_losses(qar_run)
-
+    # Load one example from QA and QAR datasets
     qa_example = load_jsonl_example(qa_data, split=split, index=sample_index)
     qar_example = load_jsonl_example(qar_data, split=split, index=sample_index)
 
-    examples = []
-    for dataset_name, ex in [("QA", qa_example), ("QAR", qar_example)]:
-        examples.append(
-            {
-                "dataset": dataset_name,
-                "split": ex["split"],
-                "index": ex["index"],
-                "source_path": ex["path"],
-                "raw_sample": ex["raw_sample"],
-                "prompt": ex["prompt"],
-                "generation_length": length,
-                "sampling_steps": steps,
-                "model_outputs": {},
-            }
-        )
+    examples = [
+        {
+            "dataset": "QA-test",
+            "split": qa_example["split"],
+            "index": qa_example["index"],
+            "prompt": qa_example["prompt"],
+            "model_outputs": {},
+        },
+        {
+            "dataset": "QAR-test",
+            "split": qar_example["split"],
+            "index": qar_example["index"],
+            "prompt": qar_example["prompt"],
+            "model_outputs": {},
+        },
+    ]
 
     if not no_sample:
         import torch
         from transformers import GPT2TokenizerFast
-        from load_model import load_model
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        model = graph = noise = None
-        try:
-            print(f"Loading pretrained: {pretrained}")
-            model, graph, noise = load_model(pretrained, device)
-            if hasattr(noise, "eval"):
-                noise.eval()
+        models_to_run = []
+        if pretrained:
+            models_to_run.append(("pretrain", pretrained))
+        if qa_run:
+            models_to_run.append(("QA-best", qa_run))
+        if qar_run:
+            models_to_run.append(("QAR-best", qar_run))
 
-            add_model_generations(
+        for model_key, checkpoint in models_to_run:
+            examples = run_model_inference(
+                model_key=model_key,
+                checkpoint_path=checkpoint,
                 examples=examples,
-                model_key="pretrained",
-                checkpoint=pretrained,
-                model=model,
-                graph=graph,
-                noise=noise,
                 tokenizer=tokenizer,
                 length=length,
                 steps=steps,
                 device=device,
                 seed=seed,
             )
-        finally:
-            del model, graph, noise
-            cleanup_cuda()
 
-        for model_key, run_dir in [("QA_best", qa_run), ("QAR_best", qar_run)]:
-            if not run_dir:
-                continue
+    # Build compact report
+    compact_report = {}
+    for ex in examples:
+        ds = ex["dataset"]
+        compact_report[ds] = {
+            "sample": ex["prompt"],
+            "pretrain": ex["model_outputs"].get("pretrain", {}).get("generated_after_prompt", None),
+            "QA-best": ex["model_outputs"].get("QA-best", {}).get("generated_after_prompt", None),
+            "QAR-best": ex["model_outputs"].get("QAR-best", {}).get("generated_after_prompt", None),
+        }
 
-            model = graph = noise = None
-            try:
-                print(f"Loading {model_key}: {run_dir}")
-                model, graph, noise, ckpt = load_local_model(run_dir, device)
-
-                add_model_generations(
-                    examples=examples,
-                    model_key=model_key,
-                    checkpoint=ckpt,
-                    model=model,
-                    graph=graph,
-                    noise=noise,
-                    tokenizer=tokenizer,
-                    length=length,
-                    steps=steps,
-                    device=device,
-                    seed=seed,
-                )
-
-                if model_key == "QA_best":
-                    losses.setdefault("QA", {})["sample_checkpoint"] = ckpt
-                if model_key == "QAR_best":
-                    losses.setdefault("QAR", {})["sample_checkpoint"] = ckpt
-
-            finally:
-                del model, graph, noise
-                cleanup_cuda()
-
-    report = {
-        "metadata": {
-            "model_root": str(model_root),
-            "pretrained": pretrained,
-            "qa_run": qa_run,
-            "qar_run": qar_run,
-            "qa_data": str(qa_data),
-            "qar_data": str(qar_data),
-            "split": split,
-            "sample_index": sample_index,
-            "length": length,
-            "steps": steps,
-            "seed": seed,
-            "format": "For each QA/QAR raw sample, compare pretrained, QA_best, and QAR_best restored/generated text.",
-        },
-        "losses": losses,
-        "test_results": read_test_results(model_root),
-        "examples": examples,
-    }
-
-    dump_json(report, out_path)
-    print(f"Wrote JSON comparison report to {out_path}")
+    dump_json(compact_report, out_path)
+    print(f"Wrote compact comparison to {out_path}")
 
 
 if __name__ == "__main__":

@@ -53,14 +53,18 @@ def split_indices(n_rows, valid_ratio, test_ratio, seed):
 
 
 def make_qa(row_id, question, answer, meta):
-    prompt = f"User: {question}\nAssistant:"
-    target = f" {answer}"
+    prompt = f"User: {question}\nAssistant:\nAnswer:\n"
+    target = clean(answer)
     return {
         "id": row_id,
         "mode": "QA",
         "prompt": prompt,
         "target": target,
         "text": prompt + target,
+        "segments": [
+            {"text": prompt, "loss": False, "name": "prompt"},
+            {"text": target, "loss": True, "name": "answer"},
+        ],
         "question": question,
         "answer": answer,
         **meta,
@@ -68,14 +72,23 @@ def make_qa(row_id, question, answer, meta):
 
 
 def make_qar(row_id, question, reasoning, answer, meta):
-    prompt = f"User: {question}\nAssistant:\n"
-    target = f"{reasoning}\n\nFinal Answer: {answer}"
+    prompt = f"User: {question}\nAssistant:\nAnswer:\n"
+    answer_text = clean(answer)
+    reason_cue = "\n\nReason:\n"
+    reasoning_text = clean(reasoning)
+    target = answer_text + reason_cue + reasoning_text
     return {
         "id": row_id,
         "mode": "QAR",
         "prompt": prompt,
         "target": target,
         "text": prompt + target,
+        "segments": [
+            {"text": prompt, "loss": False, "name": "prompt"},
+            {"text": answer_text, "loss": True, "name": "answer"},
+            {"text": reason_cue, "loss": False, "name": "reason_cue"},
+            {"text": reasoning_text, "loss": True, "name": "reasoning"},
+        ],
         "question": question,
         "reasoning": reasoning,
         "answer": answer,

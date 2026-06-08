@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 from pathlib import Path
 
 
@@ -14,10 +15,21 @@ def read_csv(path):
 
 
 def best_metrics_path(root, name):
-    direct = Path(root) / name / "best_metrics.csv"
+    run_root = Path(root) / name
+    best_eval = run_root / "best_eval.json"
+    if best_eval.exists():
+        with open(best_eval, "r", encoding="utf-8") as f:
+            run_instance = json.load(f).get("run_instance")
+        if run_instance:
+            full_run_metrics = run_root / run_instance / "metrics.csv"
+            if full_run_metrics.exists():
+                return full_run_metrics
+
+    direct = run_root / "best_metrics.csv"
     if direct.exists():
         return direct
-    return Path(root) / name / "metrics.csv"
+
+    return run_root / "metrics.csv"
 
 
 def plot_curve(root, name, out_dir):
@@ -37,7 +49,17 @@ def plot_curve(root, name, out_dir):
     for split, label in [("train", "train"), ("validation", "validation")]:
         selected = [row for row in rows if row["split"] == split]
         if selected:
-            plt.plot([r["step"] for r in selected], [r["loss"] for r in selected], marker="o", label=label)
+            marker = "." if split == "train" and len(selected) > 100 else "o"
+            linewidth = 1.0 if split == "train" else 1.8
+            markersize = 2 if split == "train" and len(selected) > 100 else 4
+            plt.plot(
+                [r["step"] for r in selected],
+                [r["loss"] for r in selected],
+                marker=marker,
+                markersize=markersize,
+                linewidth=linewidth,
+                label=f"{label} ({len(selected)} points)",
+            )
     baseline = [row for row in rows if row["split"] == "pretrain_validation"]
     if baseline:
         plt.axhline(baseline[0]["loss"], linestyle="--", label="pretrained validation")

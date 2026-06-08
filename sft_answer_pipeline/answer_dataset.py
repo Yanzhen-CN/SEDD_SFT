@@ -25,6 +25,9 @@ class AnswerJsonlDataset(Dataset):
         return len(self.rows)
 
     def _encode(self, row):
+        if row.get("segments"):
+            return self._encode_segments(row)
+
         prompt_ids = self.tokenizer(row["prompt"], add_special_tokens=False).input_ids
         target_ids = self.tokenizer(row["target"], add_special_tokens=False).input_ids
 
@@ -54,6 +57,87 @@ class AnswerJsonlDataset(Dataset):
             "prompt_len": len(prompt_ids),
             "target_len": int(sum(answer_mask)),
         }
+
+    def _encode_segments(self, row):
+        encoded = []
+        for segment in row["segments"]:
+            segment_ids = self.tokenizer(segment["text"], add_special_tokens=False).input_ids
+            encoded.append({
+                "name": segment.get("name", "segment"),
+                "ids": segment_ids,
+                "loss": bool(segment.get("loss")),
+            })
+
+        ids, mask = self._truncate_encoded_segments(encoded)
+        segment_token_counts = {item["name"]: len(item["ids"]) for item in encoded}
+
+        if sum(mask) == 0:
+            ids = ids[: self.max_length - 1] + [self.tokenizer.eos_token_id]
+            mask = mask[: self.max_length - 1] + [1]
+
+        attention_mask = [1] * len(ids)
+        pad_len = self.max_length - len(ids)
+        if pad_len > 0:
+            ids += [self.tokenizer.eos_token_id] * pad_len
+            mask += [0] * pad_len
+            attention_mask += [0] * pad_len
+
+        return {
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "answer_mask": torch.tensor(mask, dtype=torch.bool),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.bool),
+            "prompt_len": int(segment_token_counts.get("prompt", 0)),
+            "target_len": int(sum(mask)),
+        }
+
+    def _truncate_encoded_segments(self, encoded):
+        total_len = sum(len(item["ids"]) for item in encoded)
+        if total_len <= self.max_length:
+            ids = []
+            mask = []
+            for item in encoded:
+                ids.extend(item["ids"])
+                mask.extend([1 if item["loss"] else 0] * len(item["ids"]))
+            return ids, mask
+
+        by_name = {item["name"]: item for item in encoded}
+        prompt = by_name.get("prompt", {"ids": [], "loss": False})
+        reasoning = by_name.get("reasoning", {"ids": [], "loss": True})
+        cue = by_name.get("reason_cue", {"ids": [], "loss": False})
+        answer = by_name.get("answer", {"ids": [], "loss": True})
+
+        if "answer" not in by_name:
+            return self._truncate_generic_segments(encoded)
+
+        reserved_answer = min(len(answer["ids"]), max(self.min_target_tokens, self.max_length // 3))
+        answer_ids = answer["ids"][:reserved_answer]
+        answer_mask = [1] * len(answer_ids)
+
+        prompt_budget = max(1, self.max_length - len(answer_ids) - len(cue["ids"]) - self.min_target_tokens)
+        prompt_ids = prompt["ids"][-prompt_budget:]
+        prompt_mask = [0] * len(prompt_ids)
+
+        remaining = self.max_length - len(prompt_ids) - len(answer_ids) - len(cue["ids"])
+        reasoning_ids = reasoning["ids"][:max(0, remaining)]
+        reasoning_mask = [1] * len(reasoning_ids)
+
+        ids = prompt_ids + answer_ids + cue["ids"] + reasoning_ids
+        mask = prompt_mask + answer_mask + [0] * len(cue["ids"]) + reasoning_mask
+        return ids[:self.max_length], mask[:self.max_length]
+
+    def _truncate_generic_segments(self, encoded):
+        ids = []
+        mask = []
+        remaining = self.max_length
+        for item in encoded:
+            if remaining <= 0:
+                break
+            take = min(len(item["ids"]), remaining)
+            current = item["ids"][-take:] if not item["loss"] else item["ids"][:take]
+            ids.extend(current)
+            mask.extend([1 if item["loss"] else 0] * take)
+            remaining -= take
+        return ids, mask
 
     def __getitem__(self, idx):
         row = self.rows[idx]

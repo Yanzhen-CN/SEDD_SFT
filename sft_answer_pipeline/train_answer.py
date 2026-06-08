@@ -273,6 +273,12 @@ def train_one(config, run_name):
         if save_freq > 0 and step % save_freq == 0:
             save_checkpoint(run_dir / f"step_{step}.pth", model, ema, optimizer, step, run_info)
 
+    global_best_path = global_dir / "best_eval.json"
+    if global_best_path.exists():
+        global_best = json.loads(global_best_path.read_text(encoding="utf-8"))
+        if global_best.get("run_instance") == run_instance:
+            sync_global_best(run_dir, global_dir)
+
     print(f"[{run_name}] done. run_dir={run_dir}")
 
 
