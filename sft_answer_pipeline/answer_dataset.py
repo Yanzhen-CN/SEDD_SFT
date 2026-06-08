@@ -86,7 +86,12 @@ class AnswerJsonlDataset(Dataset):
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "answer_mask": torch.tensor(mask, dtype=torch.bool),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.bool),
-            "prompt_len": int(segment_token_counts.get("prompt", 0)),
+            "prompt_len": int(
+                segment_token_counts.get("prompt", 0)
+                + segment_token_counts.get("user_label", 0)
+                + segment_token_counts.get("user", 0)
+                + segment_token_counts.get("assistant_label", 0)
+            ),
             "target_len": int(sum(mask)),
         }
 
@@ -101,10 +106,21 @@ class AnswerJsonlDataset(Dataset):
             return ids, mask
 
         by_name = {item["name"]: item for item in encoded}
-        prompt = by_name.get("prompt", {"ids": [], "loss": False})
+        prompt = by_name.get("prompt")
+        if prompt is None:
+            prompt_ids = []
+            for item in encoded:
+                if item["name"] == "assistant":
+                    break
+                if not item["loss"]:
+                    prompt_ids.extend(item["ids"])
+            prompt = {"ids": prompt_ids, "loss": False}
         assistant = by_name.get("assistant", by_name.get("answer", {"ids": [], "loss": True}))
         reasoning = by_name.get("reasoning", {"ids": [], "loss": True})
-        cue = by_name.get("reasoning_cue", by_name.get("reason_cue", {"ids": [], "loss": False}))
+        cue = by_name.get(
+            "reasoning_label",
+            by_name.get("reasoning_cue", by_name.get("reason_cue", {"ids": [], "loss": False})),
+        )
 
         if "assistant" not in by_name and "answer" not in by_name:
             return self._truncate_generic_segments(encoded)

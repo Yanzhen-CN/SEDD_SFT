@@ -52,19 +52,36 @@ def split_indices(n_rows, valid_ratio, test_ratio, seed):
     return set(indices[:n_valid]), set(indices[n_valid:n_valid + n_test])
 
 
+def join_segments(segments):
+    return "".join(segment["text"] for segment in segments)
+
+
+def fixed_text(segments):
+    return "".join(segment["text"] for segment in segments if not segment["loss"])
+
+
+def target_text(segments):
+    return "".join(segment["text"] for segment in segments if segment["loss"])
+
+
 def make_qa(row_id, question, answer, meta):
-    prompt = f"User: {question}\nAssistant:\n"
+    user_text = clean(question)
     assistant_text = clean(answer)
+    segments = [
+        {"text": "User: ", "loss": False, "name": "user_label"},
+        {"text": user_text, "loss": False, "name": "user"},
+        {"text": "\nAssistant:\n", "loss": False, "name": "assistant_label"},
+        {"text": assistant_text, "loss": True, "name": "assistant"},
+    ]
     return {
         "id": row_id,
         "mode": "QA",
-        "prompt": prompt,
-        "target": assistant_text,
-        "text": prompt + assistant_text,
-        "segments": [
-            {"text": prompt, "loss": False, "name": "prompt"},
-            {"text": assistant_text, "loss": True, "name": "assistant"},
-        ],
+        "text": join_segments(segments),
+        "segments": segments,
+        "prompt": fixed_text(segments),
+        "target": target_text(segments),
+        "user": user_text,
+        "assistant": assistant_text,
         "question": question,
         "answer": answer,
         **meta,
@@ -72,23 +89,27 @@ def make_qa(row_id, question, answer, meta):
 
 
 def make_qar(row_id, question, reasoning, answer, meta):
-    prompt = f"User: {question}\nAssistant:\n"
+    user_text = clean(question)
     assistant_text = clean(answer)
-    reasoning_cue = "\nReasoning:\n"
     reasoning_text = clean(reasoning)
-    target = assistant_text + reasoning_cue + reasoning_text
+    segments = [
+        {"text": "User: ", "loss": False, "name": "user_label"},
+        {"text": user_text, "loss": False, "name": "user"},
+        {"text": "\nAssistant:\n", "loss": False, "name": "assistant_label"},
+        {"text": assistant_text, "loss": True, "name": "assistant"},
+        {"text": "\nReasoning:\n", "loss": False, "name": "reasoning_label"},
+        {"text": reasoning_text, "loss": True, "name": "reasoning"},
+    ]
     return {
         "id": row_id,
         "mode": "QAR",
-        "prompt": prompt,
-        "target": target,
-        "text": prompt + target,
-        "segments": [
-            {"text": prompt, "loss": False, "name": "prompt"},
-            {"text": assistant_text, "loss": True, "name": "assistant"},
-            {"text": reasoning_cue, "loss": False, "name": "reasoning_cue"},
-            {"text": reasoning_text, "loss": True, "name": "reasoning"},
-        ],
+        "text": join_segments(segments),
+        "segments": segments,
+        "prompt": "User: " + user_text + "\nAssistant:\n",
+        "target": assistant_text + "\nReasoning:\n" + reasoning_text,
+        "user": user_text,
+        "assistant": assistant_text,
+        "reasoning": reasoning_text,
         "question": question,
         "reasoning": reasoning,
         "answer": answer,
