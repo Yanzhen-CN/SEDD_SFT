@@ -25,6 +25,35 @@ def segment_text(sample, train=None):
     return sample_text(sample, train=train)
 
 
+def segment_value(sample, name, default=""):
+    segment = sample.get("segments", {}).get(name)
+    if not segment:
+        return default
+    return segment.get("text", default)
+
+
+def assistant_completion(sample):
+    from answer_dataset import ordered_segments
+
+    parts = []
+    seen_assistant = False
+    for name, segment in ordered_segments(sample):
+        if seen_assistant:
+            parts.append(segment.get("text", ""))
+        if name == "assistant_label":
+            seen_assistant = True
+    return "".join(parts)
+
+
+def completion_from_full_text(text):
+    raw = str(text or "")
+    marker = "Assistant:"
+    idx = raw.find(marker)
+    if idx >= 0:
+        return raw[idx + len(marker):].strip()
+    return raw.strip()
+
+
 def load_filtered_samples(config, tokenizer, limit):
     from answer_dataset import AnswerSegmentDataset
 
@@ -103,29 +132,39 @@ def sample_infilling(model, graph, noise, tokenizer, sample, length, steps, devi
     target_positions = [i for i, is_train in enumerate(train_mask[:real_len]) if is_train]
     with torch.no_grad():
         generated = proj_fun(sampling_fn(model))
+        full_text = tokenizer.batch_decode(generated[:, :real_len])[0].strip()
         target_ids = generated[0, target_positions]
-    return tokenizer.decode(target_ids).strip()
+    return {
+        "completion": completion_from_full_text(full_text),
+        "target": tokenizer.decode(target_ids).strip(),
+        "full": full_text,
+    }
 
 
 def write_report(path, records):
     lines = ["# Reasoning-conditioned Answer Generation Examples", ""]
+    lines.append(
+        "`Reasoning:` and teacher reasoning are fixed conditioning tokens in RA; "
+        "the generated answer section is stitched back into the full assistant completion."
+    )
+    lines.append("")
     for item in records:
         lines.append(f"## {item['id']}")
         lines.append("")
-        lines.append("### Fixed question + teacher reasoning")
+        lines.append("### Question")
         lines.append("```text")
-        lines.append(item["prompt"])
+        lines.append(item["question"].strip())
         lines.append("```")
         lines.append("")
-        lines.append("### Reference answer")
+        lines.append("### GT")
         lines.append("```text")
-        lines.append(item["reference"].strip())
+        lines.append(item["reference_completion"].strip())
         lines.append("```")
         lines.append("")
-        for model_name, text in item["generations"].items():
+        for model_name, result in item["generations"].items():
             lines.append(f"### {model_name}")
             lines.append("```text")
-            lines.append(text.strip())
+            lines.append(result["completion"].strip())
             lines.append("```")
             lines.append("")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -152,8 +191,10 @@ def main():
     for idx, row in enumerate(rows):
         item = {
             "id": row.get("id", str(idx)),
+            "question": segment_value(row, "user"),
             "prompt": segment_text(row, train=False),
             "reference": segment_text(row, train=True),
+            "reference_completion": assistant_completion(row),
             "generations": {},
         }
         for model_name, (model, graph, noise, _) in loaded.items():

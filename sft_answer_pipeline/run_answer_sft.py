@@ -1,68 +1,35 @@
-import argparse
-import os
-import subprocess
-import sys
-from pathlib import Path
+"""Deprecated one-command runner for answer SFT.
 
-import yaml
+The current experiments are intentionally run step by step:
+prepare data -> train -> test -> generate -> visualize.  Keeping this file as
+a clear stop sign avoids accidentally rebuilding data and starting training
+with stale assumptions.
+"""
+
+from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_DIR = SCRIPT_DIR.parent
-DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
-
-
-def load_config(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def selected_runs(config):
-    selected = config.get("run", {}).get("selected", "QA")
-    if selected == "all":
-        return ["QA", "QAR"]
-    if isinstance(selected, list):
-        return selected
-    return [selected]
-
-
-def maybe_prepare_data(config_path, config):
-    if not config.get("data", {}).get("build", True):
-        return
-    cmd = [sys.executable, str(SCRIPT_DIR / "prepare_answer_data.py"), "--config", str(config_path)]
-    subprocess.check_call(cmd, cwd=str(REPO_DIR))
-
-
-def run_train(config_path, config, run_name):
-    env = os.environ.copy()
-    cuda = config.get("runs", {}).get(run_name, {}).get("cuda_visible_devices")
-    if cuda is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(cuda)
-    cmd = [sys.executable, str(SCRIPT_DIR / "train_answer.py"), "--config", str(config_path), "--run", run_name]
-    print(f"[{run_name}] {' '.join(cmd)}")
-    return subprocess.call(cmd, cwd=str(REPO_DIR), env=env)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="One-command answer-conditioned SFT runner.")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    args = parser.parse_args()
-
-    config_path = Path(args.config)
-    config = load_config(config_path)
-    maybe_prepare_data(config_path, config)
-
-    if not config.get("run", {}).get("execute", True):
-        print("run.execute=false, data preparation finished only.")
-        return
-
-    failures = []
-    for run_name in selected_runs(config):
-        code = run_train(config_path, config, run_name)
-        if code != 0:
-            failures.append((run_name, code))
-    if failures:
-        raise SystemExit(f"Run(s) failed: {failures}")
+    print(
+        "\n".join(
+            [
+                "run_answer_sft.py is deprecated for the current anchored-SFT workflow.",
+                "",
+                "Use the explicit server workflow instead:",
+                f"  python {SCRIPT_DIR / 'prepare_answer_data.py'} --config {SCRIPT_DIR / 'answer_config.yaml'}",
+                f"  python {SCRIPT_DIR / 'train_answer.py'} --config {SCRIPT_DIR / 'answer_config.yaml'}",
+                f"  python {SCRIPT_DIR / 'test_answer_eval.py'} --config {SCRIPT_DIR / 'answer_config.yaml'}",
+                f"  python {SCRIPT_DIR / 'generate_answer_examples.py'} --config {SCRIPT_DIR / 'answer_config.yaml'} --dataset QAR",
+                f"  python {SCRIPT_DIR / 'visual_answer.py'}",
+                "",
+                "RL still has a batch launcher: bash sft_rl_pipeline/launch_rl_six.sh",
+            ]
+        )
+    )
+    raise SystemExit(2)
 
 
 if __name__ == "__main__":

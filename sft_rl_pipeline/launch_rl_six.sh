@@ -24,8 +24,8 @@ QAR_CKPT="$(read_yaml_value "$SFT_CONFIG" model.init_checkpoint)"
 QAR_DATA_DIR="$(read_yaml_value "$SFT_CONFIG" data.data_dir)"
 QAR_DATA="${QAR_DATA_DIR}/train.jsonl"
 
-if [[ ! -f "$PRETRAIN_CKPT" ]]; then
-  echo "Missing $PRETRAIN_CKPT. Run: python save_pretrained_checkpoint.py"
+if [[ -n "$PRETRAIN_CKPT" && ! -f "$PRETRAIN_CKPT" ]]; then
+  echo "Missing $PRETRAIN_CKPT. Either create it or leave model.init_checkpoint empty for pretrained-start RL."
   exit 1
 fi
 if [[ ! -f "$QAR_CKPT" ]]; then

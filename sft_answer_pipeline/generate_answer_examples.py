@@ -58,6 +58,13 @@ def assistant_completion(sample):
     return "".join(parts)
 
 
+def segment_value(sample, name, default=""):
+    segment = sample.get("segments", {}).get(name)
+    if not segment:
+        return default
+    return segment.get("text", default)
+
+
 def completion_from_full_text(text):
     raw = str(text or "")
     marker = "Assistant:"
@@ -159,37 +166,27 @@ def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, ste
 
 def write_report(path, records):
     lines = ["# Answer SFT Generation Examples", ""]
-    lines.append("Structural anchors such as `Reasoning:` and `Answer:` may be fixed conditioning tokens; therefore the completion view is the main qualitative output.")
+    lines.append("Each generated section is stitched back into the fixed assistant scaffold. Read the completion blocks, not the raw target-only string.")
     lines.append("")
     for item in records:
         lines.append(f"## {item['id']}")
         lines.append("")
         lines.append(f"Mode: `{item.get('mode', '')}`")
         lines.append("")
-        lines.append("### Fixed conditioning tokens")
+        lines.append("### Question")
         lines.append("```text")
-        lines.append(item["prompt"])
+        lines.append(item["question"].strip())
         lines.append("```")
         lines.append("")
-        lines.append("### Reference assistant completion")
+        lines.append("### GT")
         lines.append("```text")
         lines.append(item["reference_completion"].strip())
         lines.append("```")
         lines.append("")
-        lines.append("### Reference generated-token target only")
-        lines.append("```text")
-        lines.append(item["reference_target"].strip())
-        lines.append("```")
-        lines.append("")
         for model_name, result in item["generations"].items():
-            lines.append(f"### {model_name} completion")
+            lines.append(f"### {model_name}")
             lines.append("```text")
             lines.append(result["completion"].strip())
-            lines.append("```")
-            lines.append("")
-            lines.append(f"### {model_name} generated-token target only")
-            lines.append("```text")
-            lines.append(result["target"].strip())
             lines.append("```")
             lines.append("")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -227,6 +224,7 @@ def main():
         item = {
             "id": row.get("id", str(idx)),
             "mode": row.get("mode", args.dataset),
+            "question": segment_value(row, "user"),
             "prompt": segment_text(row, train=False),
             "reference_target": segment_text(row, train=True),
             "reference_completion": assistant_completion(row),
