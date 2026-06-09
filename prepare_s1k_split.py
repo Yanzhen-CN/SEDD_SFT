@@ -1,19 +1,22 @@
 """
-Root-level S1K split/data preparation for SEDD SFT pipelines.
+Root-level S1K preparation for SEDD SFT pipelines.
 
-This file does the shared, expensive data work once, in the order requested:
-  1) filter rows by extracting a short final answer from `solution`
-  2) compute QAR total token length and find rows that need compression
-  3) compress only overlength reasoning, using complete sentence-like units only
-  4) split the processed rows into train / validation / test
+This script does the shared data work once and writes two data folders:
+  data/S1K/       : raw S1K rows, kept for inspection/debugging
+  data/S1K_light/ : cleaned/light rows used by QA, QAR and QRA adapters
 
-Output files:
-  data/S1K/raw.jsonl and data/S1K/manifest.json contain original S1K rows.
-  data/S1K_light/train.jsonl, validation.jsonl, test.jsonl contain processed light rows with no train masks.
-  data/S1K_light/manifest.json contains processing/split statistics.
+Current intended order:
+  1) Clean/extract the final answer from `solution` first.
+     The Answer section should be the final answer only, not the explanation/reasoning.
+  2) Optionally verify that the selected reasoning trace actually contains/matches that answer.
+     This filters out cases where the teacher reasoning solved a different answer.
+  3) Compute the fixed length of question + anchors + cleaned answer, then crop only the reasoning body.
+     The question, labels and cleaned answer are never cropped here.
+  4) Split the processed S1K_light rows into train / validation / test.
 
-Pipeline-specific prepare files read these S1K_light rows and only create segment masks:
-  QA:  question -> answer
+S1K_light rows are content-level rows only. They do not contain train masks.
+Pipeline adapters create masks later:
+  QA : question -> answer
   QAR: question -> reasoning + answer
   QRA: question + teacher reasoning -> answer
 """
@@ -41,6 +44,7 @@ DEFAULT_CONFIG = REPO_DIR / "sft_answer_pipeline" / "answer_config.yaml"
 DEFAULT_RAW_OUTPUT_DIR = REPO_DIR / "data" / "S1K"
 DEFAULT_LIGHT_OUTPUT_DIR = REPO_DIR / "data" / "S1K_light"
 ELLIPSIS = "..."
+_TOKEN_CACHE: Dict[str, int] = {}
 
 REASONING_CUES = [
     "according to", "based on", "given", "given that", "note that", "notice that",
@@ -57,6 +61,15 @@ ANSWER_CUES = [
     "so the answer", "hence the answer", "we get", "we obtain", "equals",
     "is equal to", "\\boxed", "####",
 ]
+EXPLANATION_HEADINGS = (
+    "explanation", "definition", "wordplay", "reasoning", "solution", "parse", "clue",
+    "defn", "def", "analysis", "proof", "working", "work", "steps",
+)
+BAD_ANSWER_PREFIXES = (
+    "defn:", "definition:", "wordplay:", "parse:", "explanation:", "clue:",
+    "def:", "cryptic:", "reasoning:", "solution:", "analysis:", "proof:",
+    "working:", "work:", "steps:", "anagram of", "homophone of", "hidden in",
+)
 
 
 def clean(text) -> str:
@@ -85,16 +98,21 @@ def write_jsonl(path, rows: Iterable[dict]) -> None:
 def load_s1k(data_cfg):
     if data_cfg.get("arrow_path"):
         from datasets import Dataset
-
         return Dataset.from_file(data_cfg["arrow_path"])
 
     from datasets import load_dataset
-
     return load_dataset(data_cfg.get("source_dataset", "simplescaling/s1K-1.1"), split="train")
 
 
 def token_count(tokenizer, text) -> int:
-    return len(tokenizer(clean(text), add_special_tokens=False).input_ids)
+    text = clean(text)
+    cached = _TOKEN_CACHE.get(text)
+    if cached is not None:
+        return cached
+    n = len(tokenizer(text, add_special_tokens=False).input_ids)
+    if len(_TOKEN_CACHE) < 200000:
+        _TOKEN_CACHE[text] = n
+    return n
 
 
 def _percentile(sorted_values: List[int], q: float):
@@ -132,7 +150,7 @@ def split_indices(n_rows: int, valid_ratio: float, test_ratio: float, seed: int)
 
 
 def split_sentences(text) -> List[str]:
-    """Split into complete sentence-like units; never returns half-token crops."""
+    """Split into complete sentence-like units; no token-level half-sentence truncation."""
     text = clean(text)
     if not text:
         return []
@@ -142,7 +160,6 @@ def split_sentences(text) -> List[str]:
         block = clean(block)
         if not block:
             continue
-        # First split on strong sentence boundaries. For math derivations, keep lines complete.
         pieces = re.split(r"(?<=[。！？!?])\s+|(?<=[.!?])\s+(?=[A-Z0-9\\\(\[])", block)
         for piece in pieces:
             piece = clean(piece)
@@ -153,7 +170,6 @@ def split_sentences(text) -> List[str]:
                 units.extend(lines)
             else:
                 units.append(piece)
-    # Remove exact duplicates while keeping order. This reduces repeated model traces.
     out, seen = [], set()
     for unit in units:
         key = re.sub(r"\s+", " ", unit).strip().lower()
@@ -171,59 +187,167 @@ def _strip_boxed(text: str) -> str:
     return text
 
 
-def looks_like_short_answer(text, max_chars=320, max_tokens=None, tokenizer=None) -> bool:
+def clean_answer_candidate(candidate: str) -> str:
+    """Clean a possible final-answer string, but do not keep explanations."""
+    candidate = clean(candidate)
+    if not candidate:
+        return ""
+
+    # Cut off any explanation heading accidentally captured after the answer.
+    candidate = re.split(
+        r"(?im)\n\s*#{0,6}\s*(?:" + "|".join(EXPLANATION_HEADINGS) + r")\s*:",
+        candidate,
+        maxsplit=1,
+    )[0]
+    candidate = re.split(
+        r"(?im)\s+#{1,6}\s*(?:" + "|".join(EXPLANATION_HEADINGS) + r")\s*:",
+        candidate,
+        maxsplit=1,
+    )[0]
+
+    # Strip markdown headings/answer labels.
+    candidate = re.sub(r"^\s*#{0,6}\s*(?:final\s+)?answer\s*:\s*", "", candidate, flags=re.I).strip()
+    candidate = re.sub(r"^\s*(?:the\s+)?(?:final\s+)?answer\s+(?:is|=)\s*", "", candidate, flags=re.I).strip()
+
+    # If explicit answer phrase captured a whole clause, keep the answer-like prefix.
+    candidate = re.split(r"\s+(?:because|since|as|which|that\s+is\s+why|therefore|so)\b", candidate, maxsplit=1, flags=re.I)[0]
+
+    # Remove common markdown/emphasis/wrappers.
+    candidate = re.sub(r"^[-*•\s]+", "", candidate).strip()
+    candidate = re.sub(r"^\*\*(.+?)\*\*$", r"\1", candidate).strip()
+    candidate = candidate.strip(" \t\n\r'\"“”‘’`")
+    candidate = re.sub(r"^\((.+)\)$", r"\1", candidate).strip()
+
+    # Prefer first nonempty line if a remaining candidate is multiline. The Answer field
+    # should not include the explanation block.
+    lines = [clean(x) for x in candidate.splitlines() if clean(x)]
+    if lines:
+        candidate = lines[0]
+
+    # Remove final punctuation unless it is likely part of a formula/decimal.
+    candidate = re.sub(r"[。!?]+$", "", candidate).strip()
+    if not re.search(r"\d\.\d$", candidate):
+        candidate = re.sub(r"\.$", "", candidate).strip()
+    return candidate
+
+
+def reject_bad_answer_candidate(text: str) -> bool:
+    t = clean(text)
+    low = t.lower().strip()
+    if not t:
+        return True
+    if low.startswith(BAD_ANSWER_PREFIXES):
+        return True
+    if re.search(r"(?im)^\s*#{0,6}\s*(?:" + "|".join(EXPLANATION_HEADINGS) + r")\s*:", t):
+        return True
+    # Explanation-like snippets should not become the Answer section.
+    if low.startswith(("anagram of", "homophone of", "hidden in", "definition of", "clue is")):
+        return True
+    if "…" in t and not re.search(r"[A-Za-z0-9]", t.replace("…", "")):
+        return True
+    return False
+
+
+def looks_like_clean_answer(text, max_chars=1200, max_tokens=None, tokenizer=None) -> bool:
+    """Accept a final answer that may be a scalar, phrase, or short natural-language answer.
+
+    It may be longer than a single token, but it should not be a multi-section reasoning block.
+    """
     text = clean(text)
-    if not text:
+    if not text or reject_bad_answer_candidate(text):
         return False
     if len(text) > max_chars:
         return False
     if max_tokens is not None and tokenizer is not None and token_count(tokenizer, text) > max_tokens:
         return False
-    scalar_patterns = [
-        r"^[+-]?\d+(?:\.\d+)?(?:/\d+)?(?:\s*[%°])?$",
-        r"^[A-E]$",
-        r"^(yes|no|true|false)$",
-        r"^\\boxed\s*\{.+\}$",
-        r"^[A-Za-z0-9_\\{}^+\-*/=().,\s]+$",
+
+    # Reject obvious reasoning blocks, even if they fit the token budget.
+    if "\n" in text:
+        return False
+    if len(split_sentences(text)) > 2 and token_count(tokenizer, text) > 80:
+        return False
+    if re.search(r"\b(first|second|next|then|therefore|because|since|we need to|we can|let us|let's)\b", text, flags=re.I):
+        # Allow short phrase answers that happen to contain a cue word, but reject long reasoning-like text.
+        if token_count(tokenizer, text) > 40:
+            return False
+    return True
+
+
+def add_markdown_answer_candidates(text: str, method_prefix: str, candidates: List[Tuple[str, str]]) -> None:
+    """Extract from structured answer sections before any tail fallback.
+
+    Handles:
+      ### Answer: GOATHERDS
+      Answer:\nGOATHERDS\n### Explanation: ...
+    """
+    text = clean(text)
+    if not text:
+        return
+
+    # Line form: `### Answer: GOATHERDS`.
+    for line in text.splitlines():
+        m = re.match(r"^\s*#{0,6}\s*(?:final\s+)?answer\s*:\s*(.+?)\s*$", line, flags=re.I)
+        if m:
+            candidates.append((clean_answer_candidate(m.group(1)), f"{method_prefix}_markdown_answer_line"))
+
+    # Block form: `Answer:` followed by lines until next heading.
+    heading = r"(?:" + "|".join(EXPLANATION_HEADINGS) + r")"
+    block_pattern = re.compile(
+        r"(?is)(?:^|\n)\s*#{0,6}\s*(?:final\s+)?answer\s*:\s*(.*?)"
+        r"(?=\n\s*#{0,6}\s*" + heading + r"\s*:|\n\s*\*\*|\Z)"
+    )
+    for m in block_pattern.finditer(text):
+        block = clean(m.group(1))
+        if not block:
+            continue
+        lines = [clean(x) for x in block.splitlines() if clean(x)]
+        if lines:
+            candidates.append((clean_answer_candidate(lines[0]), f"{method_prefix}_markdown_answer_block_first_line"))
+        candidates.append((clean_answer_candidate(block), f"{method_prefix}_markdown_answer_block"))
+
+
+def add_explicit_answer_candidates(text: str, method_prefix: str, candidates: List[Tuple[str, str]]) -> None:
+    text = clean(text)
+    if not text:
+        return
+    patterns = [
+        r"(?i)(?:final\s+answer|the\s+answer\s+is|answer\s+is|answer\s*:|therefore\s+the\s+answer\s+is|so\s+the\s+answer\s+is)\s*[\"“']?([^\n\"”']{1,220})[\"”']?",
+        r"(?i)(?:we\s+get|we\s+obtain)\s+[\"“']?([^\n\"”']{1,160})[\"”']?",
     ]
-    if any(re.fullmatch(p, text, flags=re.IGNORECASE | re.DOTALL) for p in scalar_patterns):
-        return True
-    return len(text.split()) <= 40
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text))
+        for m in reversed(matches[-8:]):
+            candidates.append((clean_answer_candidate(m.group(1)), f"{method_prefix}_explicit_answer_marker"))
 
 
-def extract_short_answer(solution, tokenizer, data_cfg) -> Tuple[str, str]:
-    """Extract concise final answer from solution; never use a long solution as Answer."""
-    solution = clean(solution)
-    if not solution:
-        return "", "empty_solution"
+def add_math_answer_candidates(text: str, method_prefix: str, candidates: List[Tuple[str, str]]) -> None:
+    text = clean(text)
+    if not text:
+        return
+    for m in re.finditer(r"\\boxed\s*\{([^{}]+)\}", text, flags=re.DOTALL):
+        candidates.append((clean("\\boxed{" + m.group(1) + "}"), f"{method_prefix}_boxed"))
+    for m in re.finditer(r"####\s*([^\n]+)", text):
+        candidates.append((clean_answer_candidate(m.group(1)), f"{method_prefix}_gsm8k_hash"))
 
-    max_chars = int(data_cfg.get("max_answer_chars", 320))
-    max_tokens = int(data_cfg.get("max_answer_tokens", 64))
-    candidates: List[Tuple[str, str]] = []
 
-    # Most reliable patterns first.
-    for m in re.finditer(r"\\boxed\s*\{([^{}]+)\}", solution, flags=re.DOTALL):
-        candidates.append((clean("\\boxed{" + m.group(1) + "}"), "boxed"))
-    for m in re.finditer(r"####\s*([^\n]+)", solution):
-        candidates.append((clean(m.group(1)), "gsm8k_hash"))
+def add_safe_tail_candidates(solution: str, candidates: List[Tuple[str, str]]) -> None:
+    """Very low-priority fallback. Only add tail lines that look answer-like.
 
-    marker_patterns = [
-        r"(?i)(?:final\s+answer|the\s+answer\s+is|answer\s+is)\s*[:：]?\s*([^\n]+)",
-        r"(?i)(?:therefore|thus|hence|so),?\s+(?:the\s+)?answer\s+is\s*([^\n]+)",
-    ]
-    for pattern in marker_patterns:
-        for m in re.finditer(pattern, solution):
-            candidates.append((clean(m.group(1)), "explicit_answer_marker"))
-
-    lines = [clean(x) for x in solution.splitlines() if clean(x)]
+    This avoids the old bug where `Defn: ...` became the final answer.
+    """
+    lines = [clean(x) for x in clean(solution).splitlines() if clean(x)]
     for line in reversed(lines[-5:]):
-        candidates.append((line, "last_nonempty_line"))
+        c = clean_answer_candidate(line)
+        if c and not reject_bad_answer_candidate(c):
+            candidates.append((c, "solution_safe_tail_line"))
 
     sentences = split_sentences(solution)
     for sent in reversed(sentences[-5:]):
-        candidates.append((sent, "last_sentence"))
+        c = clean_answer_candidate(sent)
+        if c and not reject_bad_answer_candidate(c):
+            candidates.append((c, "solution_safe_tail_sentence"))
 
-    tail = solution[-1200:]
+    tail = clean(solution)[-1200:]
     expr_patterns = [
         r"\\boxed\s*\{[^{}]+\}",
         r"[A-Za-z]?\s*=\s*[+-]?\d+(?:\.\d+)?(?:/\d+)?",
@@ -231,27 +355,122 @@ def extract_short_answer(solution, tokenizer, data_cfg) -> Tuple[str, str]:
     ]
     for pattern in expr_patterns:
         matches = re.findall(pattern, tail)
-        for val in matches[-3:]:
-            candidates.append((clean(val), "tail_numeric_or_formula"))
+        for val in reversed(matches[-3:]):
+            candidates.append((clean_answer_candidate(val), "solution_tail_numeric_or_formula"))
+
+
+def extract_clean_answer(solution, tokenizer, data_cfg, reasoning_text="") -> Tuple[str, str, dict]:
+    """Extract the Answer field from solution and clean out reasoning/explanation.
+
+    Priority:
+      1. structured answer sections from solution, e.g. `### Answer: ...`
+      2. boxed / GSM8K hash from solution
+      3. explicit answer phrases from solution
+      4. explicit answer phrases from reasoning, as fallback only
+      5. very conservative tail candidates
+      6. whole solution only if it is already a clean answer
+    """
+    solution = clean(solution)
+    reasoning_text = clean(reasoning_text)
+    if not solution and not reasoning_text:
+        return "", "empty_solution_and_reasoning", {"candidate_count": 0}
+
+    max_chars = int(data_cfg.get("max_answer_chars", 1200))
+    explicit_max_tokens = int(data_cfg.get("max_answer_tokens", 256))
+    effective_max_tokens = int(data_cfg.get("_effective_max_answer_tokens", explicit_max_tokens))
+    max_tokens = max(1, min(explicit_max_tokens, effective_max_tokens))
+
+    candidates: List[Tuple[str, str]] = []
+    add_markdown_answer_candidates(solution, "solution", candidates)
+    add_math_answer_candidates(solution, "solution", candidates)
+    add_explicit_answer_candidates(solution, "solution", candidates)
+
+    # Fallback to reasoning markers only after trying solution answer sections.
+    add_markdown_answer_candidates(reasoning_text, "reasoning", candidates)
+    add_explicit_answer_candidates(reasoning_text, "reasoning", candidates)
+    add_math_answer_candidates(reasoning_text, "reasoning", candidates)
+
+    add_safe_tail_candidates(solution, candidates)
 
     seen = set()
+    rejected_preview = []
     for candidate, method in candidates:
-        candidate = clean(candidate).strip(" .。")
-        candidate = _strip_boxed(candidate) if method != "boxed" else candidate
-        key = candidate.lower()
+        candidate = clean_answer_candidate(candidate)
+        candidate = _strip_boxed(candidate) if "boxed" not in method else candidate
+        candidate = re.sub(r"^\*\*(.+?)\*\*$", r"\1", candidate).strip()
+        key = re.sub(r"\s+", " ", candidate.lower()).strip()
         if not candidate or key in seen:
             continue
         seen.add(key)
-        if looks_like_short_answer(candidate, max_chars=max_chars, max_tokens=max_tokens, tokenizer=tokenizer):
-            return candidate, method
+        if looks_like_clean_answer(candidate, max_chars=max_chars, max_tokens=max_tokens, tokenizer=tokenizer):
+            return candidate, method, {"candidate_count": len(candidates), "max_answer_tokens": max_tokens}
+        if len(rejected_preview) < 8:
+            rejected_preview.append({"method": method, "candidate": candidate[:160]})
 
-    if looks_like_short_answer(solution, max_chars=max_chars, max_tokens=max_tokens, tokenizer=tokenizer):
-        return solution, "whole_short_solution"
-    return "", "long_or_unextractable_answer"
+    whole = clean_answer_candidate(solution)
+    if looks_like_clean_answer(whole, max_chars=max_chars, max_tokens=max_tokens, tokenizer=tokenizer):
+        return whole, "whole_clean_solution", {"candidate_count": len(candidates), "max_answer_tokens": max_tokens}
+
+    return "", "long_or_unextractable_answer", {
+        "candidate_count": len(candidates),
+        "max_answer_tokens": max_tokens,
+        "rejected_preview": rejected_preview,
+    }
+
+
+def normalize_for_match(text) -> str:
+    text = clean(text).lower()
+    text = re.sub(r"\\boxed\s*\{([^{}]+)\}", r"\1", text)
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    text = re.sub(r"[^a-z0-9.+\-*/=]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def answer_matches_reasoning(answer: str, reasoning: str, data_cfg: dict) -> Tuple[bool, str]:
+    """Light correctness filter: keep reasoning only if it appears to reach the selected answer.
+
+    This is intentionally string-based and conservative; it is not a semantic judge.
+    If the answer is too long to match exactly, the check is relaxed.
+    """
+    if not bool(data_cfg.get("require_answer_in_reasoning", True)):
+        return True, "disabled"
+
+    answer = clean(answer)
+    reasoning = clean(reasoning)
+    if not answer or not reasoning:
+        return False, "empty_answer_or_reasoning"
+
+    max_exact_chars = int(data_cfg.get("max_answer_chars_for_reasoning_match", 200))
+    if len(answer) > max_exact_chars:
+        # Long natural-language answers may not appear verbatim in reasoning; do not over-filter them.
+        return True, "answer_too_long_for_exact_match_relaxed"
+
+    a = normalize_for_match(answer)
+    r = normalize_for_match(reasoning)
+    if not a:
+        return False, "empty_normalized_answer"
+    if len(a) >= 2 and a in r:
+        return True, "normalized_answer_substring"
+
+    # For single-word answers, require a word boundary match before normalization fallback.
+    if re.fullmatch(r"[a-zA-Z][a-zA-Z\-]{1,}", answer):
+        if re.search(r"\b" + re.escape(answer.lower()) + r"\b", reasoning.lower()):
+            return True, "word_boundary_match"
+
+    # Try explicit answer candidates from reasoning and compare them to the selected answer.
+    reason_candidates: List[Tuple[str, str]] = []
+    add_markdown_answer_candidates(reasoning, "reasoning", reason_candidates)
+    add_explicit_answer_candidates(reasoning, "reasoning", reason_candidates)
+    add_math_answer_candidates(reasoning, "reasoning", reason_candidates)
+    for cand, method in reason_candidates:
+        c = normalize_for_match(clean_answer_candidate(cand))
+        if c and (c == a or c in a or a in c):
+            return True, f"reasoning_marker_match:{method}"
+
+    return False, "answer_not_found_in_reasoning"
 
 
 def choose_reasoning(row, priority, data_cfg) -> Tuple[Optional[str], Optional[str], str]:
-    """DeepSeek stays first by default; Gemini is only fallback unless config changes."""
     text_source = data_cfg.get("reasoning_text_source", "thinking")
     field_variants = {
         "deepseek": {"thinking": "deepseek_thinking_trajectory", "attempt": "deepseek_attempt"},
@@ -274,13 +493,6 @@ def qar_text(question: str, reasoning: str, answer: str) -> str:
 
 def q_text_with_empty_reasoning(question: str, answer: str) -> str:
     return f"User: {clean(question)}\nAssistant:\nReasoning:\n\n\nAnswer:\n{clean(answer)}"
-
-
-def normalize_for_match(text) -> str:
-    text = clean(text).lower()
-    text = re.sub(r"\\boxed\s*\{([^{}]+)\}", r"\1", text)
-    text = re.sub(r"[^a-z0-9.+\-*/=]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def sentence_has_math(text) -> bool:
@@ -328,7 +540,6 @@ def assemble_sentences(sentences: List[str], selected_indices: List[int]) -> str
 
 
 def compress_reasoning_to_budget(reasoning, answer, tokenizer, budget, crop_cfg):
-    """Sentence-level compression. It never cuts inside a sentence-like unit."""
     reasoning = clean(reasoning)
     if budget <= 0:
         return "", "no_budget", {"budget_tokens": budget}
@@ -368,7 +579,6 @@ def compress_reasoning_to_budget(reasoning, answer, tokenizer, budget, crop_cfg)
             i = round(j * (n - 1) / (stride_k + 1))
             add_priority(i, 40.0 + scores[i], "stride")
 
-    # Extra filler candidates only if there is still budget.
     for i in top_indices:
         add_priority(i, 10.0 + scores[i], "filler")
 
@@ -377,7 +587,6 @@ def compress_reasoning_to_budget(reasoning, answer, tokenizer, budget, crop_cfg)
     selected_tags: Dict[int, str] = {}
 
     for _, idx, tag in ordered:
-        # Never cut a long sentence. If one sentence is too long, skip it.
         if sentence_tokens[idx] > budget:
             continue
         candidate = sorted(set(selected + [idx]))
@@ -386,7 +595,6 @@ def compress_reasoning_to_budget(reasoning, answer, tokenizer, budget, crop_cfg)
             selected = candidate
             selected_tags[idx] = tag
 
-    # Fallback: choose the shortest complete sentence that fits.
     if not selected:
         for idx in sorted(range(n), key=lambda i: sentence_tokens[i]):
             if sentence_tokens[idx] <= budget:
@@ -422,16 +630,14 @@ def source_char_stats(rows) -> dict:
 
 
 def process_and_split(config: dict) -> dict:
-    data_cfg = config.get("data", {})
+    data_cfg = dict(config.get("data", {}) or {})
     model_cfg = config.get("model", {})
     raw_output_dir = Path(data_cfg.get("raw_output_dir") or DEFAULT_RAW_OUTPUT_DIR)
-    output_dir = Path(
-        data_cfg.get("light_output_dir")
-        or data_cfg.get("base_output_dir")
-        or data_cfg.get("base_dir")
-        or DEFAULT_LIGHT_OUTPUT_DIR
-    )
+    output_dir = Path(data_cfg.get("light_output_dir") or DEFAULT_LIGHT_OUTPUT_DIR)
     max_length = int(model_cfg.get("max_length", 1024))
+
+    answer_fraction = float(data_cfg.get("max_answer_fraction_of_max_length", 0.33))
+    data_cfg["_effective_max_answer_tokens"] = max(1, int(max_length * answer_fraction))
     priority = data_cfg.get("reasoning_source_priority", ["deepseek", "gemini"])
     crop_cfg = data_cfg.get("reasoning_crop", {}) or {}
 
@@ -445,35 +651,38 @@ def process_and_split(config: dict) -> dict:
     print(f"Writing original S1K rows to {raw_output_dir} ...", flush=True)
     write_jsonl(raw_output_dir / "raw.jsonl", (dict(row) for row in tqdm(raw_rows, desc="write raw S1K", dynamic_ncols=True)))
     write_json(raw_output_dir / "manifest.json", {
-        "format": "Original S1K rows saved before short-answer filtering and reasoning compression.",
+        "format": "Original S1K rows saved before answer cleaning and reasoning compression.",
         "source_dataset": data_cfg.get("source_dataset", "simplescaling/s1K-1.1"),
         "raw_rows": len(raw_rows),
         "output_file": str(raw_output_dir / "raw.jsonl"),
         "source_char_stats": source_char_stats(raw_rows),
     })
 
-    # Step 1: filter by solution-derived short answer and required fields.
-    print("[2/5] Filtering by short answer and required fields...", flush=True)
+    print("[2/5] Cleaning/extracting answers first, then verifying reasoning-answer match...", flush=True)
     candidates = []
     counters = {
         "raw_rows": len(raw_rows),
         "missing_question": 0,
         "missing_reasoning": 0,
         "missing_answer": 0,
-        "usable_after_answer_filter": 0,
-        "full_within_length": 0,
-        "need_compression": 0,
+        "reasoning_answer_mismatch": 0,
+        "usable_after_answer_cleaning": 0,
+        "full_within_reasoning_budget": 0,
+        "need_reasoning_compression": 0,
+        "force_reasoning_compression": 0,
         "compressed_success": 0,
         "compression_failed": 0,
         "post_process_rows": 0,
     }
     answer_extract_counts: Dict[str, int] = {}
+    answer_match_counts: Dict[str, int] = {}
     answer_field_counts: Dict[str, int] = {}
     reasoning_source_counts: Dict[str, int] = {}
     reasoning_field_counts: Dict[str, int] = {}
+    skipped_examples: Dict[str, List[dict]] = {"missing_answer": [], "reasoning_answer_mismatch": []}
 
     answer_field = data_cfg.get("answer_field", "solution")
-    for idx, row in enumerate(tqdm(raw_rows, desc="step1 answer filter", dynamic_ncols=True)):
+    for idx, row in enumerate(tqdm(raw_rows, desc="step1 answer clean + reasoning verify", dynamic_ncols=True)):
         row = dict(row)
         question = clean(row.get("question"))
         if not question:
@@ -483,9 +692,32 @@ def process_and_split(config: dict) -> dict:
         if not raw_reasoning:
             counters["missing_reasoning"] += 1
             continue
-        answer, answer_method = extract_short_answer(row.get(answer_field), tokenizer, data_cfg)
+
+        answer, answer_method, answer_meta = extract_clean_answer(row.get(answer_field), tokenizer, data_cfg, raw_reasoning)
         if not answer:
             counters["missing_answer"] += 1
+            if len(skipped_examples["missing_answer"]) < 20:
+                skipped_examples["missing_answer"].append({
+                    "source_index": idx,
+                    "question_preview": question[:160],
+                    "solution_preview": clean(row.get(answer_field))[:240],
+                    "answer_method": answer_method,
+                    "answer_meta": answer_meta,
+                })
+            continue
+
+        ok_match, match_method = answer_matches_reasoning(answer, raw_reasoning, data_cfg)
+        if not ok_match:
+            counters["reasoning_answer_mismatch"] += 1
+            if len(skipped_examples["reasoning_answer_mismatch"]) < 20:
+                skipped_examples["reasoning_answer_mismatch"].append({
+                    "source_index": idx,
+                    "question_preview": question[:160],
+                    "answer": answer,
+                    "answer_method": answer_method,
+                    "match_method": match_method,
+                    "reasoning_tail_preview": raw_reasoning[-320:],
+                })
             continue
 
         candidates.append({
@@ -498,50 +730,81 @@ def process_and_split(config: dict) -> dict:
             "reasoning_field": reasoning_field,
             "answer_field": answer_field,
             "answer_extract_method": answer_method,
+            "answer_extract_meta": answer_meta,
+            "answer_match_method": match_method,
         })
-        counters["usable_after_answer_filter"] += 1
+        counters["usable_after_answer_cleaning"] += 1
         answer_extract_counts[answer_method] = answer_extract_counts.get(answer_method, 0) + 1
+        answer_match_counts[match_method] = answer_match_counts.get(match_method, 0) + 1
         answer_field_counts[answer_field] = answer_field_counts.get(answer_field, 0) + 1
         reasoning_source_counts[source] = reasoning_source_counts.get(source, 0) + 1
         reasoning_field_counts[reasoning_field] = reasoning_field_counts.get(reasoning_field, 0) + 1
 
-    # Step 2: compute total length once and separate rows needing compression.
-    print("[3/5] Computing QAR total token lengths and marking rows that need compression...", flush=True)
+    print("[3/5] Computing fixed prefix/suffix length and reasoning-only budgets...", flush=True)
     within, need_crop = [], []
-    for item in tqdm(candidates, desc="step2 length check", dynamic_ncols=True):
+    margin = int(crop_cfg.get("safety_margin_tokens", 8))
+    force_crop = bool(crop_cfg.get("force", True))
+    max_reasoning_tokens = int(crop_cfg.get("max_reasoning_tokens", 384))
+
+    for item in tqdm(candidates, desc="step2 fixed length + reasoning budget", dynamic_ncols=True):
         raw_reasoning = item["raw_reasoning"]
-        full_total = token_count(tokenizer, qar_text(item["question"], raw_reasoning, item["answer"]))
-        item["original_qar_total_tokens"] = full_total
+        fixed_tokens = token_count(tokenizer, q_text_with_empty_reasoning(item["question"], item["answer"]))
+        available_reasoning_budget = max_length - fixed_tokens - margin
+        reasoning_budget = available_reasoning_budget
+        if force_crop and max_reasoning_tokens > 0:
+            reasoning_budget = min(available_reasoning_budget, max_reasoning_tokens)
+
+        item["fixed_tokens_without_reasoning"] = fixed_tokens
+        item["available_reasoning_budget_tokens"] = available_reasoning_budget
+        item["compression_budget_tokens"] = reasoning_budget
         item["reasoning_full_tokens"] = token_count(tokenizer, raw_reasoning)
         item["question_tokens"] = token_count(tokenizer, item["question"])
         item["answer_tokens"] = token_count(tokenizer, item["answer"])
-        if full_total <= max_length:
-            item["reasoning"] = raw_reasoning
-            item["reasoning_processing"] = {
-                "method": "full_within_sample_budget",
-                "original_total_tokens": full_total,
-                "final_total_tokens": full_total,
-                "reasoning_tokens": item["reasoning_full_tokens"],
-            }
-            within.append(item)
-            counters["full_within_length"] += 1
-        else:
-            need_crop.append(item)
-            counters["need_compression"] += 1
+        item["original_qar_total_tokens_est"] = fixed_tokens + item["reasoning_full_tokens"]
 
-    # Step 3: compress overlength rows only.
-    print(f"[4/5] Compressing {len(need_crop)} overlength rows by complete sentences...", flush=True)
+        if available_reasoning_budget <= 0:
+            item["compression_reason"] = "no_reasoning_budget_after_fixed_parts"
+            need_crop.append(item)
+            counters["need_reasoning_compression"] += 1
+            continue
+
+        needs_crop_for_context = item["reasoning_full_tokens"] > available_reasoning_budget
+        needs_crop_for_light_reasoning = force_crop and item["reasoning_full_tokens"] > reasoning_budget
+
+        if not needs_crop_for_context and not needs_crop_for_light_reasoning:
+            final_total = token_count(tokenizer, qar_text(item["question"], raw_reasoning, item["answer"]))
+            if final_total <= max_length:
+                item["reasoning"] = raw_reasoning
+                item["reasoning_processing"] = {
+                    "method": "full_reasoning_within_budget",
+                    "fixed_tokens_without_reasoning": fixed_tokens,
+                    "available_reasoning_budget_tokens": available_reasoning_budget,
+                    "reasoning_budget_tokens": reasoning_budget,
+                    "original_total_tokens_est": item["original_qar_total_tokens_est"],
+                    "final_total_tokens": final_total,
+                    "reasoning_tokens": item["reasoning_full_tokens"],
+                    "force_crop": force_crop,
+                }
+                within.append(item)
+                counters["full_within_reasoning_budget"] += 1
+                continue
+
+        item["compression_reason"] = "over_context_budget" if needs_crop_for_context else "over_light_reasoning_budget"
+        need_crop.append(item)
+        counters["need_reasoning_compression"] += 1
+        if needs_crop_for_light_reasoning and not needs_crop_for_context:
+            counters["force_reasoning_compression"] += 1
+
+    print(f"[4/5] Compressing reasoning for {len(need_crop)} rows by complete sentences...", flush=True)
     processed = list(within)
-    crop_method_counts: Dict[str, int] = {"full_within_sample_budget": len(within)}
-    margin = int(crop_cfg.get("safety_margin_tokens", 8))
-    for item in tqdm(need_crop, desc="step3 sentence crop", dynamic_ncols=True):
-        fixed_tokens = token_count(tokenizer, q_text_with_empty_reasoning(item["question"], item["answer"]))
-        budget = max_length - fixed_tokens - margin
+    crop_method_counts: Dict[str, int] = {"full_reasoning_within_budget": len(within)}
+    for item in tqdm(need_crop, desc="step3 reasoning-only sentence crop", dynamic_ncols=True):
+        budget = item.get("compression_budget_tokens", 0)
         cropped, method, meta = compress_reasoning_to_budget(
             item["raw_reasoning"], item["answer"], tokenizer, budget, crop_cfg
-        ) if bool(crop_cfg.get("enabled", True)) else ("", "crop_disabled_overlength", {"budget_tokens": budget})
+        ) if bool(crop_cfg.get("enabled", True)) else ("", "crop_disabled", {"budget_tokens": budget})
 
-        final_total = token_count(tokenizer, qar_text(item["question"], cropped, item["answer"])) if cropped else fixed_tokens
+        final_total = token_count(tokenizer, qar_text(item["question"], cropped, item["answer"])) if cropped else item.get("fixed_tokens_without_reasoning", 0)
         if not clean(cropped) or final_total > max_length:
             counters["compression_failed"] += 1
             crop_method_counts[method] = crop_method_counts.get(method, 0) + 1
@@ -550,16 +813,21 @@ def process_and_split(config: dict) -> dict:
         item["reasoning"] = cropped
         item["reasoning_processing"] = {
             "method": method,
-            "original_total_tokens": item["original_qar_total_tokens"],
+            "compression_reason": item.get("compression_reason"),
+            "fixed_tokens_without_reasoning": item.get("fixed_tokens_without_reasoning"),
+            "available_reasoning_budget_tokens": item.get("available_reasoning_budget_tokens"),
+            "original_total_tokens_est": item.get("original_qar_total_tokens_est"),
             "final_total_tokens": final_total,
             "reasoning_tokens": token_count(tokenizer, cropped),
+            "reasoning_budget_tokens": budget,
             **meta,
         }
         processed.append(item)
         counters["compressed_success"] += 1
         crop_method_counts[method] = crop_method_counts.get(method, 0) + 1
 
-    # Step 4: split after all filtering / compression.
+    processed = sorted(processed, key=lambda x: int(x.get("source_index", 10**12)))
+
     print("[5/5] Splitting processed rows and writing JSONL files...", flush=True)
     valid_indices, test_indices = split_indices(
         len(processed),
@@ -586,6 +854,8 @@ def process_and_split(config: dict) -> dict:
             "reasoning_field": item["reasoning_field"],
             "answer_field": item["answer_field"],
             "answer_extract_method": item["answer_extract_method"],
+            "answer_extract_meta": item["answer_extract_meta"],
+            "answer_match_method": item["answer_match_method"],
             "reasoning_processing": item["reasoning_processing"],
             "token_stats": {
                 "question_tokens": item["question_tokens"],
@@ -602,21 +872,15 @@ def process_and_split(config: dict) -> dict:
     for split, rows in split_rows.items():
         write_jsonl(output_dir / f"{split}.jsonl", rows)
 
-    def all_items():
-        for rows in split_rows.values():
-            for row in rows:
-                yield row
-
-    all_list = list(all_items())
+    all_list = [row for rows in split_rows.values() for row in rows]
     manifest = {
-        "format": "S1K_light content rows after short-answer filtering, length check, complete-sentence compression, then split. No train masks here.",
+        "format": "S1K_light rows after answer cleaning, reasoning-answer verification, reasoning-only complete-sentence compression, then split. No train masks here.",
         "source_dataset": data_cfg.get("source_dataset", "simplescaling/s1K-1.1"),
         "raw_output_dir": str(raw_output_dir),
         "light_output_dir": str(output_dir),
         "max_length": max_length,
-        "split_order": "filter_by_solution -> length_check -> compress_overlength -> split",
+        "split_order": "clean_answer_from_solution -> verify_reasoning_contains_answer -> compute_fixed_answer_and_reasoning_budget -> compress_reasoning_only -> split",
         "light_rows": {split: len(rows) for split, rows in split_rows.items()},
-        "base_rows": {split: len(rows) for split, rows in split_rows.items()},  # backward compatibility
         "counters": counters,
         "reasoning_source_priority": priority,
         "reasoning_text_source": data_cfg.get("reasoning_text_source", "thinking"),
@@ -624,8 +888,19 @@ def process_and_split(config: dict) -> dict:
         "reasoning_field_counts": reasoning_field_counts,
         "answer_field_counts": answer_field_counts,
         "answer_extract_counts": answer_extract_counts,
+        "answer_match_counts": answer_match_counts,
+        "answer_config": {
+            "max_answer_chars": data_cfg.get("max_answer_chars", 1200),
+            "max_answer_tokens": data_cfg.get("max_answer_tokens", 256),
+            "max_answer_fraction_of_max_length": data_cfg.get("max_answer_fraction_of_max_length", 0.33),
+            "effective_max_answer_tokens": data_cfg.get("_effective_max_answer_tokens"),
+            "require_answer_in_reasoning": data_cfg.get("require_answer_in_reasoning", True),
+            "max_answer_chars_for_reasoning_match": data_cfg.get("max_answer_chars_for_reasoning_match", 200),
+            "question_deduplication": "disabled_by_default; source_index is preserved",
+        },
         "crop_config": crop_cfg,
         "crop_method_counts": crop_method_counts,
+        "skipped_examples": skipped_examples,
         "light_token_stats": {
             "question_tokens": summary(row["token_stats"]["question_tokens"] for row in all_list),
             "answer_tokens": summary(row["token_stats"]["answer_tokens"] for row in all_list),
@@ -634,7 +909,7 @@ def process_and_split(config: dict) -> dict:
             "qar_total_tokens": summary(row["token_stats"]["qar_total_tokens"] for row in all_list),
         },
         "source_char_stats_before_processing": source_char_stats(raw_rows),
-        "note": "Only overlength rows are compressed. Compression uses complete sentence-like units; gaps are represented by '...'.",
+        "note": "Answer is cleaned first and should contain only the final answer, not explanation/reasoning. Only the reasoning body is compressed; gaps are represented by '...'.",
     }
     write_json(output_dir / "manifest.json", manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
@@ -642,7 +917,7 @@ def process_and_split(config: dict) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare root-level data/S1K and data/S1K_light splits for SEDD SFT pipelines.")
+    parser = argparse.ArgumentParser(description="Prepare data/S1K and data/S1K_light splits for SEDD SFT pipelines.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG), help="Config file to read data/model options from.")
     args = parser.parse_args()
     process_and_split(load_config(args.config))
