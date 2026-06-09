@@ -1,18 +1,27 @@
 # sft_reasoning_pipeline
 
-This pipeline is an ablation for **reasoning-conditioned answer SFT**:
+This pipeline is an ablation for **reasoning-conditioned answer SFT**.
+It keeps the same assistant-style layout as QAR, but changes the train mask:
 
 ```text
-User: <question>
-Reasoning: <teacher reasoning>        # fixed condition, no loss
-Assistant:
-Final Answer:
+User: <question>                      # fixed condition, no loss
+Assistant:                            # fixed condition, no loss
+Reasoning:
+<teacher reasoning>                   # fixed condition, no loss
+
+Answer:
 <answer>                              # train target, score-entropy loss only here
+```
+
+So this pipeline trains:
+
+```text
+p(answer | question, teacher reasoning)
 ```
 
 It reuses `sft_answer_pipeline/answer_dataset.py`, `answer_losses.py`, and `train_answer.py`.
 
-## Run
+## Single run
 
 ```bash
 # 1. Build RA data
@@ -26,6 +35,27 @@ python sft_reasoning_pipeline/test_reasoning_eval.py --config sft_reasoning_pipe
 
 # 4. Qualitative generation
 python sft_reasoning_pipeline/generate_reasoning_examples.py --config sft_reasoning_pipeline/reasoning_config.yaml
+```
+
+## Parallel 3-GPU run
+
+Launch three independent RA runs on CUDA 0, 1, and 2 with different seeds:
+
+```bash
+bash sft_reasoning_pipeline/launch_reasoning_three.sh
+```
+
+The script will build RA data first if `sft_reasoning_pipeline/data/RA/train.jsonl` is missing.
+It writes logs to:
+
+```text
+sft_reasoning_pipeline/logs/
+```
+
+Because `train_answer.py` synchronizes the best run under the global run directory, the best checkpoint across these RA runs will be available at:
+
+```text
+sft_reasoning_pipeline/modelparameter/RA/best.pth
 ```
 
 Token filtering happens in `AnswerSegmentDataset`: samples longer than `model.max_length` are dropped, not truncated. Load reports are written beside each split file, for example:

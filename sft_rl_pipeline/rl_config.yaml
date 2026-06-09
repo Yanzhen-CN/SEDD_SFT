@@ -1,22 +1,14 @@
 data:
-  # Must be refreshed after every regenerated QAR dataset:
-  #   python sft_rl_pipeline/copy_rl_data.py --source-data sft_answer_pipeline/data/QAR --target-data sft_rl_pipeline/data/QAR
   data_dir: sft_rl_pipeline/data/QAR
-
 model:
   pretrained: louaaron/sedd-medium
-  # Replace this after every new QAR SFT run:
-  #   cp sft_answer_pipeline/modelparameter/QAR/best.pth sft_rl_pipeline/modelparameter/startpoint/QAR-best.pth
   init_checkpoint: sft_rl_pipeline/modelparameter/startpoint/QAR-best.pth
   max_length: 512
   min_target_tokens: 32
   drop_overlength: true
   write_load_reports: true
-
 reward:
-  # Rule reward for fast exploration. Higher is better.
-  # Used in train_reward_weighted.py as a reference-target sample weight; this
-  # is reward-weighted SFT, not online policy-gradient RL.
+  schema_mode: anchored_qar_content_reward_v4_integer_points_with_negative_penalties
   length_min: 64
   length_max: 60000
   repeat_ngram: 4
@@ -26,23 +18,70 @@ reward:
   fatal_balance_threshold: 0.15
   fatal_diversity_min_tokens: 12
   fatal_diversity_threshold: 0.2
-  normalize_weights: true
+  normalize_weights: false
   train_weight_min: 0.5
   train_weight_max: 1.5
   rules:
-    - name: style_structure
-      enabled: true
-      weight: 0.4
-    - name: math_format
-      enabled: true
-      weight: 0.3
-    - name: final_answer_style
-      enabled: true
-      weight: 0.2
-    - name: length
-      enabled: true
-      weight: 0.1
-
+  - name: section_edge_quality
+    enabled: true
+    weight: 12
+  - name: punctuation_correctness
+    enabled: true
+    weight: 10
+  - name: reasoning_keyword_density
+    enabled: true
+    weight: 20
+  - name: reasoning_math_signal
+    enabled: true
+    weight: 12
+  - name: answer_result_quality
+    enabled: true
+    weight: 20
+  - name: section_content_quality
+    enabled: true
+    weight: 12
+  - name: no_repeat
+    enabled: true
+    weight: 6
+  - name: no_mojibake
+    enabled: true
+    weight: 3
+  - name: low_symbol_noise
+    enabled: true
+    weight: 3
+  - name: readability
+    enabled: true
+    weight: 2
+  - name: length_guardrail
+    enabled: true
+    weight: 2
+  - name: reference_overlap
+    enabled: false
+    weight: 0
+  reasoning_min_tokens: 12
+  answer_max_tokens: 160
+  answer_concise_max_tokens: 80
+  reasoning_guardrail_max_tokens: 1600
+  answer_guardrail_max_tokens: 220
+  lexicon_stats_path: sft_rl_pipeline/reports/s1k_reward_vocab_stats.json
+  penalty_bad_reasoning_start: 0.8
+  penalty_bad_answer_start: 0.8
+  penalty_bad_reasoning_end: 0.88
+  penalty_bad_answer_end: 0.92
+  penalty_repeated_anchor_in_content: 0.85
+  penalty_verbose_answer: 0.9
+  answer_soft_max_tokens: 120
+  penalty_empty_reasoning_points: 100
+  penalty_empty_answer_points: 100
+  penalty_bad_reasoning_start_points: 15
+  penalty_bad_answer_start_points: 15
+  penalty_bad_reasoning_end_points: 8
+  penalty_bad_answer_end_points: 5
+  penalty_repeated_anchor_points: 12
+  penalty_dangling_operator_points: 10
+  penalty_verbose_answer_points: 8
+  penalty_unbalanced_symbols_points: 25
+  penalty_fatal_points: 120
 best_of_k:
   split: test
   num_examples: 20
@@ -50,12 +89,11 @@ best_of_k:
   generation_mode: segment_infilling
   steps: 128
   answer_token_budget: 256
-
 training:
   steps: 300
   batch_size: 1
   accum: 8
-  lr: 1.0e-6
+  lr: 1.0e-06
   warmup: 50
   weight_decay: 0.0
   grad_clip: 1.0
@@ -65,7 +103,6 @@ training:
   eval_batches: 0
   seed: 42
   num_workers: 0
-
 results:
   output_dir: sft_rl_pipeline/modelparameter/sft_rl
   report_dir: sft_rl_pipeline/reports

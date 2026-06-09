@@ -11,7 +11,8 @@ DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
 
 # Textual layout follows S1K-style completion and SEDD plain-text LM blocks:
 #   User: <question>\nAssistant:\nReasoning:\n<reasoning>\n\nAnswer:\n<answer>
-# For target-only SFT, only the assistant completion after "Assistant:" is train=True.
+# For target-only SFT, structural markers are fixed anchors (train=False);
+# only the content after each marker is generated / noised / lossed.
 QA_SEGMENT_ORDER = ["user_label", "user", "assistant_label", "answer_label", "answer"]
 QAR_SEGMENT_ORDER = [
     "user_label",
@@ -97,7 +98,7 @@ def make_qa_sample(row_id, question, answer, meta=None):
         "user_label": segment("User: ", False),
         "user": segment(clean(question), False),
         "assistant_label": segment("\nAssistant:\n", False),
-        "answer_label": segment("Answer:\n", True),
+        "answer_label": segment("Answer:\n", False),
         "answer": segment(clean(answer), True),
     }
     return {
@@ -112,16 +113,16 @@ def make_qa_sample(row_id, question, answer, meta=None):
 
 
 def make_qar_sample(row_id, question, answer, reasoning, meta=None):
-    # Correct QAR target: the *assistant completion* contains both reasoning and
-    # answer.  "Assistant:" itself is fixed conditioning; "Reasoning:" and
-    # "Answer:" are generated target tokens so the model learns the output format.
+    # Correct QAR layout: the assistant completion contains fixed section markers
+    # and generated section contents.  Reasoning:/Answer: are anchors
+    # (train=False), while reasoning text and answer text are train=True.
     segments = {
         "user_label": segment("User: ", False),
         "user": segment(clean(question), False),
         "assistant_label": segment("\nAssistant:\n", False),
-        "reasoning_label": segment("Reasoning:\n", True),
+        "reasoning_label": segment("Reasoning:\n", False),
         "reasoning": segment(clean(reasoning), True),
-        "answer_label": segment("\n\nAnswer:\n", True),
+        "answer_label": segment("\n\nAnswer:\n", False),
         "answer": segment(clean(answer), True),
     }
     return {
@@ -254,7 +255,7 @@ def build(config):
     )
     output_dir = data_cfg.get("output_dir", str(SCRIPT_DIR / "data"))
     manifest = {
-        "format": "User + Assistant completion. QAR target is 'Reasoning: ... Answer: ...'.",
+        "format": "User + Assistant completion. QAR uses fixed anchors 'Reasoning:' and 'Answer:'; reasoning/answer contents are train=True.",
         "source_dataset": data_cfg.get("source_dataset", "simplescaling/s1K-1.1"),
         "raw_rows": len(raw),
         "usable_rows_before_token_filter": len(qa_samples),

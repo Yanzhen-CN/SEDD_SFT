@@ -39,6 +39,34 @@ def segment_text(sample, train=None):
     return sample_text(sample, train=train)
 
 
+def assistant_completion(sample):
+    """Return text after the fixed `Assistant:` header, including fixed anchors.
+
+    This is important when `Reasoning:` and `Answer:` are train=False anchors:
+    `sample_text(train=True)` contains only the generated contents and therefore
+    cannot show the section boundary.
+    """
+    from answer_dataset import ordered_segments
+
+    parts = []
+    seen_assistant = False
+    for name, segment in ordered_segments(sample):
+        if seen_assistant:
+            parts.append(segment.get("text", ""))
+        if name == "assistant_label":
+            seen_assistant = True
+    return "".join(parts)
+
+
+def completion_from_full_text(text):
+    raw = str(text or "")
+    marker = "Assistant:"
+    idx = raw.find(marker)
+    if idx >= 0:
+        return raw[idx + len(marker):].strip()
+    return raw.strip()
+
+
 def load_model_tuple(config, kind, device):
     import graph_lib
     import noise_lib
@@ -118,17 +146,21 @@ def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, ste
     target_positions = [idx for idx, is_train in enumerate(train_mask[:real_len]) if is_train]
     with torch.no_grad():
         generated = proj_fun(sampling_fn(model))
+        full_text = tokenizer.batch_decode(generated[:, :real_len])[0].strip()
         generated_target_ids = generated[0, target_positions]
 
     return {
         "prompt": segment_text(sample, train=False),
-        "generated_full": tokenizer.batch_decode(generated[:, :real_len])[0].strip(),
+        "generated_full": full_text,
+        "generated_completion": completion_from_full_text(full_text),
         "generated_target": tokenizer.decode(generated_target_ids).strip(),
     }
 
 
 def write_report(path, records):
     lines = ["# Answer SFT Generation Examples", ""]
+    lines.append("Structural anchors such as `Reasoning:` and `Answer:` may be fixed conditioning tokens; therefore the completion view is the main qualitative output.")
+    lines.append("")
     for item in records:
         lines.append(f"## {item['id']}")
         lines.append("")
@@ -139,15 +171,25 @@ def write_report(path, records):
         lines.append(item["prompt"])
         lines.append("```")
         lines.append("")
-        lines.append("### Reference target tokens")
+        lines.append("### Reference assistant completion")
         lines.append("```text")
-        lines.append(item["reference"].strip())
+        lines.append(item["reference_completion"].strip())
         lines.append("```")
         lines.append("")
-        for model_name, text in item["generations"].items():
-            lines.append(f"### {model_name}")
+        lines.append("### Reference generated-token target only")
+        lines.append("```text")
+        lines.append(item["reference_target"].strip())
+        lines.append("```")
+        lines.append("")
+        for model_name, result in item["generations"].items():
+            lines.append(f"### {model_name} completion")
             lines.append("```text")
-            lines.append(text.strip())
+            lines.append(result["completion"].strip())
+            lines.append("```")
+            lines.append("")
+            lines.append(f"### {model_name} generated-token target only")
+            lines.append("```text")
+            lines.append(result["target"].strip())
             lines.append("```")
             lines.append("")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +228,8 @@ def main():
             "id": row.get("id", str(idx)),
             "mode": row.get("mode", args.dataset),
             "prompt": segment_text(row, train=False),
-            "reference": segment_text(row, train=True),
+            "reference_target": segment_text(row, train=True),
+            "reference_completion": assistant_completion(row),
             "answer": row.get("answer", ""),
             "reasoning": row.get("reasoning", ""),
             "generations": {},
@@ -202,14 +245,17 @@ def main():
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-            item["generations"][model_name] = sample["generated_target"]
+            item["generations"][model_name] = {
+                "completion": sample["generated_completion"],
+                "target": sample["generated_target"],
+                "full": sample["generated_full"],
+            }
         records.append(item)
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))
     write_report(out_dir / f"answer_generation_{args.dataset}.md", records)
     (out_dir / f"answer_generation_{args.dataset}.json").write_text(
-        json.dumps(records, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+        json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"Wrote {out_dir / f'answer_generation_{args.dataset}.md'}")
 

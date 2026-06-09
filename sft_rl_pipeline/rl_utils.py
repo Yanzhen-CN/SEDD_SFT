@@ -39,12 +39,6 @@ def read_jsonl(path, limit=None):
 
 
 def ordered_segments(sample):
-    """Use the shared SFT segment order.
-
-    This is crucial for v2 QAR samples, where the assistant completion is:
-        Reasoning: ...\n\nAnswer: ...
-    and the per-sample `segment_order` includes answer_label/answer.
-    """
     from answer_dataset import ordered_segments as _ordered_segments
 
     return _ordered_segments(sample)
@@ -54,6 +48,27 @@ def segment_text(sample, train=None):
     from answer_dataset import sample_text
 
     return sample_text(sample, train=train)
+
+
+def assistant_completion(sample):
+    """Text after Assistant:, including fixed anchors and generated contents."""
+    parts = []
+    seen_assistant = False
+    for name, seg in ordered_segments(sample):
+        if seen_assistant:
+            parts.append(seg.get("text", ""))
+        if name == "assistant_label":
+            seen_assistant = True
+    return "".join(parts)
+
+
+def completion_from_full_text(text):
+    raw = str(text or "")
+    marker = "Assistant:"
+    idx = raw.find(marker)
+    if idx >= 0:
+        return raw[idx + len(marker):].strip()
+    return raw.strip()
 
 
 def prompt_until_assistant(sample):
@@ -66,12 +81,6 @@ def prompt_until_assistant(sample):
 
 
 def load_filtered_samples(config, split, tokenizer, limit=None):
-    """Load the same filtered data that training/eval will see.
-
-    We intentionally do not read raw JSONL directly for best-of-K, because raw
-    QAR can contain over-length examples.  The dataset loader drops them and
-    writes a report, matching training behavior.
-    """
     from answer_dataset import AnswerSegmentDataset
 
     data_dir = Path(config["data"]["data_dir"])
@@ -170,10 +179,11 @@ def encode_sample_no_truncation(sample, tokenizer, max_length):
 
 
 def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, min_target_tokens, steps, device):
-    """Generate only train=True tokens while clamping condition tokens.
+    """Generate train=True content tokens while clamping condition/anchor tokens.
 
-    No truncation is performed.  This keeps RL generation aligned with the
-    training dataset and avoids silently dropping the Answer section.
+    With anchored QAR, `Reasoning:` and `Answer:` are fixed tokens.  Therefore
+    rewards and qualitative reports should use `generated_completion`, not only
+    `generated_target`, because target-only text omits the fixed section labels.
     """
     import sampling
 
@@ -210,7 +220,9 @@ def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, min
     return {
         "prompt": segment_text(sample, train=False),
         "reference_target": segment_text(sample, train=True),
+        "reference_completion": assistant_completion(sample),
         "generated": full_text.strip(),
+        "generated_completion": completion_from_full_text(full_text),
         "generated_target": generated_target.strip(),
         "segment_token_lens": segment_token_lens,
     }

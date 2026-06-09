@@ -59,12 +59,31 @@ def update_global_best(out_root, run_dir, checkpoint_path, best_info):
     return True
 
 
+def _assistant_completion_from_segments(segments, order):
+    parts = []
+    seen_assistant = False
+    for name in order:
+        seg = segments.get(name)
+        if seg is None:
+            continue
+        if seen_assistant:
+            parts.append(seg.get("text", ""))
+        if name == "assistant_label":
+            seen_assistant = True
+    if parts:
+        return "".join(parts)
+    return "".join(segments[name].get("text", "") for name in order if name in segments)
+
+
 def reward_weights(batch, reward_cfg, device):
     vals = []
-    for target in batch["targets"]:
-        # This is reward-weighted SFT, not online RL: the reward is computed on
-        # the reference assistant completion, then used as a stable sample weight.
-        vals.append(score_answer(target, target, reward_cfg)["score"])
+    for segments, order, target in zip(batch.get("segments", []), batch.get("segment_orders", []), batch["targets"]):
+        # Reward-weighted SFT, not online RL: reward is computed on the reference
+        # assistant completion and used as a stable sample weight.  With anchored
+        # QAR, batch["targets"] only contains generated contents and omits fixed
+        # labels such as Reasoning:/Answer:, so we reconstruct the completion.
+        completion = _assistant_completion_from_segments(segments, order) or target
+        vals.append(score_answer(completion, completion, reward_cfg)["score"])
     rewards = torch.tensor(vals, dtype=torch.float32, device=device)
     min_weight = float(reward_cfg.get("train_weight_min", 0.5))
     max_weight = float(reward_cfg.get("train_weight_max", 1.5))
@@ -142,7 +161,7 @@ def main():
         {
             "init_checkpoint": checkpoint,
             "objective": "reward-weighted masked DWDSE; reference reward used as sample weight, not online RL",
-            "target_format": "Assistant completion = Reasoning + Answer",
+            "target_format": "Anchored assistant completion = Reasoning: <generated reasoning> / Answer: <generated answer>",
             "data_dir": str(data_dir),
             "config": args.config,
             "device": str(device),

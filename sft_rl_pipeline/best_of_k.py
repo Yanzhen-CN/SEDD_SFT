@@ -6,21 +6,38 @@ import torch
 from transformers import GPT2TokenizerFast
 
 from reward import score_answer
+
+
+def numeric_reward_components(reward):
+    skip = {"score", "base_score", "fatal_multiplier", "active_weight_sum", "chars", "reasoning_chars", "answer_chars", "reasoning_tokens", "answer_tokens"}
+    return {k: float(v) for k, v in reward.items() if k not in skip and isinstance(v, (int, float))}
+
+
+def mean_dict(rows):
+    sums = {}
+    counts = {}
+    for row in rows:
+        for k, v in row.items():
+            if isinstance(v, (int, float)):
+                sums[k] = sums.get(k, 0.0) + float(v)
+                counts[k] = counts.get(k, 0) + 1
+    return {k: sums[k] / max(1, counts[k]) for k in sorted(sums)}
+
 from rl_utils import (
     DEFAULT_CONFIG,
+    assistant_completion,
     load_config,
     load_filtered_samples,
     load_policy,
     prompt_until_assistant,
     sample_answer,
     sample_segment_infilling,
-    segment_text,
     set_seed,
 )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Reward-guided best-of-K sampling for QAR SFT policy.")
+    parser = argparse.ArgumentParser(description="Reward-guided best-of-K sampling for anchored QAR SFT policy.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--tag", default=None)
@@ -40,7 +57,7 @@ def main():
     rows = []
     for idx, sample in enumerate(samples):
         prompt = prompt_until_assistant(sample)
-        reference = segment_text(sample, train=True)
+        reference_completion = assistant_completion(sample)
         candidates = []
         for k in range(int(bok.get("k", 4))):
             if bok.get("generation_mode", "segment_infilling") == "segment_infilling":
@@ -55,10 +72,13 @@ def main():
                     int(bok.get("steps", 128)),
                     device,
                 )
-                answer = generated["generated_target"]
-                display_answer = generated["generated"]
+                # Score the assistant completion, not generated_target.  In anchored
+                # QAR, generated_target omits fixed labels such as Reasoning:/Answer:.
+                score_text = generated["generated_completion"]
+                display_answer = generated["generated_completion"]
+                target_only = generated["generated_target"]
             else:
-                answer = sample_answer(
+                score_text = sample_answer(
                     model,
                     graph,
                     noise,
@@ -69,27 +89,41 @@ def main():
                     int(bok.get("steps", 128)),
                     device,
                 )
-                display_answer = answer
-            reward = score_answer(answer, reference, config.get("reward", {}))
-            candidates.append({"k": k, "answer": answer, "display_answer": display_answer, "reward": reward})
+                display_answer = score_text
+                target_only = score_text
+            reward = score_answer(score_text, reference_completion, config.get("reward", {}))
+            candidates.append(
+                {
+                    "k": k,
+                    "answer": score_text,
+                    "target_only": target_only,
+                    "display_answer": display_answer,
+                    "reward": reward,
+                }
+            )
 
         best = max(candidates, key=lambda row: row["reward"]["score"])
         first = candidates[0]
         record = {
             "id": sample.get("id", str(idx)),
             "checkpoint": checkpoint,
-            "format_note": "QAR target is Assistant completion: Reasoning + Answer.",
+            "format_note": "Anchored QAR: fixed Reasoning:/Answer: labels; generated contents are scored through the full assistant completion.",
             "prompt": prompt,
-            "reference": reference,
+            "reference": reference_completion,
             "first_reward": first["reward"]["score"],
             "best_reward": best["reward"]["score"],
             "reward_gain": best["reward"]["score"] - first["reward"]["score"],
+            "first_components": numeric_reward_components(first["reward"]),
+            "best_components": numeric_reward_components(best["reward"]),
             "first_answer": first.get("display_answer", first["answer"]),
             "best_answer": best.get("display_answer", best["answer"]),
             "candidates": candidates,
         }
         rows.append(record)
-        print(f"{record['id']}: first={record['first_reward']:.3f}, best={record['best_reward']:.3f}, gain={record['reward_gain']:.3f}")
+        print(
+            f"{record['id']}: first={record['first_reward']:.3f}, "
+            f"best={record['best_reward']:.3f}, gain={record['reward_gain']:.3f}"
+        )
 
     out_dir = Path(config["results"].get("report_dir", "sft_rl_pipeline/reports"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -97,39 +131,65 @@ def main():
     json_path = out_dir / f"best_of_k_{run_name}.json"
     json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    md = ["# SFT-RL Best-of-K QAR", "", "QAR target is the assistant completion: `Reasoning: ... Answer: ...`.", ""]
+    summary = {
+        "num_examples": len(rows),
+        "mean_first_reward": sum(row["first_reward"] for row in rows) / max(1, len(rows)),
+        "mean_best_reward": sum(row["best_reward"] for row in rows) / max(1, len(rows)),
+        "mean_reward_gain": sum(row["reward_gain"] for row in rows) / max(1, len(rows)),
+        "mean_first_components": mean_dict([row.get("first_components", {}) for row in rows]),
+        "mean_best_components": mean_dict([row.get("best_components", {}) for row in rows]),
+    }
+    summary_path = out_dir / f"best_of_k_{run_name}_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    md = [
+        "# SFT-RL Best-of-K Anchored QAR",
+        "",
+        "QAR completion view is `Reasoning: ... Answer: ...`; the labels may be fixed anchors, so candidates are scored on the assistant completion rather than target-only tokens.",
+        "",
+    ]
     if rows:
         avg_gain = sum(row["reward_gain"] for row in rows) / len(rows)
         md.append(f"Average reward gain over first sample: `{avg_gain:.4f}`")
+        md.append(f"Mean first reward: `{summary['mean_first_reward']:.4f}`")
+        md.append(f"Mean best reward: `{summary['mean_best_reward']:.4f}`")
+        md.append("")
+        md.append("### Mean component scores")
+        md.append("```json")
+        md.append(json.dumps({"first": summary["mean_first_components"], "best": summary["mean_best_components"]}, ensure_ascii=False, indent=2))
+        md.append("```")
         md.append("")
     for row in rows:
-        md.extend([
-            f"## {row['id']}",
-            "",
-            f"first reward: `{row['first_reward']:.4f}`",
-            f"best reward: `{row['best_reward']:.4f}`",
-            "",
-            "### Prompt",
-            "```text",
-            row["prompt"],
-            "```",
-            "### Reference target",
-            "```text",
-            row["reference"],
-            "```",
-            "### First",
-            "```text",
-            row["first_answer"],
-            "```",
-            "### Best",
-            "```text",
-            row["best_answer"],
-            "```",
-            "",
-        ])
+        md.extend(
+            [
+                f"## {row['id']}",
+                "",
+                f"first reward: `{row['first_reward']:.4f}`",
+                f"best reward: `{row['best_reward']:.4f}`",
+                "",
+                "### Prompt",
+                "```text",
+                row["prompt"],
+                "```",
+                "### Reference assistant completion",
+                "```text",
+                row["reference"],
+                "```",
+                "### First",
+                "```text",
+                row["first_answer"],
+                "```",
+                "### Best",
+                "```text",
+                row["best_answer"],
+                "```",
+                "",
+            ]
+        )
     md_path = out_dir / f"best_of_k_{run_name}.md"
     md_path.write_text("\n".join(md), encoding="utf-8")
     print(f"Wrote {json_path}")
+    print(f"Wrote {summary_path}")
     print(f"Wrote {md_path}")
 
 
