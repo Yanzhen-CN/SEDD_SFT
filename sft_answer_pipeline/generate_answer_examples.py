@@ -7,8 +7,6 @@ import torch
 import yaml
 from transformers import GPT2TokenizerFast
 
-from sft_rl_pipeline.rl_utils import sample_segment_infilling
-
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
@@ -52,6 +50,61 @@ def prompt_until_assistant(sample):
         if name == "assistant_label":
             break
     return "".join(parts)
+
+
+def truncate_segments_for_infilling(sample, tokenizer, max_length, min_target_tokens):
+    encoded = []
+    for name, segment in get_segments(sample):
+        encoded.append({
+            "name": name,
+            "ids": tokenizer(segment["text"], add_special_tokens=False).input_ids,
+            "train": bool(segment["train"]),
+        })
+
+    total_len = sum(len(item["ids"]) for item in encoded)
+    if total_len <= max_length:
+        ids, train_mask = [], []
+        for item in encoded:
+            ids.extend(item["ids"])
+            train_mask.extend([1 if item["train"] else 0] * len(item["ids"]))
+        return ids, train_mask
+
+    by_name = {item["name"]: item for item in encoded}
+    prefix_ids = []
+    for name in ["user_label", "user", "assistant_label"]:
+        if name in by_name:
+            prefix_ids.extend(by_name[name]["ids"])
+
+    assistant_ids = by_name.get("assistant", {"ids": []})["ids"]
+    reasoning_label_ids = by_name.get("reasoning_label", {"ids": []})["ids"]
+    reasoning_ids = by_name.get("reasoning", {"ids": []})["ids"]
+    if not assistant_ids:
+        ids, train_mask, remaining = [], [], max_length
+        for item in encoded:
+            if remaining <= 0:
+                break
+            take = min(len(item["ids"]), remaining)
+            ids.extend(item["ids"][:take])
+            train_mask.extend([1 if item["train"] else 0] * take)
+            remaining -= take
+        return ids, train_mask
+
+    reserved_reasoning = min_target_tokens if reasoning_ids else 0
+    prefix_budget = max(1, max_length - reserved_reasoning - len(reasoning_label_ids) - min_target_tokens)
+    prefix_ids = prefix_ids[-prefix_budget:]
+    assistant_budget = max_length - len(prefix_ids) - len(reasoning_label_ids) - reserved_reasoning
+    assistant_ids = assistant_ids[:max(1, assistant_budget)]
+    remaining = max_length - len(prefix_ids) - len(assistant_ids) - len(reasoning_label_ids)
+    reasoning_ids = reasoning_ids[:max(0, remaining)]
+
+    ids = prefix_ids + assistant_ids + reasoning_label_ids + reasoning_ids
+    train_mask = (
+        [0] * len(prefix_ids)
+        + [1] * len(assistant_ids)
+        + [0] * len(reasoning_label_ids)
+        + [1] * len(reasoning_ids)
+    )
+    return ids[:max_length], train_mask[:max_length]
 
 
 def load_model_tuple(config, kind, device):
@@ -115,6 +168,43 @@ def sample_answer(model, graph, noise, tokenizer, prompt, length, answer_budget,
         "prompt": prompt_text,
         "generated_full": full_text,
         "generated_answer": answer_text.strip(),
+    }
+
+
+def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, min_target_tokens, steps, device):
+    import sampling
+
+    ids, train_mask = truncate_segments_for_infilling(sample, tokenizer, int(length), int(min_target_tokens))
+    real_len = len(ids)
+    pad_len = int(length) - real_len
+    if pad_len > 0:
+        ids = ids + [tokenizer.eos_token_id] * pad_len
+        train_mask = train_mask + [0] * pad_len
+
+    fixed_locs = [idx for idx, is_train in enumerate(train_mask) if not is_train]
+    fixed_ids = torch.tensor([ids[idx] for idx in fixed_locs], device=device)[None]
+
+    def proj_fun(x):
+        x[:, fixed_locs] = fixed_ids
+        return x
+
+    sampling_fn = sampling.get_pc_sampler(
+        graph,
+        noise,
+        (1, int(length)),
+        "analytic",
+        int(steps),
+        device=device,
+        proj_fun=proj_fun,
+    )
+    with torch.no_grad():
+        generated = proj_fun(sampling_fn(model))
+
+    generated_target_ids = generated[0, [idx for idx, is_train in enumerate(train_mask[:real_len]) if is_train]]
+    return {
+        "prompt": segment_text(sample, train=False),
+        "generated_full": tokenizer.batch_decode(generated[:, :real_len])[0].strip(),
+        "generated_target": tokenizer.decode(generated_target_ids).strip(),
     }
 
 
