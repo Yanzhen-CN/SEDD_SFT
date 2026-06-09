@@ -82,7 +82,7 @@ def main():
 
     set_seed(int(config["training"].get("seed", 42)))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_root = Path(config["results"].get("output_dir", "SFT_RL/modelparameter/RL-QAR"))
+    out_root = Path(config["results"].get("output_dir", "sft_rl_pipeline/modelparameter/RL-QAR"))
     timestamp = dt.datetime.now().strftime("%Y.%m.%d_%H%M%S")
     run_dir_name = timestamp if not args.run_name else f"{timestamp}_{args.run_name}"
     run_dir = out_root / run_dir_name

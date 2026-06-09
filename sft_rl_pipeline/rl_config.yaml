@@ -71,5 +71,5 @@ training:
   num_workers: 0
 
 results:
-  output_dir: SFT_RL/modelparameter/sft_rl
-  report_dir: SFT_RL/reports
+  output_dir: sft_rl_pipeline/modelparameter/sft_rl
+  report_dir: sft_rl_pipeline/reports

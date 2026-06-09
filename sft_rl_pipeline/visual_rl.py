@@ -164,7 +164,7 @@ def plot_final_comparison(experiments, figure_dir):
     return path
 
 
-def plot_test_comparison(figure_dir, test_path=Path("SFT_RL/test_results/rl_test_results.csv")):
+def plot_test_comparison(figure_dir, test_path=Path("sft_rl_pipeline/test_results/rl_test_results.csv")):
     if not test_path.exists():
         return None
     rows = []
@@ -214,7 +214,7 @@ def write_summary(experiments, figure_dir):
 def main():
     parser = argparse.ArgumentParser(description="Visualize all SFT-RL experiments from saved metrics.")
     parser.add_argument("--configs", nargs="*", default=DEFAULT_CONFIGS)
-    parser.add_argument("--output-dir", default="SFT_RL/visualization")
+    parser.add_argument("--output-dir", default="sft_rl_pipeline/visualization")
     args = parser.parse_args()
 
     experiments = [experiment_from_config(Path(path)) for path in args.configs]
