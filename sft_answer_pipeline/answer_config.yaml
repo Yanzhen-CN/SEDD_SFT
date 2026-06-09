@@ -31,9 +31,12 @@ runs:
 model:
   pretrained: louaaron/sedd-medium
   name: medium
-  # 512 is safer on small GPUs but will drop most long QAR samples.
-  # 1024/2048 keeps more reasoning traces but costs much more memory.
-  max_length: 512
+  # This is the exact per-sample sequence length used by SEDD.
+  # Any prepared sample whose tokenized full text is longer than this is dropped
+  # and recorded in *_prepare_filter_report.json.
+  # Official SEDD small/medium configs use length=1024. Keep filtering,
+  # training, evaluation, and generation aligned to that unless memory fails.
+  max_length: 1024
   min_target_tokens: 32
   drop_overlength: true
   write_load_reports: true
@@ -66,5 +69,5 @@ eval:
 generation:
   num_examples: 5
   steps: 128
-  max_length: 512
+  max_length: 1024
   output_dir: sft_answer_pipeline/reports

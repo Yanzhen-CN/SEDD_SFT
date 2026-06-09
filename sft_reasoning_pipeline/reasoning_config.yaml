@@ -23,7 +23,9 @@ runs:
 model:
   pretrained: louaaron/sedd-medium
   name: medium
-  max_length: 512
+  # Official SEDD small/medium configs use length=1024. Over-length rows are
+  # dropped during prepare_reasoning_data.py and recorded in reports.
+  max_length: 1024
   min_target_tokens: 8
   drop_overlength: true
   write_load_reports: true
@@ -55,5 +57,5 @@ eval:
 generation:
   num_examples: 5
   steps: 128
-  max_length: 512
+  max_length: 1024
   output_dir: sft_reasoning_pipeline/reports

@@ -236,7 +236,7 @@ def filter_by_tokens(split_name, samples, tokenizer, max_length, min_target_toke
         "kept_total_tokens": _summary(kept_total),
         "kept_train_tokens": _summary(kept_train),
         "skipped_examples": skipped,
-        "note": "Token filtering is done during data preparation. Training should not see over-length samples.",
+        "note": "Each JSONL row is checked as one independent training sample. Rows with total_tokens > model.max_length are dropped and reported.",
     }
     report_path = Path(output_dir) / "RA" / f"{split_name}_prepare_filter_report.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,7 +254,9 @@ def write_jsonl(path, samples):
 def save_dataset(split_samples, output_dir, tokenizer, max_length, min_target_tokens):
     splits = {}
     filter_reports = {}
+    input_samples = []
     for split, samples in split_samples.items():
+        input_samples.extend(samples)
         kept, report = filter_by_tokens(split, samples, tokenizer, max_length, min_target_tokens, output_dir)
         splits[split] = kept
         filter_reports[split] = report
@@ -267,7 +269,8 @@ def save_dataset(split_samples, output_dir, tokenizer, max_length, min_target_to
         "train": len(splits["train"]),
         "validation": len(splits["validation"]),
         "test": len(splits["test"]),
-        "all_stats": length_stats(samples),
+        "input_stats_before_token_filter": length_stats(input_samples),
+        "all_stats": length_stats([sample for split in splits.values() for sample in split]),
         "train_stats": length_stats(splits["train"]),
         "validation_stats": length_stats(splits["validation"]),
         "test_stats": length_stats(splits["test"]),
