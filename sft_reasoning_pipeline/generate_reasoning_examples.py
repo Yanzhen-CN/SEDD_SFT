@@ -9,8 +9,10 @@ from transformers import GPT2TokenizerFast
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
+ANSWER_PIPELINE_DIR = REPO_DIR / "sft_answer_pipeline"
 sys.path.insert(0, str(REPO_DIR))
-DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
+sys.path.insert(0, str(ANSWER_PIPELINE_DIR))
+DEFAULT_CONFIG = SCRIPT_DIR / "reasoning_config.yaml"
 
 
 def load_config(path):
@@ -18,25 +20,24 @@ def load_config(path):
         return yaml.safe_load(f) or {}
 
 
-def load_filtered_samples(config, dataset_name, split, tokenizer, limit):
+def segment_text(sample, train=None):
+    from answer_dataset import sample_text
+    return sample_text(sample, train=train)
+
+
+def load_filtered_samples(config, tokenizer, limit):
     from answer_dataset import AnswerSegmentDataset
 
     data_root = Path(config["data"].get("output_dir", SCRIPT_DIR / "data"))
     dataset = AnswerSegmentDataset(
-        data_root / dataset_name / f"{split}.jsonl",
+        data_root / "RA" / "test.jsonl",
         tokenizer,
         int(config["generation"].get("max_length", config["model"].get("max_length", 512))),
-        min_target_tokens=int(config["model"].get("min_target_tokens", 32)),
+        min_target_tokens=int(config["model"].get("min_target_tokens", 8)),
         drop_overlength=bool(config["model"].get("drop_overlength", True)),
         write_report=bool(config["model"].get("write_load_reports", True)),
     )
     return dataset.samples[:limit]
-
-
-def segment_text(sample, train=None):
-    from answer_dataset import sample_text
-
-    return sample_text(sample, train=train)
 
 
 def load_model_tuple(config, kind, device):
@@ -50,16 +51,14 @@ def load_model_tuple(config, kind, device):
     model.config.model.length = int(config["generation"].get("max_length", config["model"].get("max_length", 512)))
     ema = ExponentialMovingAverage(model.parameters(), decay=float(config["training"].get("ema", 0.9999)))
     checkpoint = pretrained
-
-    if kind in ["QA", "QAR"]:
-        ckpt = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / kind / "best.pth"
+    if kind == "RA":
+        ckpt = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / "RA" / "best.pth"
         if not ckpt.exists():
             return None
         state = torch.load(ckpt, map_location=device)
         model.load_state_dict(state["model"], strict=True)
         ema.load_state_dict(state["ema"])
         checkpoint = str(ckpt)
-
     ema.store(model.parameters())
     ema.copy_to(model.parameters())
     graph = graph_lib.get_graph(model.config, device)
@@ -71,75 +70,54 @@ def load_model_tuple(config, kind, device):
 def encode_sample_no_truncation(sample, tokenizer, max_length):
     from answer_dataset import ordered_segments
 
-    ids = []
-    train_mask = []
+    ids, train_mask = [], []
     for _, segment in ordered_segments(sample):
         token_ids = tokenizer(segment.get("text", ""), add_special_tokens=False).input_ids
         is_train = bool(segment.get("train", False))
         ids.extend(token_ids)
         train_mask.extend([1 if is_train else 0] * len(token_ids))
     if len(ids) > max_length:
-        raise ValueError(
-            f"Filtered generation sample {sample.get('id')} is still over-length: "
-            f"{len(ids)} > {max_length}. Regenerate or reload with stricter filtering."
-        )
+        raise ValueError(f"Sample {sample.get('id')} is over-length after filtering: {len(ids)}>{max_length}")
     if not any(train_mask):
-        raise ValueError(f"Generation sample {sample.get('id')} has no train target tokens.")
+        raise ValueError(f"Sample {sample.get('id')} has no target tokens")
     return ids, train_mask
 
 
-def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, steps, device):
+def sample_infilling(model, graph, noise, tokenizer, sample, length, steps, device):
     import sampling
 
     ids, train_mask = encode_sample_no_truncation(sample, tokenizer, int(length))
     real_len = len(ids)
     pad_len = int(length) - real_len
     if pad_len > 0:
-        ids = ids + [tokenizer.eos_token_id] * pad_len
-        train_mask = train_mask + [0] * pad_len
-
-    fixed_locs = [idx for idx, is_train in enumerate(train_mask) if not is_train]
-    fixed_ids = torch.tensor([ids[idx] for idx in fixed_locs], device=device)[None]
+        ids += [tokenizer.eos_token_id] * pad_len
+        train_mask += [0] * pad_len
+    fixed_locs = [i for i, is_train in enumerate(train_mask) if not is_train]
+    fixed_ids = torch.tensor([ids[i] for i in fixed_locs], device=device)[None]
 
     def proj_fun(x):
         x[:, fixed_locs] = fixed_ids
         return x
 
-    sampling_fn = sampling.get_pc_sampler(
-        graph,
-        noise,
-        (1, int(length)),
-        "analytic",
-        int(steps),
-        device=device,
-        proj_fun=proj_fun,
-    )
-
-    target_positions = [idx for idx, is_train in enumerate(train_mask[:real_len]) if is_train]
+    sampling_fn = sampling.get_pc_sampler(graph, noise, (1, int(length)), "analytic", int(steps), device=device, proj_fun=proj_fun)
+    target_positions = [i for i, is_train in enumerate(train_mask[:real_len]) if is_train]
     with torch.no_grad():
         generated = proj_fun(sampling_fn(model))
-        generated_target_ids = generated[0, target_positions]
-
-    return {
-        "prompt": segment_text(sample, train=False),
-        "generated_full": tokenizer.batch_decode(generated[:, :real_len])[0].strip(),
-        "generated_target": tokenizer.decode(generated_target_ids).strip(),
-    }
+        target_ids = generated[0, target_positions]
+    return tokenizer.decode(target_ids).strip()
 
 
 def write_report(path, records):
-    lines = ["# Answer SFT Generation Examples", ""]
+    lines = ["# Reasoning-conditioned Answer Generation Examples", ""]
     for item in records:
         lines.append(f"## {item['id']}")
         lines.append("")
-        lines.append(f"Mode: `{item.get('mode', '')}`")
-        lines.append("")
-        lines.append("### Fixed conditioning tokens")
+        lines.append("### Fixed question + teacher reasoning")
         lines.append("```text")
         lines.append(item["prompt"])
         lines.append("```")
         lines.append("")
-        lines.append("### Reference target tokens")
+        lines.append("### Reference answer")
         lines.append("```text")
         lines.append(item["reference"].strip())
         lines.append("```")
@@ -155,27 +133,17 @@ def write_report(path, records):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate qualitative examples from pretrained/QA/QAR models.")
+    parser = argparse.ArgumentParser(description="Generate RA examples: fixed reasoning -> answer.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--dataset", default="QAR", choices=["QA", "QAR"])
     args = parser.parse_args()
-
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
+    rows = load_filtered_samples(config, tokenizer, int(config["generation"].get("num_examples", 5)))
 
-    rows = load_filtered_samples(
-        config,
-        args.dataset,
-        "test",
-        tokenizer,
-        int(config["generation"].get("num_examples", 5)),
-    )
-
-    model_kinds = ["pretrained", "QA", "QAR"]
     loaded = {}
-    for kind in model_kinds:
+    for kind in ["pretrained", "RA"]:
         model_tuple = load_model_tuple(config, kind if kind != "pretrained" else "pretrained", device)
         if model_tuple is not None:
             loaded[kind] = model_tuple
@@ -184,34 +152,23 @@ def main():
     for idx, row in enumerate(rows):
         item = {
             "id": row.get("id", str(idx)),
-            "mode": row.get("mode", args.dataset),
             "prompt": segment_text(row, train=False),
             "reference": segment_text(row, train=True),
-            "answer": row.get("answer", ""),
-            "reasoning": row.get("reasoning", ""),
             "generations": {},
         }
         for model_name, (model, graph, noise, _) in loaded.items():
-            sample = sample_segment_infilling(
-                model,
-                graph,
-                noise,
-                tokenizer,
-                row,
+            item["generations"][model_name] = sample_infilling(
+                model, graph, noise, tokenizer, row,
                 int(config["generation"].get("max_length", 512)),
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-            item["generations"][model_name] = sample["generated_target"]
         records.append(item)
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))
-    write_report(out_dir / f"answer_generation_{args.dataset}.md", records)
-    (out_dir / f"answer_generation_{args.dataset}.json").write_text(
-        json.dumps(records, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"Wrote {out_dir / f'answer_generation_{args.dataset}.md'}")
+    write_report(out_dir / "reasoning_answer_generation_RA.md", records)
+    (out_dir / "reasoning_answer_generation_RA.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Wrote {out_dir / 'reasoning_answer_generation_RA.md'}")
 
 
 if __name__ == "__main__":

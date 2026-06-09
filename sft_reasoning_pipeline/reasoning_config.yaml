@@ -1,0 +1,58 @@
+data:
+  build: true
+  source_dataset: simplescaling/s1K-1.1
+  arrow_path: null
+  output_dir: sft_reasoning_pipeline/data
+  valid_ratio: 0.10
+  test_ratio: 0.10
+  seed: 42
+  reasoning_source_priority: ["deepseek", "gemini"]
+  answer_source: solution
+  answer_field: solution
+
+run:
+  selected: RA
+  execute: true
+
+runs:
+  RA:
+    dataset: RA
+    cuda_visible_devices: null
+
+model:
+  pretrained: louaaron/sedd-medium
+  name: medium
+  max_length: 512
+  min_target_tokens: 8
+  drop_overlength: true
+  write_load_reports: true
+
+training:
+  steps: 1500
+  batch_size: 1
+  accum: 8
+  lr: 3.0e-6
+  warmup: 500
+  weight_decay: 0.0
+  grad_clip: 1.0
+  ema: 0.9999
+  log_freq: 1
+  eval_freq: 25
+  eval_batches: 0
+  save_freq: 0
+  seed: 42
+  num_workers: 0
+
+results:
+  output_dir: sft_reasoning_pipeline/modelparameter
+
+eval:
+  batch_size: 1
+  eval_batches: 0
+  num_workers: 0
+
+generation:
+  num_examples: 5
+  steps: 128
+  max_length: 512
+  output_dir: sft_reasoning_pipeline/reports

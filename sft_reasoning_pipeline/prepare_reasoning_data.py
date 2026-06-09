@@ -5,12 +5,9 @@ from pathlib import Path
 
 import yaml
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
-
-QA_SEGMENT_ORDER = ["user_label", "user", "assistant_label", "assistant"]
-QAR_SEGMENT_ORDER = ["user_label", "user", "assistant_label", "assistant"]
+DEFAULT_CONFIG = SCRIPT_DIR / "reasoning_config.yaml"
+RA_SEGMENT_ORDER = ["user_label", "user", "reasoning_label", "reasoning", "assistant_label", "assistant"]
 
 
 def clean(text):
@@ -25,40 +22,30 @@ def load_config(path):
 def load_s1k(data_cfg):
     if data_cfg.get("arrow_path"):
         from datasets import Dataset
-
         return Dataset.from_file(data_cfg["arrow_path"])
-
     from datasets import load_dataset
-
     return load_dataset(data_cfg.get("source_dataset", "simplescaling/s1K-1.1"), split="train")
 
 
 def choose_reasoning(row, priority):
-    reasoning_fields = {
+    fields = {
         "deepseek": clean(row.get("deepseek_thinking_trajectory")),
         "gemini": clean(row.get("gemini_thinking_trajectory")),
     }
     for source in priority:
-        if reasoning_fields.get(source):
-            return source, reasoning_fields[source]
+        if fields.get(source):
+            return source, fields[source]
     return None, None
 
 
 def choose_answer(row, source, data_cfg):
-    """Choose answer text.
-
-    answer_source='solution' uses the ground-truth solution.
-    answer_source='matched_attempt' uses deepseek_attempt/gemini_attempt when
-    available, which is more source-consistent with the chosen reasoning trace
-    but may be less ground-truth aligned.
-    """
-    answer_source = data_cfg.get("answer_source", "solution")
-    fallback = clean(row.get(data_cfg.get("answer_field", "solution")))
-    if answer_source == "matched_attempt" and source:
+    fallback_field = data_cfg.get("answer_field", "solution")
+    fallback = clean(row.get(fallback_field))
+    if data_cfg.get("answer_source", "solution") == "matched_attempt" and source:
         attempt = clean(row.get(f"{source}_attempt"))
         if attempt:
             return attempt, f"{source}_attempt"
-    return fallback, data_cfg.get("answer_field", "solution")
+    return fallback, fallback_field
 
 
 def split_indices(n_rows, valid_ratio, test_ratio, seed):
@@ -68,45 +55,28 @@ def split_indices(n_rows, valid_ratio, test_ratio, seed):
     n_test = max(1, int(n_rows * test_ratio)) if n_rows > 1 and test_ratio > 0 else 0
     if n_valid + n_test >= n_rows:
         raise ValueError("valid_ratio + test_ratio leaves no training data.")
-    return set(indices[:n_valid]), set(indices[n_valid : n_valid + n_test])
+    return set(indices[:n_valid]), set(indices[n_valid:n_valid + n_test])
 
 
 def segment(text, train):
     return {"text": str(text), "train": bool(train)}
 
 
-def make_qa_sample(row_id, question, answer, meta=None):
+def make_ra_sample(row_id, question, reasoning, answer, meta=None):
+    # RA = Reasoning-conditioned Answer SFT.
+    # Question and teacher reasoning are fixed conditions; only final answer is trained.
     segments = {
         "user_label": segment("User: ", False),
         "user": segment(clean(question), False),
-        "assistant_label": segment("\nAssistant:\n", False),
+        "reasoning_label": segment("\nReasoning:\n", False),
+        "reasoning": segment(clean(reasoning), False),
+        "assistant_label": segment("\nAssistant:\nFinal Answer:\n", False),
         "assistant": segment(clean(answer), True),
     }
     return {
         "id": row_id,
-        "mode": "QA",
-        "segment_order": QA_SEGMENT_ORDER,
-        "segments": segments,
-        "answer": clean(answer),
-        "reasoning": "",
-        **(meta or {}),
-    }
-
-
-def make_qar_sample(row_id, question, answer, reasoning, meta=None):
-    # Completion-only SFT target: reasoning first, then final answer.
-    # The final-answer marker is part of the train target, not a fixed prompt.
-    target = clean(reasoning) + "\n\nFinal Answer:\n" + clean(answer)
-    segments = {
-        "user_label": segment("User: ", False),
-        "user": segment(clean(question), False),
-        "assistant_label": segment("\nAssistant:\n", False),
-        "assistant": segment(target, True),
-    }
-    return {
-        "id": row_id,
-        "mode": "QAR",
-        "segment_order": QAR_SEGMENT_ORDER,
+        "mode": "RA",
+        "segment_order": RA_SEGMENT_ORDER,
         "segments": segments,
         "answer": clean(answer),
         "reasoning": clean(reasoning),
@@ -117,37 +87,31 @@ def make_qar_sample(row_id, question, answer, reasoning, meta=None):
 def sample_text(sample, train=None):
     parts = []
     for name in sample.get("segment_order", []):
-        segment_obj = sample["segments"].get(name)
-        if segment_obj is None:
+        seg = sample["segments"].get(name)
+        if seg is None:
             continue
-        if train is None or bool(segment_obj["train"]) is train:
-            parts.append(segment_obj["text"])
+        if train is None or bool(seg["train"]) is train:
+            parts.append(seg["text"])
     return "".join(parts)
 
 
-def _percentile(sorted_values, q):
-    if not sorted_values:
-        return 0
-    idx = min(len(sorted_values) - 1, max(0, int(round((len(sorted_values) - 1) * q))))
-    return sorted_values[idx]
-
-
 def length_stats(samples):
-    lengths = sorted(len(sample_text(sample)) for sample in samples)
-    train_lengths = sorted(len(sample_text(sample, train=True)) for sample in samples)
-    if not lengths:
+    if not samples:
         return {"count": 0}
+    total = sorted(len(sample_text(s)) for s in samples)
+    train = sorted(len(sample_text(s, train=True)) for s in samples)
+    def p(vals, q):
+        return vals[min(len(vals)-1, max(0, int(round((len(vals)-1)*q))))]
     return {
         "count": len(samples),
-        "avg_chars": round(sum(lengths) / len(lengths), 1),
-        "p50_chars": _percentile(lengths, 0.50),
-        "p90_chars": _percentile(lengths, 0.90),
-        "p95_chars": _percentile(lengths, 0.95),
-        "max_chars": lengths[-1],
-        "avg_train_chars": round(sum(train_lengths) / len(train_lengths), 1),
-        "p90_train_chars": _percentile(train_lengths, 0.90),
-        "p95_train_chars": _percentile(train_lengths, 0.95),
-        "max_train_chars": train_lengths[-1],
+        "avg_chars": round(sum(total)/len(total), 1),
+        "p50_chars": p(total, 0.5),
+        "p90_chars": p(total, 0.9),
+        "p95_chars": p(total, 0.95),
+        "max_chars": total[-1],
+        "avg_train_chars": round(sum(train)/len(train), 1),
+        "p90_train_chars": p(train, 0.9),
+        "max_train_chars": train[-1],
     }
 
 
@@ -158,7 +122,7 @@ def write_jsonl(path, samples):
             f.write(json.dumps(sample, ensure_ascii=False) + "\n")
 
 
-def save_dataset(name, samples, valid_indices, test_indices, output_dir):
+def save_dataset(samples, valid_indices, test_indices, output_dir):
     splits = {"train": [], "validation": [], "test": []}
     for idx, sample in enumerate(samples):
         if idx in valid_indices:
@@ -167,13 +131,11 @@ def save_dataset(name, samples, valid_indices, test_indices, output_dir):
             splits["test"].append(sample)
         else:
             splits["train"].append(sample)
-
-    base = Path(output_dir) / name
-    for split, split_samples in splits.items():
-        write_jsonl(base / f"{split}.jsonl", split_samples)
-
+    base = Path(output_dir) / "RA"
+    for split, rows in splits.items():
+        write_jsonl(base / f"{split}.jsonl", rows)
     return {
-        "name": name,
+        "name": "RA",
         "train": len(splits["train"]),
         "validation": len(splits["validation"]),
         "test": len(splits["test"]),
@@ -188,45 +150,31 @@ def build(config):
     data_cfg = config.get("data", {})
     raw = load_s1k(data_cfg)
     priority = data_cfg.get("reasoning_source_priority", ["deepseek", "gemini"])
-
-    qa_samples = []
-    qar_samples = []
-    source_counts = {"deepseek": 0, "gemini": 0}
-    answer_field_counts = {}
+    samples = []
     skipped = 0
     skipped_reasons = {"missing_question": 0, "missing_reasoning": 0, "missing_answer": 0}
+    source_counts = {"deepseek": 0, "gemini": 0}
+    answer_field_counts = {}
 
     for raw_idx, row in enumerate(raw):
         question = clean(row.get("question"))
         source, reasoning = choose_reasoning(row, priority)
         answer, answer_field = choose_answer(row, source, data_cfg)
-
         if not question:
-            skipped += 1
-            skipped_reasons["missing_question"] += 1
-            continue
+            skipped += 1; skipped_reasons["missing_question"] += 1; continue
         if not reasoning:
-            skipped += 1
-            skipped_reasons["missing_reasoning"] += 1
-            continue
+            skipped += 1; skipped_reasons["missing_reasoning"] += 1; continue
         if not answer:
-            skipped += 1
-            skipped_reasons["missing_answer"] += 1
-            continue
-
+            skipped += 1; skipped_reasons["missing_answer"] += 1; continue
         source_counts[source] = source_counts.get(source, 0) + 1
         answer_field_counts[answer_field] = answer_field_counts.get(answer_field, 0) + 1
-        row_id = f"s1k_{raw_idx}"
-        meta = {
-            "source_index": raw_idx,
-            "reasoning_source": source,
-            "answer_field": answer_field,
-        }
-        qa_samples.append(make_qa_sample(row_id, question, answer, meta=meta))
-        qar_samples.append(make_qar_sample(row_id, question, answer, reasoning, meta=meta))
+        samples.append(make_ra_sample(
+            f"s1k_{raw_idx}", question, reasoning, answer,
+            meta={"source_index": raw_idx, "reasoning_source": source, "answer_field": answer_field},
+        ))
 
     valid_indices, test_indices = split_indices(
-        len(qa_samples),
+        len(samples),
         float(data_cfg.get("valid_ratio", 0.1)),
         float(data_cfg.get("test_ratio", 0.1)),
         int(data_cfg.get("seed", 42)),
@@ -235,22 +183,16 @@ def build(config):
     manifest = {
         "source_dataset": data_cfg.get("source_dataset", "simplescaling/s1K-1.1"),
         "raw_rows": len(raw),
-        "usable_rows_before_token_filter": len(qa_samples),
+        "usable_rows_before_token_filter": len(samples),
         "skipped_rows_before_token_filter": skipped,
         "skipped_reasons_before_token_filter": skipped_reasons,
         "token_filter_note": "Token-length filtering is performed by AnswerSegmentDataset at load time. Over-length samples are dropped, not truncated.",
-        "qa_segment_order": QA_SEGMENT_ORDER,
-        "qar_segment_order": QAR_SEGMENT_ORDER,
-        "qar_target_format": "Assistant target = reasoning + '\\n\\nFinal Answer:\\n' + answer",
-        "split_note": "QA and QAR use the same row order and split.",
-        "train_note": "segments.*.train=true tokens are noised and used for score entropy loss; train=false tokens are fixed conditioning context.",
+        "task": "RA: fixed question + fixed teacher reasoning -> train final answer only",
+        "segment_order": RA_SEGMENT_ORDER,
         "reasoning_source_counts": source_counts,
         "answer_field_counts": answer_field_counts,
         "answer_source_config": data_cfg.get("answer_source", "solution"),
-        "datasets": [
-            save_dataset("QA", qa_samples, valid_indices, test_indices, output_dir),
-            save_dataset("QAR", qar_samples, valid_indices, test_indices, output_dir),
-        ],
+        "datasets": [save_dataset(samples, valid_indices, test_indices, output_dir)],
     }
     manifest_path = Path(output_dir) / "manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +201,7 @@ def build(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare answer SFT JSONL datasets.")
+    parser = argparse.ArgumentParser(description="Prepare reasoning-conditioned answer SFT data.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     build(load_config(args.config))

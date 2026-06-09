@@ -8,9 +8,15 @@ data:
   seed: 42
   reasoning_source_priority: ["deepseek", "gemini"]
 
+  # solution: pair DeepSeek/Gemini reasoning with the dataset ground-truth solution.
+  # matched_attempt: pair DeepSeek reasoning with deepseek_attempt, Gemini reasoning with gemini_attempt.
+  # Use matched_attempt only when you care more about trace-answer source consistency than ground-truth correctness.
+  answer_source: solution
+  answer_field: solution
+
 run:
-  # Use "QA", "QAR", or "all".
-  selected: QA
+  # Use "QA", "QAR", or "all".  QAR is the main reasoning-trace SFT experiment.
+  selected: QAR
   execute: true
 
 runs:
@@ -24,8 +30,12 @@ runs:
 model:
   pretrained: louaaron/sedd-medium
   name: medium
+  # 512 is safer on small GPUs but will drop most long QAR samples.
+  # 1024/2048 keeps more reasoning traces but costs much more memory.
   max_length: 512
   min_target_tokens: 32
+  drop_overlength: true
+  write_load_reports: true
 
 training:
   steps: 1500
@@ -56,5 +66,4 @@ generation:
   num_examples: 5
   steps: 128
   max_length: 512
-  answer_token_budget: 256
   output_dir: sft_answer_pipeline/reports

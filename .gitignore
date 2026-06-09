@@ -23,6 +23,7 @@ core
 *.json
 *.csv
 *.tar
+*.zip
 
 sft_pipeline/cache/
 sft_pipeline/modelparameter/
@@ -35,3 +36,6 @@ sft_answer_pipeline/visualization/
 sft_rl_pipeline/modelparameter/
 sft_rl_pipeline_pipeline/reports/
 sft_rl_pipeline/visualization/
+sft_reasoning_pipeline/modelparameter/
+sft_reasoning_pipeline/reports/
+sft_reasoning_pipeline/visualization/
