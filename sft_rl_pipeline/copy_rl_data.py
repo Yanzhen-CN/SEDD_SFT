@@ -26,6 +26,7 @@ def copy_qar_data(source, target, clean_target=True):
     # training but make it clear which QAR version the RL run used.
     optional_names = ["manifest.json"]
     optional_names += [p.name for p in source.glob("*_load_report.json")]
+    optional_names += [p.name for p in source.glob("*_prepare_filter_report.json")]
     for name in sorted(set(optional_names)):
         src = source / name
         if src.exists():

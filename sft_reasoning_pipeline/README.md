@@ -58,10 +58,18 @@ Because `train_answer.py` synchronizes the best run under the global run directo
 sft_reasoning_pipeline/modelparameter/RA/best.pth
 ```
 
-Token filtering happens in `AnswerSegmentDataset`: samples longer than `model.max_length` are dropped, not truncated. Load reports are written beside each split file, for example:
+Use the shared raw S1K split first:
+
+```bash
+python prepare_s1k_split.py --config sft_reasoning_pipeline/reasoning_config.yaml
+```
+
+Token filtering now happens during `prepare_reasoning_data.py`: samples longer
+than `model.max_length` are dropped, not truncated. Filter reports are written
+beside each split file, for example:
 
 ```text
-sft_reasoning_pipeline/data/RA/train_load_report.json
-sft_reasoning_pipeline/data/RA/validation_load_report.json
-sft_reasoning_pipeline/data/RA/test_load_report.json
+sft_reasoning_pipeline/data/RA/train_prepare_filter_report.json
+sft_reasoning_pipeline/data/RA/validation_prepare_filter_report.json
+sft_reasoning_pipeline/data/RA/test_prepare_filter_report.json
 ```

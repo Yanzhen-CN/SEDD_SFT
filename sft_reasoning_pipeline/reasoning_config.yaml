@@ -2,6 +2,7 @@ data:
   build: true
   source_dataset: simplescaling/s1K-1.1
   arrow_path: null
+  split_dir: data/s1k_split
   output_dir: sft_reasoning_pipeline/data
   valid_ratio: 0.10
   test_ratio: 0.10

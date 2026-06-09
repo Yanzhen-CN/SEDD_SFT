@@ -13,7 +13,26 @@ conda activate sedd
 mkdir -p sft_answer_pipeline/logs sft_reasoning_pipeline/logs sft_rl_pipeline/logs
 ```
 
-## 1. Build anchored QAR / QA data
+## 1. Build the shared S1K split
+
+Create one raw S1K split first.  All later pipelines read this same split and
+then apply their own token-length filters.  This keeps train/validation/test
+assignment consistent and avoids leakage when QAR/RA drop long samples.
+
+```bash
+python prepare_s1k_split.py --config sft_answer_pipeline/answer_config.yaml
+```
+
+Outputs:
+
+```text
+data/s1k_split/train.jsonl
+data/s1k_split/validation.jsonl
+data/s1k_split/test.jsonl
+data/s1k_split/manifest.json
+```
+
+## 2. Build anchored QAR / QA data
 
 ```bash
 python sft_answer_pipeline/prepare_answer_data.py --config sft_answer_pipeline/answer_config.yaml
@@ -38,17 +57,19 @@ User/question/Assistant/Reasoning:/Answer:  train=false
 reasoning content + answer content          train=true
 ```
 
-Training-time token filtering will write load reports beside each split after
-the dataloader is used.  Inspect them when checking how many long S1K examples
-were dropped:
+Data preparation now applies tokenizer-length filtering before training.  Check
+these reports to see how many long S1K examples were dropped:
 
 ```text
-sft_answer_pipeline/data/QAR/train_load_report.json
-sft_answer_pipeline/data/QAR/validation_load_report.json
-sft_answer_pipeline/data/QAR/test_load_report.json
+sft_answer_pipeline/data/QAR/train_prepare_filter_report.json
+sft_answer_pipeline/data/QAR/validation_prepare_filter_report.json
+sft_answer_pipeline/data/QAR/test_prepare_filter_report.json
 ```
 
-## 2. Train main QAR SFT
+The dataloader may still write `*_load_report.json`, but those should show the
+already-filtered prepared data.
+
+## 3. Train main QAR SFT
 
 Make sure `sft_answer_pipeline/answer_config.yaml` has:
 
@@ -80,7 +101,7 @@ sft_answer_pipeline/modelparameter/QAR/best_eval.json
 sft_answer_pipeline/modelparameter/QAR/best_metrics.csv
 ```
 
-## 3. Evaluate and generate QAR examples
+## 4. Evaluate and generate QAR examples
 
 ```bash
 python sft_answer_pipeline/test_answer_eval.py --config sft_answer_pipeline/answer_config.yaml
@@ -98,7 +119,7 @@ sft_answer_pipeline/modelparameter/test_result/
 For qualitative analysis, read `generated_completion`, because fixed anchors
 are not part of the generated target loss.
 
-## 4. Reasoning pipeline: RA diagnostic
+## 5. Reasoning pipeline: RA diagnostic
 
 `sft_reasoning_pipeline` is an independent diagnostic pipeline.  It keeps the
 same text scaffold as QAR, but teacher reasoning is fixed and only the final
@@ -112,6 +133,14 @@ Build RA data:
 
 ```bash
 python sft_reasoning_pipeline/prepare_reasoning_data.py --config sft_reasoning_pipeline/reasoning_config.yaml
+```
+
+RA reads the same `data/s1k_split` and then writes its own token-filter reports:
+
+```text
+sft_reasoning_pipeline/data/RA/train_prepare_filter_report.json
+sft_reasoning_pipeline/data/RA/validation_prepare_filter_report.json
+sft_reasoning_pipeline/data/RA/test_prepare_filter_report.json
 ```
 
 Manual single run:
@@ -145,7 +174,7 @@ sft_reasoning_pipeline/modelparameter/RA/best_metrics.csv
 sft_reasoning_pipeline/reports/
 ```
 
-## 5. Prepare RL-style continuation
+## 6. Prepare RL-style continuation
 
 Refresh the RL data snapshot every time QAR data format changes:
 
@@ -171,7 +200,7 @@ pretrained-start RL config can also load directly from Hugging Face when
 python save_pretrained_checkpoint.py
 ```
 
-## 6. Run six RL-style experiments
+## 7. Run six RL-style experiments
 
 This is the only kept batch launcher.  It starts three pretrained-start runs
 and three QAR-start runs on CUDA 0-5:
@@ -194,7 +223,7 @@ sft_rl_pipeline/modelparameter/sft_rl/
 sft_rl_pipeline/reports/
 ```
 
-## 7. RL evaluation and visualization
+## 8. RL evaluation and visualization
 
 ```bash
 python sft_rl_pipeline/test_rl_eval.py
@@ -203,7 +232,7 @@ python sft_rl_pipeline/run_rl.py --config sft_rl_pipeline/rl_config.yaml --best-
 python sft_rl_pipeline/visual_rl.py
 ```
 
-## 8. Files worth copying back locally
+## 9. Files worth copying back locally
 
 ```text
 sft_answer_pipeline/modelparameter/
