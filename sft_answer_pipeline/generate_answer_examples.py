@@ -273,7 +273,7 @@ def main():
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-            item["generations"][model_name] = sample["generated_target"]
+            item["generations"][model_name] = sample["generated_full"]
         records.append(item)
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))

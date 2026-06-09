@@ -45,6 +45,7 @@ def main():
                     device,
                 )
                 answer = generated["generated_target"]
+                display_answer = generated["generated"]
             else:
                 answer = sample_answer(
                     model,
@@ -57,8 +58,9 @@ def main():
                     int(bok.get("steps", 128)),
                     device,
                 )
+                display_answer = answer
             reward = score_answer(answer, reference, config.get("reward", {}))
-            candidates.append({"k": k, "answer": answer, "reward": reward})
+            candidates.append({"k": k, "answer": answer, "display_answer": display_answer, "reward": reward})
         best = max(candidates, key=lambda row: row["reward"]["score"])
         first = candidates[0]
         record = {
@@ -69,8 +71,8 @@ def main():
             "first_reward": first["reward"]["score"],
             "best_reward": best["reward"]["score"],
             "reward_gain": best["reward"]["score"] - first["reward"]["score"],
-            "first_answer": first["answer"],
-            "best_answer": best["answer"],
+            "first_answer": first.get("display_answer", first["answer"]),
+            "best_answer": best.get("display_answer", best["answer"]),
             "candidates": candidates,
         }
         rows.append(record)
