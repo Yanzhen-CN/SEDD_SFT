@@ -62,8 +62,8 @@ def update_global_best(out_root, run_dir, checkpoint_path, best_info):
 
 def reward_weights(batch, reward_cfg, device):
     vals = []
-    for answer, target in zip(batch["answers"], batch["targets"]):
-        vals.append(score_answer(answer, target, reward_cfg)["score"])
+    for target in batch["targets"]:
+        vals.append(score_answer(target, target, reward_cfg)["score"])
     rewards = torch.tensor(vals, dtype=torch.float32, device=device)
     min_weight = float(reward_cfg.get("train_weight_min", 0.5))
     max_weight = float(reward_cfg.get("train_weight_max", 1.5))

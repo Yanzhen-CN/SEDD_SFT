@@ -11,57 +11,36 @@ reward:
   # Rule reward for fast exploration. Higher is better.
   # Only enabled rules are used. Weights are normalized automatically by default.
   length_min: 64
-  length_max: 900
+  length_max: 60000
   repeat_ngram: 4
   max_char_run: 5
+  fatal_repeat_threshold: 0.25
+  fatal_char_repeat_threshold: 0.5
+  fatal_balance_threshold: 0.15
+  fatal_diversity_min_tokens: 12
+  fatal_diversity_threshold: 0.2
   normalize_weights: true
   train_weight_min: 0.5
   train_weight_max: 1.5
   rules:
-    - name: nonempty
-      enabled: true
-      weight: 1.0
-    - name: format
+    - name: style_structure
       enabled: true
       weight: 0.4
-    - name: length
+    - name: math_format
       enabled: true
       weight: 0.3
-    - name: no_repeat
-      enabled: true
-      weight: 0.3
-    - name: reference_overlap
-      enabled: true
-      weight: 0.5
-    - name: has_reasoning_markers
-      enabled: true
-      weight: 0.4
-    - name: has_math_expression
-      enabled: true
-      weight: 0.4
-    - name: has_final_cue
-      enabled: true
-      weight: 0.3
-    - name: no_mojibake
-      enabled: true
-      weight: 0.8
-    - name: no_char_repeat
+    - name: final_answer_style
       enabled: true
       weight: 0.2
-    - name: balanced_symbols
+    - name: length
       enabled: true
-      weight: 0.3
-    - name: readability
-      enabled: false
-      weight: 0.25
-    - name: low_symbol_noise
-      enabled: false
-      weight: 0.3
+      weight: 0.1
 
 best_of_k:
   split: test
   num_examples: 20
   k: 4
+  generation_mode: segment_infilling
   steps: 128
   answer_token_budget: 256
 

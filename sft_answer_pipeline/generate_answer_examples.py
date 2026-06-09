@@ -7,6 +7,8 @@ import torch
 import yaml
 from transformers import GPT2TokenizerFast
 
+from sft_rl_pipeline.rl_utils import sample_segment_infilling
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
@@ -170,18 +172,18 @@ def main():
             "generations": {},
         }
         for model_name, (model, graph, noise, _) in loaded.items():
-            sample = sample_answer(
+            sample = sample_segment_infilling(
                 model,
                 graph,
                 noise,
                 tokenizer,
-                item["prompt"],
+                row,
                 int(config["generation"].get("max_length", 512)),
-                int(config["generation"].get("answer_token_budget", 256)),
+                int(config["model"].get("min_target_tokens", 32)),
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-            item["generations"][model_name] = sample["generated_answer"]
+            item["generations"][model_name] = sample["generated_target"]
         records.append(item)
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))

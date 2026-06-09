@@ -14,35 +14,17 @@ MOJIBAKE_PATTERNS = (
 )
 
 DEFAULT_ENABLED_REWARDS = (
-    "nonempty",
-    "format",
+    "style_structure",
+    "math_format",
+    "final_answer_style",
     "length",
-    "no_repeat",
-    "reference_overlap",
-    "has_reasoning_markers",
-    "has_math_expression",
-    "has_final_cue",
-    "no_mojibake",
-    "no_char_repeat",
-    "balanced_symbols",
-    "readability",
-    "low_symbol_noise",
 )
 
 DEFAULT_REWARD_WEIGHTS = {
-    "nonempty": 1.0,
-    "format": 0.4,
-    "length": 0.3,
-    "no_repeat": 0.3,
-    "reference_overlap": 0.5,
-    "has_reasoning_markers": 0.4,
-    "has_math_expression": 0.4,
-    "has_final_cue": 0.3,
-    "no_mojibake": 0.8,
-    "no_char_repeat": 0.2,
-    "balanced_symbols": 0.3,
-    "readability": 0.25,
-    "low_symbol_noise": 0.3,
+    "style_structure": 0.4,
+    "math_format": 0.3,
+    "final_answer_style": 0.2,
+    "length": 0.1,
 }
 
 
@@ -72,37 +54,44 @@ def reference_overlap(answer, reference):
     return len(a & r) / max(1, len(r))
 
 
-def reasoning_marker_score(text):
+def style_structure_score(text):
     markers = (
+        "let",
+        "first",
+        "next",
         "because",
         "therefore",
         "thus",
-        "so",
         "since",
         "we have",
         "we get",
         "then",
         "hence",
+        "wait",
+        "check",
         "substitute",
         "simplify",
         "solve",
     )
     lowered = normalize(text)
     hits = sum(1 for marker in markers if marker in lowered)
-    return min(1.0, hits / 2)
+    paragraph_bonus = 1.0 if "\n\n" in str(text or "") else 0.0
+    return min(1.0, 0.8 * min(1.0, hits / 3) + 0.2 * paragraph_bonus)
 
 
-def math_expression_score(text):
+def math_format_score(text):
     if not text:
         return 0.0
     has_equation = 1.0 if re.search(r"[A-Za-z0-9]\s*[=<>]\s*[A-Za-z0-9\\$-]", text) else 0.0
-    has_latex = 1.0 if re.search(r"\\[a-zA-Z]+|\$[^$]+\$", text) else 0.0
+    has_latex = 1.0 if re.search(r"\\[a-zA-Z]+|\\\(|\\\)|\$[^$]+\$", text) else 0.0
     has_number = 1.0 if re.search(r"\d", text) else 0.0
     return min(1.0, 0.5 * has_equation + 0.3 * has_latex + 0.2 * has_number)
 
 
-def final_cue_score(text):
+def final_answer_style_score(text):
     cues = (
+        "final answer",
+        "boxed",
         "answer",
         "final",
         "therefore",
@@ -178,6 +167,29 @@ def symbol_noise_score(text):
     return max(0.0, 1.0 - penalty / max(1.0, len(text) / 25))
 
 
+def fatal_error_multiplier(text, config):
+    text = str(text or "")
+    if not text.strip():
+        return 0.0
+    if "\ufffd" in text:
+        return 0.0
+    control_hits = sum(1 for char in text if ord(char) < 32 and char not in "\n\t\r")
+    if control_hits:
+        return 0.0
+    if ngram_repeat_score(text, n=int(config.get("repeat_ngram", 4))) < float(config.get("fatal_repeat_threshold", 0.25)):
+        return 0.0
+    if repeated_char_score(text, max_run=int(config.get("max_char_run", 5))) < float(config.get("fatal_char_repeat_threshold", 0.5)):
+        return 0.0
+    toks = re.findall(r"\S+", normalize(text))
+    if len(toks) >= int(config.get("fatal_diversity_min_tokens", 12)):
+        diversity = len(set(toks)) / max(1, len(toks))
+        if diversity < float(config.get("fatal_diversity_threshold", 0.2)):
+            return 0.0
+    if balanced_symbol_score(text) < float(config.get("fatal_balance_threshold", 0.15)):
+        return 0.2
+    return 1.0
+
+
 def reward_weights(config):
     rules = config.get("rules")
     if rules is not None:
@@ -218,14 +230,12 @@ def score_answer(answer, reference="", config=None):
         length_score = max(0.0, 1.0 - abs(length - min(max(length, length_min), length_max)) / max(length_max, 1))
 
     components = {
-        "nonempty": 1.0 if text else 0.0,
-        "format": 1.0 if re.search(r"[a-zA-Z0-9\\$]", text) else 0.0,
+        "style_structure": style_structure_score(text),
+        "math_format": math_format_score(text),
+        "final_answer_style": final_answer_style_score(text),
         "length": length_score,
-        "no_repeat": ngram_repeat_score(text, n=repeat_ngram),
         "reference_overlap": reference_overlap(text, reference),
-        "has_reasoning_markers": reasoning_marker_score(text),
-        "has_math_expression": math_expression_score(text),
-        "has_final_cue": final_cue_score(text),
+        "no_repeat": ngram_repeat_score(text, n=repeat_ngram),
         "no_char_repeat": repeated_char_score(text, max_run=int(cfg.get("max_char_run", 5))),
         "no_mojibake": mojibake_score(text),
         "balanced_symbols": balanced_symbol_score(text),
@@ -233,9 +243,13 @@ def score_answer(answer, reference="", config=None):
         "low_symbol_noise": symbol_noise_score(text),
     }
 
-    score = sum(float(weights.get(name, 0.0)) * value for name, value in components.items())
+    base_score = sum(float(weights.get(name, 0.0)) * value for name, value in components.items())
+    fatal_multiplier = fatal_error_multiplier(text, cfg)
+    score = base_score * fatal_multiplier
     return {
         "score": score,
+        "base_score": base_score,
+        "fatal_multiplier": fatal_multiplier,
         "active_weight_sum": sum(weights.values()),
         **components,
         "chars": length,

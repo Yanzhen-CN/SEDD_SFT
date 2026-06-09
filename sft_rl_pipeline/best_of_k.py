@@ -6,7 +6,7 @@ import torch
 from transformers import GPT2TokenizerFast
 
 from reward import score_answer
-from rl_utils import DEFAULT_CONFIG, load_config, load_policy, prompt_until_assistant, read_jsonl, sample_answer, segment_text, set_seed
+from rl_utils import DEFAULT_CONFIG, load_config, load_policy, prompt_until_assistant, read_jsonl, sample_answer, sample_segment_infilling, segment_text, set_seed
 
 
 def main():
@@ -32,17 +32,31 @@ def main():
         reference = segment_text(sample, train=True)
         candidates = []
         for k in range(int(bok.get("k", 4))):
-            answer = sample_answer(
-                model,
-                graph,
-                noise,
-                tokenizer,
-                prompt,
-                int(config["model"].get("max_length", 512)),
-                int(bok.get("answer_token_budget", 256)),
-                int(bok.get("steps", 128)),
-                device,
-            )
+            if bok.get("generation_mode", "segment_infilling") == "segment_infilling":
+                generated = sample_segment_infilling(
+                    model,
+                    graph,
+                    noise,
+                    tokenizer,
+                    sample,
+                    int(config["model"].get("max_length", 512)),
+                    int(config["model"].get("min_target_tokens", 32)),
+                    int(bok.get("steps", 128)),
+                    device,
+                )
+                answer = generated["generated_target"]
+            else:
+                answer = sample_answer(
+                    model,
+                    graph,
+                    noise,
+                    tokenizer,
+                    prompt,
+                    int(config["model"].get("max_length", 512)),
+                    int(bok.get("answer_token_budget", 256)),
+                    int(bok.get("steps", 128)),
+                    device,
+                )
             reward = score_answer(answer, reference, config.get("reward", {}))
             candidates.append({"k": k, "answer": answer, "reward": reward})
         best = max(candidates, key=lambda row: row["reward"]["score"])
