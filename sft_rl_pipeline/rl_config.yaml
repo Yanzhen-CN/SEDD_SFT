@@ -1,15 +1,22 @@
 data:
+  # Must be refreshed after every regenerated QAR dataset:
+  #   python sft_rl_pipeline/copy_rl_data.py --source-data sft_answer_pipeline/data/QAR --target-data sft_rl_pipeline/data/QAR
   data_dir: sft_rl_pipeline/data/QAR
 
 model:
   pretrained: louaaron/sedd-medium
+  # Replace this after every new QAR SFT run:
+  #   cp sft_answer_pipeline/modelparameter/QAR/best.pth sft_rl_pipeline/modelparameter/startpoint/QAR-best.pth
   init_checkpoint: sft_rl_pipeline/modelparameter/startpoint/QAR-best.pth
   max_length: 512
   min_target_tokens: 32
+  drop_overlength: true
+  write_load_reports: true
 
 reward:
   # Rule reward for fast exploration. Higher is better.
-  # Only enabled rules are used. Weights are normalized automatically by default.
+  # Used in train_reward_weighted.py as a reference-target sample weight; this
+  # is reward-weighted SFT, not online policy-gradient RL.
   length_min: 64
   length_max: 60000
   repeat_ngram: 4
@@ -45,7 +52,6 @@ best_of_k:
   answer_token_budget: 256
 
 training:
-  # Reward-weighted DWDSE continuation from best-QAR.
   steps: 300
   batch_size: 1
   accum: 8

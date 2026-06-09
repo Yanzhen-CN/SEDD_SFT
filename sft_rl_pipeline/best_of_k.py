@@ -6,7 +6,17 @@ import torch
 from transformers import GPT2TokenizerFast
 
 from reward import score_answer
-from rl_utils import DEFAULT_CONFIG, load_config, load_policy, prompt_until_assistant, read_jsonl, sample_answer, sample_segment_infilling, segment_text, set_seed
+from rl_utils import (
+    DEFAULT_CONFIG,
+    load_config,
+    load_filtered_samples,
+    load_policy,
+    prompt_until_assistant,
+    sample_answer,
+    sample_segment_infilling,
+    segment_text,
+    set_seed,
+)
 
 
 def main():
@@ -15,18 +25,19 @@ def main():
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--tag", default=None)
     args = parser.parse_args()
+
     config = load_config(args.config)
     set_seed(int(config["training"].get("seed", 42)))
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+
     model, graph, noise, _, checkpoint = load_policy(config, device, checkpoint_path=args.checkpoint)
-
     bok = config["best_of_k"]
-    data_path = Path(config["data"]["data_dir"]) / f"{bok.get('split', 'test')}.jsonl"
-    samples = read_jsonl(data_path, limit=int(bok.get("num_examples", 20)))
-    rows = []
+    split = bok.get("split", "test")
+    samples = load_filtered_samples(config, split, tokenizer, limit=int(bok.get("num_examples", 20)))
 
+    rows = []
     for idx, sample in enumerate(samples):
         prompt = prompt_until_assistant(sample)
         reference = segment_text(sample, train=True)
@@ -61,11 +72,13 @@ def main():
                 display_answer = answer
             reward = score_answer(answer, reference, config.get("reward", {}))
             candidates.append({"k": k, "answer": answer, "display_answer": display_answer, "reward": reward})
+
         best = max(candidates, key=lambda row: row["reward"]["score"])
         first = candidates[0]
         record = {
             "id": sample.get("id", str(idx)),
             "checkpoint": checkpoint,
+            "format_note": "QAR target is Assistant completion: Reasoning + Answer.",
             "prompt": prompt,
             "reference": reference,
             "first_reward": first["reward"]["score"],
@@ -78,12 +91,13 @@ def main():
         rows.append(record)
         print(f"{record['id']}: first={record['first_reward']:.3f}, best={record['best_reward']:.3f}, gain={record['reward_gain']:.3f}")
 
-    out_dir = Path(config["results"].get("report_dir", "SFT_RL/reports"))
+    out_dir = Path(config["results"].get("report_dir", "sft_rl_pipeline/reports"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    run_name = args.tag or Path(config["results"].get("output_dir", "SFT_RL/modelparameter/RL-QAR")).name
+    run_name = args.tag or Path(config["results"].get("output_dir", "sft_rl_pipeline/modelparameter/RL-QAR")).name
     json_path = out_dir / f"best_of_k_{run_name}.json"
     json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    md = ["# SFT-RL Best-of-K QAR", ""]
+
+    md = ["# SFT-RL Best-of-K QAR", "", "QAR target is the assistant completion: `Reasoning: ... Answer: ...`.", ""]
     if rows:
         avg_gain = sum(row["reward_gain"] for row in rows) / len(rows)
         md.append(f"Average reward gain over first sample: `{avg_gain:.4f}`")
@@ -98,6 +112,10 @@ def main():
             "### Prompt",
             "```text",
             row["prompt"],
+            "```",
+            "### Reference target",
+            "```text",
+            row["reference"],
             "```",
             "### First",
             "```text",

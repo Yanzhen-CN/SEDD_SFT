@@ -5,7 +5,6 @@ from pathlib import Path
 
 from rl_utils import DEFAULT_CONFIG
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 

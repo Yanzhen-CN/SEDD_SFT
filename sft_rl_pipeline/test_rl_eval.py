@@ -8,7 +8,6 @@ from transformers import GPT2TokenizerFast
 
 from rl_utils import load_config, load_policy
 
-
 DEFAULT_ITEMS = [
     ("pretrained", "sft_rl_pipeline/rl_config_pretrained.yaml", "sft_rl_pipeline/modelparameter/startpoint/pretrained.pth"),
     ("QAR_best", "sft_rl_pipeline/rl_config.yaml", "sft_rl_pipeline/modelparameter/startpoint/QAR-best.pth"),
@@ -47,6 +46,8 @@ def evaluate_item(name, config_path, checkpoint_path, eval_batches):
         1,
         False,
         int(config["training"].get("num_workers", 0)),
+        drop_overlength=bool(config["model"].get("drop_overlength", True)),
+        write_report=bool(config["model"].get("write_load_reports", True)),
     )
     model, graph, noise, ema, loaded_checkpoint = load_policy(config, device, checkpoint_path=checkpoint_path)
     test_loss, batches = evaluate_answer_loss(model, ema, noise, graph, loader, device, eval_batches)
@@ -62,7 +63,7 @@ def evaluate_item(name, config_path, checkpoint_path, eval_batches):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate RL experiment checkpoints on the QAR test set.")
+    parser = argparse.ArgumentParser(description="Evaluate RL experiment checkpoints on the regenerated QAR test set.")
     parser.add_argument("--eval-batches", type=int, default=0)
     parser.add_argument("--output-dir", default="sft_rl_pipeline/test_results")
     args = parser.parse_args()

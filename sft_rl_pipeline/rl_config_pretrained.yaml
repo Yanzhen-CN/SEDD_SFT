@@ -6,6 +6,8 @@ model:
   init_checkpoint: sft_rl_pipeline/modelparameter/startpoint/pretrained.pth
   max_length: 512
   min_target_tokens: 32
+  drop_overlength: true
+  write_load_reports: true
 
 reward:
   length_min: 64
@@ -43,7 +45,6 @@ best_of_k:
   answer_token_budget: 256
 
 training:
-  # Reward-weighted DWDSE continuation directly from pretrained SEDD.
   steps: 300
   batch_size: 1
   accum: 8

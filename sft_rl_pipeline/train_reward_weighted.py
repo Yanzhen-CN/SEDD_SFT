@@ -50,7 +50,6 @@ def update_global_best(out_root, run_dir, checkpoint_path, best_info):
     old_loss = float(old.get("validation_loss", math.inf))
     if float(best_info["validation_loss"]) >= old_loss:
         return False
-
     best_info = dict(best_info)
     best_info["run_dir"] = str(run_dir)
     best_info["checkpoint_path"] = str(out_root / "best_RL_QAR.pth")
@@ -63,22 +62,23 @@ def update_global_best(out_root, run_dir, checkpoint_path, best_info):
 def reward_weights(batch, reward_cfg, device):
     vals = []
     for target in batch["targets"]:
+        # This is reward-weighted SFT, not online RL: the reward is computed on
+        # the reference assistant completion, then used as a stable sample weight.
         vals.append(score_answer(target, target, reward_cfg)["score"])
     rewards = torch.tensor(vals, dtype=torch.float32, device=device)
     min_weight = float(reward_cfg.get("train_weight_min", 0.5))
     max_weight = float(reward_cfg.get("train_weight_max", 1.5))
-    # Use absolute reward as a stable sample weight. Per-batch normalization would
-    # collapse to 1.0 when batch_size=1, which is our default memory-safe setting.
     weights = min_weight + rewards.clamp(0.0, 1.0) * (max_weight - min_weight)
     return rewards, weights
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Reward-weighted masked DWDSE continuation from best-QAR.")
+    parser = argparse.ArgumentParser(description="Reward-weighted masked DWDSE continuation from QAR/pretrained.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--run-name", default="")
     args = parser.parse_args()
     config = load_config(args.config)
+
     from answer_dataset import make_answer_loader
     from answer_losses import evaluate_answer_loss, get_answer_loss_fn
 
@@ -101,6 +101,9 @@ def main():
     data_dir = Path(config["data"]["data_dir"])
     max_length = int(config["model"].get("max_length", 512))
     min_target_tokens = int(config["model"].get("min_target_tokens", 32))
+    drop_overlength = bool(config["model"].get("drop_overlength", True))
+    write_reports = bool(config["model"].get("write_load_reports", True))
+
     train_loader = make_answer_loader(
         data_dir / "train.jsonl",
         tokenizer,
@@ -109,6 +112,8 @@ def main():
         int(config["training"].get("batch_size", 1)),
         True,
         int(config["training"].get("num_workers", 0)),
+        drop_overlength=drop_overlength,
+        write_report=write_reports,
     )
     valid_loader = make_answer_loader(
         data_dir / "validation.jsonl",
@@ -118,6 +123,8 @@ def main():
         1,
         False,
         int(config["training"].get("num_workers", 0)),
+        drop_overlength=drop_overlength,
+        write_report=write_reports,
     )
 
     model, graph, noise, ema, checkpoint = load_policy(config, device)
@@ -130,14 +137,18 @@ def main():
     scaler = GradScaler(enabled=(device.type == "cuda"))
     loss_fn = get_answer_loss_fn(noise, graph, train=True)
 
-    dump_json(run_dir / "run_info.json", {
-        "init_checkpoint": checkpoint,
-        "objective": "reward-weighted masked DWDSE",
-        "data_dir": str(data_dir),
-        "config": args.config,
-        "device": str(device),
-        "run_name": args.run_name,
-    })
+    dump_json(
+        run_dir / "run_info.json",
+        {
+            "init_checkpoint": checkpoint,
+            "objective": "reward-weighted masked DWDSE; reference reward used as sample weight, not online RL",
+            "target_format": "Assistant completion = Reasoning + Answer",
+            "data_dir": str(data_dir),
+            "config": args.config,
+            "device": str(device),
+            "run_name": args.run_name,
+        },
+    )
 
     steps = int(config["training"].get("steps", 300))
     accum = int(config["training"].get("accum", 8))
@@ -166,13 +177,13 @@ def main():
         lr = current_lr(base_lr, step, warmup)
         for group in optimizer.param_groups:
             group["lr"] = lr
-
         for _ in range(accum):
             try:
                 batch = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
                 batch = next(train_iter)
+
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             train_mask = batch["train_mask"].to(device, non_blocking=True)
             rewards, weights = reward_weights(batch, config.get("reward", {}), device)
