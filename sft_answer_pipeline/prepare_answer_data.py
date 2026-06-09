@@ -9,8 +9,19 @@ import yaml
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
 
-QA_SEGMENT_ORDER = ["user_label", "user", "assistant_label", "assistant"]
-QAR_SEGMENT_ORDER = ["user_label", "user", "assistant_label", "assistant"]
+# Textual layout follows S1K-style completion and SEDD plain-text LM blocks:
+#   User: <question>\nAssistant:\nReasoning:\n<reasoning>\n\nAnswer:\n<answer>
+# For target-only SFT, only the assistant completion after "Assistant:" is train=True.
+QA_SEGMENT_ORDER = ["user_label", "user", "assistant_label", "answer_label", "answer"]
+QAR_SEGMENT_ORDER = [
+    "user_label",
+    "user",
+    "assistant_label",
+    "reasoning_label",
+    "reasoning",
+    "answer_label",
+    "answer",
+]
 
 
 def clean(text):
@@ -47,18 +58,22 @@ def choose_reasoning(row, priority):
 def choose_answer(row, source, data_cfg):
     """Choose answer text.
 
-    answer_source='solution' uses the ground-truth solution.
+    answer_source='solution' uses the dataset solution field, which is the
+    answer target intended for evaluation.
+
     answer_source='matched_attempt' uses deepseek_attempt/gemini_attempt when
-    available, which is more source-consistent with the chosen reasoning trace
-    but may be less ground-truth aligned.
+    available. This keeps reasoning and answer from the same teacher model, but
+    the attempt may contain extra explanatory text and may not be as clean as
+    the dataset solution.
     """
     answer_source = data_cfg.get("answer_source", "solution")
-    fallback = clean(row.get(data_cfg.get("answer_field", "solution")))
+    fallback_field = data_cfg.get("answer_field", "solution")
+    fallback = clean(row.get(fallback_field))
     if answer_source == "matched_attempt" and source:
         attempt = clean(row.get(f"{source}_attempt"))
         if attempt:
             return attempt, f"{source}_attempt"
-    return fallback, data_cfg.get("answer_field", "solution")
+    return fallback, fallback_field
 
 
 def split_indices(n_rows, valid_ratio, test_ratio, seed):
@@ -76,11 +91,14 @@ def segment(text, train):
 
 
 def make_qa_sample(row_id, question, answer, meta=None):
+    # QA is a short baseline.  The assistant completion is still labeled as an
+    # assistant answer rather than stored in a misleading "assistant=answer" field.
     segments = {
         "user_label": segment("User: ", False),
         "user": segment(clean(question), False),
         "assistant_label": segment("\nAssistant:\n", False),
-        "assistant": segment(clean(answer), True),
+        "answer_label": segment("Answer:\n", True),
+        "answer": segment(clean(answer), True),
     }
     return {
         "id": row_id,
@@ -94,14 +112,17 @@ def make_qa_sample(row_id, question, answer, meta=None):
 
 
 def make_qar_sample(row_id, question, answer, reasoning, meta=None):
-    # Completion-only SFT target: reasoning first, then final answer.
-    # The final-answer marker is part of the train target, not a fixed prompt.
-    target = clean(reasoning) + "\n\nFinal Answer:\n" + clean(answer)
+    # Correct QAR target: the *assistant completion* contains both reasoning and
+    # answer.  "Assistant:" itself is fixed conditioning; "Reasoning:" and
+    # "Answer:" are generated target tokens so the model learns the output format.
     segments = {
         "user_label": segment("User: ", False),
         "user": segment(clean(question), False),
         "assistant_label": segment("\nAssistant:\n", False),
-        "assistant": segment(target, True),
+        "reasoning_label": segment("Reasoning:\n", True),
+        "reasoning": segment(clean(reasoning), True),
+        "answer_label": segment("\n\nAnswer:\n", True),
+        "answer": segment(clean(answer), True),
     }
     return {
         "id": row_id,
@@ -191,7 +212,7 @@ def build(config):
 
     qa_samples = []
     qar_samples = []
-    source_counts = {"deepseek": 0, "gemini": 0}
+    source_counts = {}
     answer_field_counts = {}
     skipped = 0
     skipped_reasons = {"missing_question": 0, "missing_reasoning": 0, "missing_answer": 0}
@@ -233,20 +254,15 @@ def build(config):
     )
     output_dir = data_cfg.get("output_dir", str(SCRIPT_DIR / "data"))
     manifest = {
+        "format": "User + Assistant completion. QAR target is 'Reasoning: ... Answer: ...'.",
         "source_dataset": data_cfg.get("source_dataset", "simplescaling/s1K-1.1"),
         "raw_rows": len(raw),
         "usable_rows_before_token_filter": len(qa_samples),
         "skipped_rows_before_token_filter": skipped,
         "skipped_reasons_before_token_filter": skipped_reasons,
-        "token_filter_note": "Token-length filtering is performed by AnswerSegmentDataset at load time. Over-length samples are dropped, not truncated.",
-        "qa_segment_order": QA_SEGMENT_ORDER,
-        "qar_segment_order": QAR_SEGMENT_ORDER,
-        "qar_target_format": "Assistant target = reasoning + '\\n\\nFinal Answer:\\n' + answer",
-        "split_note": "QA and QAR use the same row order and split.",
-        "train_note": "segments.*.train=true tokens are noised and used for score entropy loss; train=false tokens are fixed conditioning context.",
         "reasoning_source_counts": source_counts,
+        "answer_source": data_cfg.get("answer_source", "solution"),
         "answer_field_counts": answer_field_counts,
-        "answer_source_config": data_cfg.get("answer_source", "solution"),
         "datasets": [
             save_dataset("QA", qa_samples, valid_indices, test_indices, output_dir),
             save_dataset("QAR", qar_samples, valid_indices, test_indices, output_dir),
@@ -259,7 +275,7 @@ def build(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare answer SFT JSONL datasets.")
+    parser = argparse.ArgumentParser(description="Prepare QA/QAR target-only SEDD SFT data.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     build(load_config(args.config))
