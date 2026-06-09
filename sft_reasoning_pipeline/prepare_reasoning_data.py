@@ -1,7 +1,7 @@
 """
 Pipeline adapter for anchored QRA data.
 
-This file reads root-level base rows from prepare_s1k_base.py and only changes
+This file reads root-level split/S1K_light rows from prepare_s1k_split.py and only changes
 segment masks:
   QRA: fixed question + fixed teacher reasoning -> train answer only
 """
@@ -18,10 +18,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 
-from prepare_s1k_base import clean, summary, token_count, write_json, write_jsonl  # noqa: E402
+from prepare_s1k_split import clean, summary, token_count, write_json, write_jsonl  # noqa: E402
 
 DEFAULT_CONFIG = SCRIPT_DIR / "reasoning_config.yaml"
-DEFAULT_BASE_DIR = REPO_DIR / "data" / "s1k_base"
+DEFAULT_BASE_DIR = REPO_DIR / "data" / "S1K_light"
 
 QRA_SEGMENT_ORDER = [
     "user_label",
@@ -188,24 +188,30 @@ def filter_by_tokens(split_name, samples, tokenizer, max_length, min_target_toke
         "kept_total_tokens": summary(kept_total),
         "kept_train_tokens": summary(kept_train),
         "skipped_examples": skipped,
-        "note": "Reasoning is fixed condition in QRA. Cropping was done once in root prepare_s1k_base.py.",
+        "note": "Reasoning is fixed condition in QRA. Cropping was done once in root prepare_s1k_split.py.",
     }
     write_json(Path(output_dir) / "QRA" / f"{split_name}_prepare_filter_report.json", report)
     return kept, report
 
 
-def load_base_splits(base_dir):
-    base_dir = Path(base_dir)
-    if not (base_dir / "manifest.json").exists():
+def load_base_splits(light_dir):
+    light_dir = Path(light_dir)
+    if not (light_dir / "manifest.json").exists():
         raise FileNotFoundError(
-            f"Missing base data at {base_dir}. Run: python prepare_s1k_base.py --config sft_answer_pipeline/answer_config.yaml"
+            f"Missing S1K_light data at {light_dir}. Run: python prepare_s1k_split.py --config sft_answer_pipeline/answer_config.yaml"
         )
-    return {split: read_jsonl(base_dir / f"{split}.jsonl") for split in ("train", "validation", "test")}, json.loads((base_dir / "manifest.json").read_text(encoding="utf-8"))
+    return {split: read_jsonl(light_dir / f"{split}.jsonl") for split in ("train", "validation", "test")}, json.loads((light_dir / "manifest.json").read_text(encoding="utf-8"))
 
 
 def build(config):
     data_cfg = config.get("data", {})
-    base_dir = data_cfg.get("base_dir") or data_cfg.get("base_output_dir") or str(DEFAULT_BASE_DIR)
+    light_dir = (
+        data_cfg.get("light_dir")
+        or data_cfg.get("light_output_dir")
+        or data_cfg.get("base_dir")
+        or data_cfg.get("base_output_dir")
+        or str(DEFAULT_BASE_DIR)
+    )
     output_dir = data_cfg.get("output_dir", str(SCRIPT_DIR / "data"))
     max_length = int(config.get("model", {}).get("max_length", 1024))
     min_target_tokens = min_target_for("QRA", config)
@@ -213,7 +219,7 @@ def build(config):
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.model_max_length = int(1e9)
 
-    base_splits, base_manifest = load_base_splits(base_dir)
+    base_splits, base_manifest = load_base_splits(light_dir)
     qra_by_split = {split: [make_qra_sample(row) for row in rows] for split, rows in base_splits.items()}
 
     splits, reports = {}, {}
@@ -251,10 +257,10 @@ def build(config):
     }
 
     manifest = {
-        "format": "Pipeline adapter from base content rows to anchored QRA segment mask.",
-        "base_dir": str(base_dir),
+        "format": "Pipeline adapter from S1K_light content rows to anchored QRA segment mask.",
+        "light_dir": str(light_dir),
         "base_manifest_summary": {
-            "base_rows": base_manifest.get("base_rows"),
+            "light_rows": base_manifest.get("light_rows") or base_manifest.get("base_rows"),
             "crop_method_counts": base_manifest.get("crop_method_counts"),
             "reasoning_source_counts": base_manifest.get("reasoning_source_counts"),
             "reasoning_field_counts": base_manifest.get("reasoning_field_counts"),
@@ -268,7 +274,7 @@ def build(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare anchored QRA data from root-level S1K base rows.")
+    parser = argparse.ArgumentParser(description="Prepare anchored QRA data from root-level S1K S1K_light rows.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     build(load_config(args.config))
