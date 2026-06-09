@@ -2,31 +2,44 @@ data:
   build: true
   source_dataset: simplescaling/s1K-1.1
   arrow_path: null
-  split_dir: data/s1k_split
+  raw_output_dir: data/S1K
+  light_output_dir: data/S1K_light
   output_dir: sft_reasoning_pipeline/data
   valid_ratio: 0.10
   test_ratio: 0.10
   seed: 42
   reasoning_source_priority: ["deepseek", "gemini"]
-  answer_source: solution
+  reasoning_text_source: thinking
   answer_field: solution
+  max_answer_chars: 320
+  max_answer_tokens: 64
+  reasoning_crop:
+    enabled: true
+    safety_margin_tokens: 8
+    keep_first_sentences: 2
+    keep_last_sentences: 2
+    keep_anchor_sentences: 5
+    max_stride_sentences: 6
 
 run:
-  selected: RA
+  selected: QRA
   execute: true
+  evaluate_after_train: true
+  generate_after_train: true
+  visual_after_train: true
 
 runs:
-  RA:
-    dataset: RA
+  QRA:
+    dataset: QRA
     cuda_visible_devices: null
 
 model:
   pretrained: louaaron/sedd-medium
   name: medium
-  # Official SEDD small/medium configs use length=1024. Over-length rows are
-  # dropped during prepare_reasoning_data.py and recorded in reports.
   max_length: 1024
-  min_target_tokens: 8
+  min_target_tokens: 1
+  min_target_tokens_by_mode:
+    QRA: 1
   drop_overlength: true
   write_load_reports: true
 

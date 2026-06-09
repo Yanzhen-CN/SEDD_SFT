@@ -14,6 +14,7 @@ REPO_DIR = SCRIPT_DIR.parent
 ANSWER_PIPELINE_DIR = REPO_DIR / "sft_answer_pipeline"
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(ANSWER_PIPELINE_DIR))
+
 DEFAULT_CONFIG = SCRIPT_DIR / "reasoning_config.yaml"
 
 
@@ -43,6 +44,15 @@ def cleanup():
         torch.cuda.empty_cache()
 
 
+def selected_runs(config):
+    selected = config.get("run", {}).get("selected", "QRA")
+    if selected == "all":
+        return list(config.get("runs", {}).keys()) or ["QRA"]
+    if isinstance(selected, list):
+        return selected
+    return [selected]
+
+
 def make_loader(config, dataset_name, split, batch_size):
     from answer_dataset import make_answer_loader
 
@@ -53,7 +63,7 @@ def make_loader(config, dataset_name, split, batch_size):
         data_root / dataset_name / f"{split}.jsonl",
         tokenizer,
         int(config["model"].get("max_length", 512)),
-        int(config["model"].get("min_target_tokens", 8)),
+        int(config["model"].get("min_target_tokens_by_mode", {}).get(dataset_name, config["model"].get("min_target_tokens", 1))),
         batch_size,
         False,
         int(config.get("eval", {}).get("num_workers", 0)),
@@ -111,19 +121,19 @@ def eval_model(config, model_name, model_tuple, datasets, device):
         loss, batches = evaluate_answer_loss(model, ema, noise, graph, loader, device, eval_batches=eval_batches)
         row = {"dataset": dataset_name, "model": model_name, "loss": loss, "batches": batches, "checkpoint": checkpoint}
         rows.append(row)
-        print(row)
+        print(row, flush=True)
     return rows
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate reasoning-conditioned answer SFT checkpoints on the RA test split.")
+    parser = argparse.ArgumentParser(description="Evaluate reasoning-conditioned QRA SFT checkpoints on test split.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    datasets = ["RA"]
-    rows = []
+    datasets = [config.get("runs", {}).get(run, {}).get("dataset", run) for run in selected_runs(config)] or ["QRA"]
 
+    rows = []
     model_tuple = None
     try:
         model_tuple = load_pretrained(config, device)
@@ -133,10 +143,12 @@ def main():
             del model_tuple
         cleanup()
 
-    model_tuple = load_best(config, "RA", device)
-    if model_tuple is not None:
+    for run_name in selected_runs(config):
+        model_tuple = load_best(config, run_name, device)
+        if model_tuple is None:
+            continue
         try:
-            rows.extend(eval_model(config, "RA-best", model_tuple, datasets, device))
+            rows.extend(eval_model(config, f"{run_name}-best", model_tuple, datasets, device))
         finally:
             del model_tuple
             cleanup()
@@ -145,7 +157,7 @@ def main():
     result_dir = output_root / "test_result"
     write_csv(rows, result_dir / "test_results.csv")
     dump_json(rows, result_dir / "test_results.json")
-    print(f"Wrote {result_dir / 'test_results.csv'}")
+    print(f"Wrote {result_dir / 'test_results.csv'}", flush=True)
 
 
 if __name__ == "__main__":

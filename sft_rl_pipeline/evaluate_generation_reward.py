@@ -22,7 +22,6 @@ from rl_utils import (
     load_config,
     load_filtered_samples,
     load_policy,
-    question_text,
     sample_segment_infilling,
     set_seed,
 )
@@ -86,7 +85,6 @@ def main():
         row = {
             "id": sample.get("id", str(idx)),
             "checkpoint": checkpoint,
-            "question": question_text(sample),
             "score": reward["score"],
             "base_score": reward.get("base_score", reward["score"]),
             "fatal_multiplier": reward.get("fatal_multiplier", 1.0),
@@ -113,41 +111,9 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = args.tag or Path(str(checkpoint)).stem.replace(".", "_")
     json_path = out_dir / f"generation_reward_{tag}.json"
-    md_path = out_dir / f"generation_reward_{tag}.md"
     summary_path = out_dir / f"generation_reward_{tag}_summary.json"
     csv_path = out_dir / f"generation_reward_{tag}_summary.csv"
     json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    md = [
-        "# Generation Reward Examples",
-        "",
-        "Generated sections are stitched back into the fixed anchored QAR scaffold before scoring and display.",
-        "",
-        f"Mean reward: `{summary['mean_reward']:.4f}`",
-        "",
-    ]
-    for row in rows:
-        md.extend(
-            [
-                f"## {row['id']}",
-                "",
-                f"reward: `{row['score']:.4f}`",
-                "",
-                "### Question",
-                "```text",
-                row["question"],
-                "```",
-                "### GT",
-                "```text",
-                row["reference_completion"],
-                "```",
-                "### Generated",
-                "```text",
-                row["generated_completion"],
-                "```",
-                "",
-            ]
-        )
-    md_path.write_text("\n".join(md), encoding="utf-8")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         fieldnames = ["checkpoint", "config", "split", "num_examples", "steps", "mean_reward", "mean_base_score", "mean_fatal_multiplier"] + [f"component_{k}" for k in summary["mean_components"]]
@@ -157,7 +123,6 @@ def main():
         flat.update({f"component_{k}": v for k, v in summary["mean_components"].items()})
         writer.writerow(flat)
     print(f"Wrote {json_path}")
-    print(f"Wrote {md_path}")
     print(f"Wrote {summary_path}")
     print(f"Wrote {csv_path}")
 

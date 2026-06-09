@@ -2,23 +2,31 @@ data:
   build: true
   source_dataset: simplescaling/s1K-1.1
   arrow_path: null
-  split_dir: data/s1k_split
+  raw_output_dir: data/S1K
+  light_output_dir: data/S1K_light
   output_dir: sft_answer_pipeline/data
   valid_ratio: 0.10
   test_ratio: 0.10
   seed: 42
   reasoning_source_priority: ["deepseek", "gemini"]
-
-  # solution: pair DeepSeek/Gemini reasoning with the dataset ground-truth solution.
-  # matched_attempt: pair DeepSeek reasoning with deepseek_attempt, Gemini reasoning with gemini_attempt.
-  # Use matched_attempt only when you care more about trace-answer source consistency than ground-truth correctness.
-  answer_source: solution
+  reasoning_text_source: thinking
   answer_field: solution
+  max_answer_chars: 320
+  max_answer_tokens: 64
+  reasoning_crop:
+    enabled: true
+    safety_margin_tokens: 8
+    keep_first_sentences: 2
+    keep_last_sentences: 2
+    keep_anchor_sentences: 5
+    max_stride_sentences: 6
 
 run:
-  # Use "QA", "QAR", or "all".  QAR is the main reasoning-trace SFT experiment.
   selected: QAR
   execute: true
+  evaluate_after_train: true
+  generate_after_train: true
+  visual_after_train: true
 
 runs:
   QA:
@@ -31,13 +39,11 @@ runs:
 model:
   pretrained: louaaron/sedd-medium
   name: medium
-  # This is the exact per-sample sequence length used by SEDD.
-  # Any prepared sample whose tokenized full text is longer than this is dropped
-  # and recorded in *_prepare_filter_report.json.
-  # Official SEDD small/medium configs use length=1024. Keep filtering,
-  # training, evaluation, and generation aligned to that unless memory fails.
   max_length: 1024
-  min_target_tokens: 32
+  min_target_tokens: 1
+  min_target_tokens_by_mode:
+    QA: 1
+    QAR: 32
   drop_overlength: true
   write_load_reports: true
 
@@ -53,7 +59,6 @@ training:
   log_freq: 1
   eval_freq: 25
   eval_batches: 0
-  # 0 disables periodic step checkpoints. Best checkpoints are still saved.
   save_freq: 0
   seed: 42
   num_workers: 0

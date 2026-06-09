@@ -50,17 +50,6 @@ def segment_text(sample, train=None):
     return sample_text(sample, train=train)
 
 
-def segment_value(sample, name, default=""):
-    segment = sample.get("segments", {}).get(name)
-    if not segment:
-        return default
-    return segment.get("text", default)
-
-
-def question_text(sample):
-    return segment_value(sample, "user")
-
-
 def assistant_completion(sample):
     """Text after Assistant:, including fixed anchors and generated contents."""
     parts = []

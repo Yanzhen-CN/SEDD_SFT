@@ -12,12 +12,26 @@ REPO_DIR = SCRIPT_DIR.parent
 ANSWER_PIPELINE_DIR = REPO_DIR / "sft_answer_pipeline"
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(ANSWER_PIPELINE_DIR))
+
 DEFAULT_CONFIG = SCRIPT_DIR / "reasoning_config.yaml"
 
 
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def selected_run(config):
+    selected = config.get("run", {}).get("selected", "QRA")
+    if selected == "all":
+        return (list(config.get("runs", {}).keys()) or ["QRA"])[0]
+    if isinstance(selected, list):
+        return selected[0]
+    return selected
+
+
+def dataset_for_run(config, run_name):
+    return config.get("runs", {}).get(run_name, {}).get("dataset", run_name)
 
 
 def segment_text(sample, train=None):
@@ -32,44 +46,22 @@ def segment_value(sample, name, default=""):
     return segment.get("text", default)
 
 
-def assistant_completion(sample):
-    from answer_dataset import ordered_segments
-
-    parts = []
-    seen_assistant = False
-    for name, segment in ordered_segments(sample):
-        if seen_assistant:
-            parts.append(segment.get("text", ""))
-        if name == "assistant_label":
-            seen_assistant = True
-    return "".join(parts)
-
-
-def completion_from_full_text(text):
-    raw = str(text or "")
-    marker = "Assistant:"
-    idx = raw.find(marker)
-    if idx >= 0:
-        return raw[idx + len(marker):].strip()
-    return raw.strip()
-
-
-def load_filtered_samples(config, tokenizer, limit):
+def load_filtered_samples(config, dataset_name, tokenizer, limit):
     from answer_dataset import AnswerSegmentDataset
 
     data_root = Path(config["data"].get("output_dir", SCRIPT_DIR / "data"))
     dataset = AnswerSegmentDataset(
-        data_root / "RA" / "test.jsonl",
+        data_root / dataset_name / "test.jsonl",
         tokenizer,
         int(config["generation"].get("max_length", config["model"].get("max_length", 512))),
-        min_target_tokens=int(config["model"].get("min_target_tokens", 8)),
+        min_target_tokens=int(config["model"].get("min_target_tokens_by_mode", {}).get(dataset_name, config["model"].get("min_target_tokens", 1))),
         drop_overlength=bool(config["model"].get("drop_overlength", True)),
         write_report=bool(config["model"].get("write_load_reports", True)),
     )
     return dataset.samples[:limit]
 
 
-def load_model_tuple(config, kind, device):
+def load_model_tuple(config, kind, run_name, device):
     import graph_lib
     import noise_lib
     from model import SEDD
@@ -80,16 +72,18 @@ def load_model_tuple(config, kind, device):
     model.config.model.length = int(config["generation"].get("max_length", config["model"].get("max_length", 512)))
     ema = ExponentialMovingAverage(model.parameters(), decay=float(config["training"].get("ema", 0.9999)))
     checkpoint = pretrained
-    if kind == "RA":
-        ckpt = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / "RA" / "best.pth"
+
+    if kind == run_name:
+        ckpt = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / run_name / "best.pth"
         if not ckpt.exists():
             return None
         state = torch.load(ckpt, map_location=device)
         model.load_state_dict(state["model"], strict=True)
         ema.load_state_dict(state["ema"])
         checkpoint = str(ckpt)
-    ema.store(model.parameters())
-    ema.copy_to(model.parameters())
+        ema.store(model.parameters())
+        ema.copy_to(model.parameters())
+
     graph = graph_lib.get_graph(model.config, device)
     noise = noise_lib.get_noise(model.config).to(device)
     model.eval()
@@ -132,39 +126,29 @@ def sample_infilling(model, graph, noise, tokenizer, sample, length, steps, devi
     target_positions = [i for i, is_train in enumerate(train_mask[:real_len]) if is_train]
     with torch.no_grad():
         generated = proj_fun(sampling_fn(model))
-        full_text = tokenizer.batch_decode(generated[:, :real_len])[0].strip()
-        target_ids = generated[0, target_positions]
-    return {
-        "completion": completion_from_full_text(full_text),
-        "target": tokenizer.decode(target_ids).strip(),
-        "full": full_text,
-    }
+    target_ids = generated[0, target_positions]
+    return tokenizer.decode(target_ids).strip()
 
 
-def write_report(path, records):
-    lines = ["# Reasoning-conditioned Answer Generation Examples", ""]
-    lines.append(
-        "`Reasoning:` and teacher reasoning are fixed conditioning tokens in RA; "
-        "the generated answer section is stitched back into the full assistant completion."
-    )
-    lines.append("")
+def write_report(path, records, run_name):
+    lines = [f"# {run_name} Reasoning-conditioned Answer Generation Examples", ""]
     for item in records:
         lines.append(f"## {item['id']}")
         lines.append("")
-        lines.append("### Question")
+        lines.append("### Fixed question + teacher reasoning")
         lines.append("```text")
-        lines.append(item["question"].strip())
+        lines.append(item["prompt"].strip())
         lines.append("```")
         lines.append("")
-        lines.append("### GT")
+        lines.append("### Reference answer")
         lines.append("```text")
-        lines.append(item["reference_completion"].strip())
+        lines.append(item["reference"].strip())
         lines.append("```")
         lines.append("")
-        for model_name, result in item["generations"].items():
+        for model_name, text in item["generations"].items():
             lines.append(f"### {model_name}")
             lines.append("```text")
-            lines.append(result["completion"].strip())
+            lines.append(text.strip())
             lines.append("```")
             lines.append("")
     Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -172,18 +156,21 @@ def write_report(path, records):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate RA examples: fixed reasoning -> answer.")
+    parser = argparse.ArgumentParser(description="Generate QRA examples: fixed teacher reasoning -> answer.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     config = load_config(args.config)
+    run_name = selected_run(config)
+    dataset_name = dataset_for_run(config, run_name)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    rows = load_filtered_samples(config, tokenizer, int(config["generation"].get("num_examples", 5)))
+    rows = load_filtered_samples(config, dataset_name, tokenizer, int(config["generation"].get("num_examples", 5)))
 
     loaded = {}
-    for kind in ["pretrained", "RA"]:
-        model_tuple = load_model_tuple(config, kind if kind != "pretrained" else "pretrained", device)
+    for kind in ["pretrained", run_name]:
+        model_tuple = load_model_tuple(config, kind if kind != "pretrained" else "pretrained", run_name, device)
         if model_tuple is not None:
             loaded[kind] = model_tuple
 
@@ -192,14 +179,18 @@ def main():
         item = {
             "id": row.get("id", str(idx)),
             "question": segment_value(row, "user"),
+            "teacher_reasoning": segment_value(row, "reasoning"),
             "prompt": segment_text(row, train=False),
             "reference": segment_text(row, train=True),
-            "reference_completion": assistant_completion(row),
             "generations": {},
         }
         for model_name, (model, graph, noise, _) in loaded.items():
             item["generations"][model_name] = sample_infilling(
-                model, graph, noise, tokenizer, row,
+                model,
+                graph,
+                noise,
+                tokenizer,
+                row,
                 int(config["generation"].get("max_length", 512)),
                 int(config["generation"].get("steps", 128)),
                 device,
@@ -207,9 +198,9 @@ def main():
         records.append(item)
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))
-    write_report(out_dir / "reasoning_answer_generation_RA.md", records)
-    (out_dir / "reasoning_answer_generation_RA.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Wrote {out_dir / 'reasoning_answer_generation_RA.md'}")
+    write_report(out_dir / f"reasoning_answer_generation_{run_name}.md", records, run_name)
+    (out_dir / f"reasoning_answer_generation_{run_name}.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Wrote {out_dir / f'reasoning_answer_generation_{run_name}.md'}", flush=True)
 
 
 if __name__ == "__main__":

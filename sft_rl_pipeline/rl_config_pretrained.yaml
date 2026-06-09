@@ -3,7 +3,7 @@ data:
 model:
   pretrained: louaaron/sedd-medium
   init_checkpoint: ''
-  max_length: 512
+  max_length: 1024
   min_target_tokens: 32
   drop_overlength: true
   write_load_reports: true
