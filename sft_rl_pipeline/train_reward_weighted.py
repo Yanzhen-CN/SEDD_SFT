@@ -65,9 +65,11 @@ def reward_weights(batch, reward_cfg, device):
     for answer, target in zip(batch["answers"], batch["targets"]):
         vals.append(score_answer(answer, target, reward_cfg)["score"])
     rewards = torch.tensor(vals, dtype=torch.float32, device=device)
-    # Normalize to a gentle positive multiplier.
-    weights = rewards / rewards.mean().clamp_min(1e-6)
-    weights = weights.clamp(0.25, 2.0)
+    min_weight = float(reward_cfg.get("train_weight_min", 0.5))
+    max_weight = float(reward_cfg.get("train_weight_max", 1.5))
+    # Use absolute reward as a stable sample weight. Per-batch normalization would
+    # collapse to 1.0 when batch_size=1, which is our default memory-safe setting.
+    weights = min_weight + rewards.clamp(0.0, 1.0) * (max_weight - min_weight)
     return rewards, weights
 
 
@@ -146,6 +148,7 @@ def main():
     warmup = int(config["training"].get("warmup", 50))
     grad_clip = float(config["training"].get("grad_clip", 1.0))
     best = math.inf
+    best_run_is_global = False
 
     pre_loss, pre_batches = evaluate_answer_loss(model, ema, noise, graph, valid_loader, device, eval_batches)
     append_csv(run_dir / "metrics.csv", {"step": 0, "split": "pretrain_validation", "loss": pre_loss, "reward": "", "weighted_loss": "", "batches": pre_batches, "lr": 0.0})
@@ -217,8 +220,11 @@ def main():
                 torch.save(state, checkpoint_path)
                 dump_json(run_dir / "best_eval.json", best_info)
                 if update_global_best(out_root, run_dir, checkpoint_path, best_info):
+                    best_run_is_global = True
                     log(f"new global best validation_loss={val:.6f} at step={step}")
 
+    if best_run_is_global:
+        shutil.copy2(run_dir / "metrics.csv", out_root / "best_metrics.csv")
     log(f"done: {run_dir}")
 
 

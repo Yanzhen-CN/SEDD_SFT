@@ -36,12 +36,22 @@ def read_json(path, default=None):
 def experiment_from_config(config_path):
     config = load_config(config_path)
     out_root = Path(config["results"]["output_dir"])
+    run_dirs = sorted(path for path in out_root.glob("*") if path.is_dir() and (path / "metrics.csv").exists())
+    if not run_dirs and (out_root / "best_metrics.csv").exists():
+        run_dirs = [out_root]
     return {
         "name": out_root.name,
         "config": str(config_path),
         "out_root": out_root,
-        "run_dirs": sorted(path for path in out_root.glob("*") if path.is_dir() and (path / "metrics.csv").exists()),
+        "run_dirs": run_dirs,
     }
+
+
+def metrics_path(run_dir):
+    run_dir = Path(run_dir)
+    if (run_dir / "metrics.csv").exists():
+        return run_dir / "metrics.csv"
+    return run_dir / "best_metrics.csv"
 
 
 def plot_learning_curves(experiments, figure_dir):
@@ -49,7 +59,7 @@ def plot_learning_curves(experiments, figure_dir):
     plotted = False
     for exp in experiments:
         for run_dir in exp["run_dirs"]:
-            rows = read_metrics(run_dir / "metrics.csv")
+            rows = read_metrics(metrics_path(run_dir))
             train = [row for row in rows if row["split"] == "train"]
             valid = [row for row in rows if row["split"] == "validation"]
             label = f"{exp['name']}/{run_dir.name}"
@@ -77,7 +87,7 @@ def plot_reward_curves(experiments, figure_dir):
     plotted = False
     for exp in experiments:
         for run_dir in exp["run_dirs"]:
-            rows = [row for row in read_metrics(run_dir / "metrics.csv") if row["split"] == "train" and row["reward"] is not None]
+            rows = [row for row in read_metrics(metrics_path(run_dir)) if row["split"] == "train" and row["reward"] is not None]
             if not rows:
                 continue
             plt.plot([row["step"] for row in rows], [row["reward"] for row in rows], marker=".", label=f"{exp['name']}/{run_dir.name}")
@@ -101,7 +111,7 @@ def plot_run_bars(experiments, figure_dir):
     best_losses = []
     for exp in experiments:
         for run_dir in exp["run_dirs"]:
-            rows = read_metrics(run_dir / "metrics.csv")
+            rows = read_metrics(metrics_path(run_dir))
             start = next((row["loss"] for row in rows if row["split"] == "pretrain_validation"), None)
             best = read_json(run_dir / "best_eval.json", {})
             if start is None or not best:

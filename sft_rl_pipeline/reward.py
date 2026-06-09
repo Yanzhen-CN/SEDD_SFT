@@ -19,6 +19,9 @@ DEFAULT_ENABLED_REWARDS = (
     "length",
     "no_repeat",
     "reference_overlap",
+    "has_reasoning_markers",
+    "has_math_expression",
+    "has_final_cue",
     "no_mojibake",
     "no_char_repeat",
     "balanced_symbols",
@@ -32,6 +35,9 @@ DEFAULT_REWARD_WEIGHTS = {
     "length": 0.3,
     "no_repeat": 0.3,
     "reference_overlap": 0.5,
+    "has_reasoning_markers": 0.4,
+    "has_math_expression": 0.4,
+    "has_final_cue": 0.3,
     "no_mojibake": 0.8,
     "no_char_repeat": 0.2,
     "balanced_symbols": 0.3,
@@ -64,6 +70,49 @@ def reference_overlap(answer, reference):
     if not a or not r:
         return 0.0
     return len(a & r) / max(1, len(r))
+
+
+def reasoning_marker_score(text):
+    markers = (
+        "because",
+        "therefore",
+        "thus",
+        "so",
+        "since",
+        "we have",
+        "we get",
+        "then",
+        "hence",
+        "substitute",
+        "simplify",
+        "solve",
+    )
+    lowered = normalize(text)
+    hits = sum(1 for marker in markers if marker in lowered)
+    return min(1.0, hits / 2)
+
+
+def math_expression_score(text):
+    if not text:
+        return 0.0
+    has_equation = 1.0 if re.search(r"[A-Za-z0-9]\s*[=<>]\s*[A-Za-z0-9\\$-]", text) else 0.0
+    has_latex = 1.0 if re.search(r"\\[a-zA-Z]+|\$[^$]+\$", text) else 0.0
+    has_number = 1.0 if re.search(r"\d", text) else 0.0
+    return min(1.0, 0.5 * has_equation + 0.3 * has_latex + 0.2 * has_number)
+
+
+def final_cue_score(text):
+    cues = (
+        "answer",
+        "final",
+        "therefore",
+        "thus",
+        "so the",
+        "we conclude",
+        "the result is",
+    )
+    lowered = normalize(text)
+    return 1.0 if any(cue in lowered for cue in cues) else 0.0
 
 
 def repeated_char_score(text, max_run=5):
@@ -174,6 +223,9 @@ def score_answer(answer, reference="", config=None):
         "length": length_score,
         "no_repeat": ngram_repeat_score(text, n=repeat_ngram),
         "reference_overlap": reference_overlap(text, reference),
+        "has_reasoning_markers": reasoning_marker_score(text),
+        "has_math_expression": math_expression_score(text),
+        "has_final_cue": final_cue_score(text),
         "no_char_repeat": repeated_char_score(text, max_run=int(cfg.get("max_char_run", 5))),
         "no_mojibake": mojibake_score(text),
         "balanced_symbols": balanced_symbol_score(text),
