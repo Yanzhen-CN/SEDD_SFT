@@ -12,8 +12,9 @@ from torch.cuda.amp import autocast
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
-for path in (REPO_DIR, REPO_DIR / "sft_answer_pipeline"):
-    sys.path.insert(0, str(path))
+sys.path.insert(0, str(REPO_DIR))
+sys.path.insert(0, str(REPO_DIR / "sft_answer_pipeline"))
+sys.path.insert(0, str(REPO_DIR / "sft_rl_pipeline"))
 
 from answer_dataset import ordered_segments, sample_text  # noqa: E402
 

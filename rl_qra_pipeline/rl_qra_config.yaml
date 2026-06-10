@@ -1,7 +1,12 @@
 seed: 42
 cpu: false
 
+run:
+  # 默认从 QRA-best 继续做 RRPI。命令行可用 --start QRA / QA / pretrain 覆盖。
+  selected: QRA
+
 model:
+  # 必须和 checkpoint 对应：如果 QRA-best 是 sedd-small 训练的，这里改成 louaaron/sedd-small。
   pretrained: louaaron/sedd-medium
   tokenizer: gpt2
   max_length: 1024
@@ -9,65 +14,40 @@ model:
   drop_overlength: true
   write_load_reports: false
 
-run:
-  selected: QRA          # all | pretrain | QRA | ["pretrain", "QRA"]
-  cuda_device: null      # null uses default CUDA device; set 0/1/... to choose a GPU
-  # Train only. Evaluation / generation / visualization are run manually after results are copied back.
-
-starts:
-  pretrain:
-    init_checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
-    output_name: rl_pretrain
-  QRA:
-    init_checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
-    output_name: rl_QRA
-
 data:
-  data_dir: rl_qra_pipeline/data/QRA
   split: train
   train_limit: 0
 
-output:
-  root_dir: rl_qra_pipeline/modelparameter
+# 每个起点一套 checkpoint / data / output。你的 pth 都叫 best.pth，所以这里按目录区分。
+starts:
+  pretrain:
+    init_checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
+    data_dir: rl_qra_pipeline/data/pretrain
+    output_dir: rl_qra_pipeline/modelparameter/rl_pretrain
+    output_name: rl_pretrain
 
-eval:
-  batch_size: 1
-  eval_batches: 0
-  num_workers: 0
-  datasets: [QRA]
-  output_dir: rl_qra_pipeline/test_result
+  QA:
+    init_checkpoint: rl_qra_pipeline/modelparameter/QA/best.pth
+    data_dir: rl_qra_pipeline/data/QA
+    output_dir: rl_qra_pipeline/modelparameter/rl_QA
+    output_name: rl_QA
 
-generation:
-  dataset: QRA
-  num_examples: 5
-  steps: 128
-  max_length: 1024
-  output_dir: rl_qra_pipeline/reports
-
-visual:
-  output_dir: rl_qra_pipeline/visualization
-  bin_size: 25
-  show_raw: false
-
-compare_models:
-  pretrain_start:
-    checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
-  QRA_start:
-    checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
-  rl_pretrain:
-    checkpoint: rl_qra_pipeline/modelparameter/rl_pretrain/best.pth
-  rl_QRA:
-    checkpoint: rl_qra_pipeline/modelparameter/rl_QRA/best.pth
+  QRA:
+    init_checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
+    data_dir: rl_qra_pipeline/data/QRA
+    output_dir: rl_qra_pipeline/modelparameter/rl_QRA
+    output_name: rl_QRA
 
 training:
-  steps: 200
+  # 200 步不够观察趋势。建议 smoke 先设 20，正式至少 1000-3000。
+  steps: 1200
   batch_size: 1
-  lr: 1.0e-6
+  lr: 2.0e-6
   weight_decay: 0.0
   grad_clip: 1.0
   ema: 0.9999
   log_every: 1
-  save_every: 50
+  save_every: 100
 
 reward:
   answer_weight: 0.80
@@ -75,28 +55,41 @@ reward:
   reasoning_min_tokens: 8
   reasoning_guardrail_max_tokens: 1600
 
-guided:
-  # 主算法：verifier-guided local ratio policy improvement。
-  # 不依赖真实 rollout 采到正确路径，直接读取 SEDD 在 mask/noisy state 下输出的完整 ratio/probability field。
-  states_per_sample: 3
-  reveal_mode: prefix_grid       # prefix_grid | random_prefix | random_subset
-  base_state: reference_answer_masked
-  corrupt_mode: mask             # mask | limit
-  max_targets_per_state: 16
+rrpi:
+  # RRPI = Ratio-Reward Policy Improvement。
+  # 不做完整真实采样；直接读取 SEDD ratio field 诱导出的 local transition policy pi_theta。
+  # 对每个 answer 位置枚举 type-aware candidate actions，计算 candidate answer reward，
+  # 用 q(a)=softmax(R(a)/tau) 构造 reward-improved target policy，再优化 KL(q || pi_theta)。
 
-  # SEDD transition probability construction.
-  transition_kind: analytic
+  states_per_sample: 2
+  max_targets_per_state: 8
+  reveal_mode: prefix_grid       # prefix_grid / random_prefix / random_subset
+  base_state: reference_answer_masked
+  corrupt_mode: mask             # mask / limit
+  transition_kind: analytic      # analytic / denoise
   step_size: 1.0e-5
   t_min: 0.05
   t_max: 0.95
-  # t_values: [0.1, 0.3, 0.5, 0.7, 0.9]
 
-  # Loss: -positive_weight * log p(correct) + negative_weight * penalty(wrong)
-  positive_weight: 1.0
-  negative_weight: 0.30
-  topk_negative: 4
-  wrong_type_negative_weight: 0.80
-  same_type_negative_weight: 0.10
-  structured_negative_weight: 0.25
-  short_text_negative_weight: 0.15
+  # Candidate action set，不再用 full-vocab top-k negative 作为主要训练目标。
+  include_model_topk: 4
+  include_clean_candidates: true
+  include_bad_continuations: false
+  max_candidates: 32
+
+  # Reward -> target policy。
+  reward_temperature: 0.10
+  min_reward_gap: 0.0
+  rrpi_weight: 1.0
+  sft_anchor_weight: 0.05
   eps: 1.0e-8
+
+  # Debug visibility。
+  debug_every: 20
+  debug_records_per_step: 2
+  max_debug_candidates: 10
+  max_debug_rows: 8
+
+# Backward-compatible alias for older scripts. New code reads rrpi first.
+guided:
+  states_per_sample: 2

@@ -1,137 +1,106 @@
-# rl_qra_pipeline: verifier-guided local ratio policy optimization
+# rl_qra_pipeline: RRPI ratio-reward policy improvement
 
-这版 `rl_qra_pipeline` 不再使用 hybrid，也不强依赖大量真实 rollout。核心思想是：SEDD 在每个 noisy / mask state 下会输出完整的 token-level ratio field，因此我们可以直接读取当前模型对所有候选 transition 的概率，然后用 verifier / GT 构造 reward-improved local actions。
+这版 `rl_qra_pipeline` 已经从旧的 **GT-guided token boost** 改成 **RRPI（Ratio-Reward Policy Improvement）**。
 
-## 为什么这样做
+核心变化：
 
-严格 on-policy RL 当然可以：SEDD 的反向扩散链可以看成 stochastic policy trajectory。但是对短答案任务，纯 rollout 样本效率很低。例如 GT 是 `(3,4]`，当前状态是 `(3,4[MASK]`，如果模型当前更偏向 `)`，那必须反复采样很多次才可能采到正确的 `]` 并获得正 reward。
+- 旧版：直接把 GT token 当正样本，full-vocab top-k 当负样本，reward 基本没有真正进入更新目标。
+- 新版：直接读取 SEDD 输出的 ratio field，得到局部 transition policy `pi_theta(a | state, t, position)`；然后枚举 answer-type-aware candidate actions，对每个 candidate answer 打 reward，用 reward softmax 构造目标策略 `q(a)`，最后优化 `KL(q || pi_theta)`。
 
-所以本 pipeline 不说“假设模型采到了正确 token”，而是明确采用：
-
-> verifier-guided local policy improvement。
-
-也就是直接在关键 mask/noisy state 上 forward 当前模型，得到
+也就是说，现在的梯度链路是清楚的：
 
 ```text
-pi_theta(y | x_t, t, position)
+SEDD ratio field -> local policy pi_theta
+candidate action -> candidate answer -> verifier reward R(a)
+reward R(a) -> target policy q(a)=softmax(R(a)/tau)
+KL(q || pi_theta) -> update SEDD parameters
 ```
 
-然后：
+这不是完整 on-policy REINFORCE，也不需要等待真实 sampler 采到正确 token。它利用 SEDD 每一步输出完整 ratio/probability field 的特点，做低方差的局部 reward-guided policy improvement。
 
-```text
-correct / reward-approved token      -> increase logprob
-high-probability wrong token          -> decrease probability
-wrong answer type                     -> strong negative
-same type but wrong content           -> weak negative
-structured component correct/wrong    -> local positive/negative
-```
+## 训练命令
 
-## 与 SEDD ratio 的关系
-
-SEDD 的 DTransformer 输出 `log_score`，代码里转成：
-
-```python
-score = exp(log_score)
-```
-
-这个 score 对应论文里的 concrete score / ratio field：
-
-```text
-s_theta(x_t, t)_{i,y} ≈ p_t(x_t with position i changed to y) / p_t(x_t)
-```
-
-采样器再用 ratio、transition matrix 和 step size 构造 reverse transition probability。训练时我们优化的是 token action 的 logprob，因此梯度会回到 DTransformer 参数，间接调高或调低对应 token 替换方向的 ratio。
-
-## Loss
-
-对一个局部状态 `s=(x_t,t,i)`：
-
-```text
-y+ = verifier / GT 指定的正确 token
-y- = 当前模型高概率但错误的 token
-```
-
-使用：
-
-```text
-L = - w+ log pi_theta(y+ | s)
-    + w- sum_y- penalty(y-) [-log(1 - pi_theta(y- | s))]
-```
-
-含义是：
-
-```text
-提高正确 token 的 transition probability / ratio；
-降低高概率错误 token 的 transition probability / ratio。
-```
-
-## Type-aware reward strategy
-
-### single_letter / single_integer
-
-这类答案不需要复杂 chain reward。核心是类型和 exact match：
-
-```text
-exact match       -> 强正向
-same type wrong   -> 弱负向或接近中性
-wrong type        -> 强负向
-```
-
-例如 GT=`4`：
-
-```text
-Pred token 4  -> 强鼓励
-Pred token 5  -> 同为整数，轻微压低
-Pred token B  -> 类型错误，强烈压低
-```
-
-### signed_decimal / interval
-
-这类答案有结构，因此构造多个局部 mask states。
-
-例如 GT=`(3,4]`：
-
-```text
-[MASK]3,4]      -> 训练 left bracket
-(3,4[MASK]      -> 训练 right bracket
-(3,[MASK]]      -> 训练 right value
-```
-
-正确组件得到正向 logprob 更新，错误组件得到负向抑制。这样可以做到：前面 `3`、`4` 已经对了就鼓励，最后括号错了只惩罚括号相关 transition。
-
-## File structure
-
-```text
-rl_qra_pipeline/
-  answer_specs.py           # answer type parser and potential functions
-  reward_type_aware.py      # final answer / reasoning reward utilities
-  state_builder.py          # encode sample, build SEDD transition probability
-  guided_ratio_update.py    # core guided ratio loss
-  train_rl_qra.py           # training entry
-  run_rl_qra.py             # thin wrapper
-  rl_qra_config.yaml        # config
-```
-
-## Run
+从 repo 根目录运行：
 
 ```bash
-python rl_qra_pipeline/run_rl_qra.py \
+CUDA_VISIBLE_DEVICES=0 python -u run_rl_qra.py \
   --config rl_qra_pipeline/rl_qra_config.yaml \
-  --run-name guided_ratio_v1
+  --run-name rrpi_smoke \
+  --start QRA
 ```
 
-Smoke test：
+正式后台训练：
 
-```yaml
-training:
-  steps: 1
-  batch_size: 1
+```bash
+CUDA_VISIBLE_DEVICES=0 nohup python -u run_rl_qra.py \
+  --config rl_qra_pipeline/rl_qra_config.yaml \
+  --run-name rrpi_qra_v1 \
+  --start QRA \
+  > rl_qra_rrpi.log 2>&1 &
 
-guided:
-  states_per_sample: 1
-  topk_negative: 2
+tail -f rl_qra_rrpi.log
 ```
 
-## How to explain in report
+## 输出结构
 
-这不是无偏的 on-policy REINFORCE，而是更适合 SEDD 的 RL-style local policy improvement。作业要求是探索 RL 如何整合进离散扩散模型；本方法保留 RL 的核心思想——用 reward/verifier 改进 policy，而不是普通 SFT 的统一模仿 loss。同时，它利用了 SEDD 的关键特点：每一步输出完整 ratio field，可以直接对采样和未采样的 candidate transition 做局部策略更新，从而避免纯 rollout 的低样本效率问题。
+以 `--start QRA` 为例：
+
+```text
+rl_qra_pipeline/modelparameter/rl_QRA/<timestamp>_<run-name>/
+  metrics.csv
+  rrpi_debug.jsonl
+  run_info.json
+  best_RL_QRA_rrpi.pth
+  last_RL_QRA_rrpi.pth
+```
+
+同时同步：
+
+```text
+rl_qra_pipeline/modelparameter/rl_QRA/best.pth
+rl_qra_pipeline/modelparameter/rl_QRA/last.pth
+```
+
+## log 指标解释
+
+```text
+target_logp     reference/GT token 当前 log probability，越接近 0 越好
+p_target        reference/GT token 当前 probability
+modelR          在候选集合中，模型当前最偏好的 candidate 的 reward
+bestR           候选集合里最高 reward
+gap             bestR - worstR，表示这个位置是否有明显 reward 差异
+targets         本 step 实际构造了多少个 candidate-policy update site
+```
+
+如果 `modelR` 长期明显低于 `bestR`，说明模型当前 ratio policy 偏向低 reward candidate；RRPI 应该逐步把 `modelR` 拉高。
+
+## debug 可视化
+
+每隔 `rrpi.debug_every` step，日志会展示一个具体 update：
+
+```text
+[RRPI DEBUG step=20]
+GT: (3,4]
+state_answer: (3,4<mask>
+position=...
+target=']' p_target=...
+best_reward=1.000 model_choice_reward=0.780 reward_gap=0.220
+candidate_table: token | reward | q_target | pi_model | answer | source
+ * ']' | R=+1.000 q=0.90 pi=0.13 | '(3,4]' | gt
+   ')' | R=+0.780 q=0.10 pi=0.62 | '(3,4)' | type
+```
+
+这个表就是 reward 如何指导梯度更新的直接证据。
+
+## 设计说明
+
+SEDD 的反向过程由 concrete score / ratio field 构造 reverse transition probability。RRPI 把这个 reverse transition probability 当作局部 policy。由于 QRA 的最终答案通常很短，answer action space 可被类型化枚举，例如：
+
+```text
+single_letter: A/B/C/D/E
+single_integer: digits/sign
+signed_decimal: digits/sign/dot
+interval: brackets/comma/digits/sign/dot
+```
+
+因此不用进行高方差完整 rollout，而是直接枚举候选动作并计算 reward-improved target policy。这比旧版 full-vocab top-k negative 更可解释，也更接近“reward 直接更新 ratio policy”的目的。
