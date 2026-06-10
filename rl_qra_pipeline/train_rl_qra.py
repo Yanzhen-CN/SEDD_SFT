@@ -17,15 +17,17 @@ from transformers import GPT2TokenizerFast
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
-for path in (REPO_DIR, REPO_DIR / "sft_answer_pipeline"):
-    sys.path.insert(0, str(path))
+
+for path in (SCRIPT_DIR, REPO_DIR, REPO_DIR / "sft_answer_pipeline"):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 import graph_lib  # noqa: E402
 import noise_lib  # noqa: E402
 from model import SEDD  # noqa: E402
 from model.ema import ExponentialMovingAverage  # noqa: E402
 from answer_dataset import AnswerSegmentDataset  # noqa: E402
-
 from guided_ratio_update import guided_ratio_loss  # noqa: E402
 
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
