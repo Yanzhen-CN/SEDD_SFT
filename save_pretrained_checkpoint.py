@@ -11,8 +11,8 @@ from model.ema import ExponentialMovingAverage
 def main():
     parser = argparse.ArgumentParser(description="Save a Hugging Face SEDD pretrained model as a local .pth checkpoint.")
     parser.add_argument("--model", default="louaaron/sedd-medium")
-    parser.add_argument("--output", default="sft_rl_pipeline/modelparameter/startpoint/pretrained.pth")
-    parser.add_argument("--length", type=int, default=512)
+    parser.add_argument("--output", default="rl_qra_pipeline/modelparameter/pretrain/pretrain.pth")
+    parser.add_argument("--length", type=int, default=1024)
     parser.add_argument("--ema", type=float, default=0.9999)
     args = parser.parse_args()
 

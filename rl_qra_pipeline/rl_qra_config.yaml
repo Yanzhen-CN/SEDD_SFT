@@ -1,0 +1,102 @@
+seed: 42
+cpu: false
+
+model:
+  pretrained: louaaron/sedd-medium
+  tokenizer: gpt2
+  max_length: 1024
+  min_target_tokens: 1
+  drop_overlength: true
+  write_load_reports: false
+
+run:
+  selected: QRA          # all | pretrain | QRA | ["pretrain", "QRA"]
+  cuda_device: null      # null uses default CUDA device; set 0/1/... to choose a GPU
+  # Train only. Evaluation / generation / visualization are run manually after results are copied back.
+
+starts:
+  pretrain:
+    init_checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
+    output_name: rl_pretrain
+  QRA:
+    init_checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
+    output_name: rl_QRA
+
+data:
+  data_dir: rl_qra_pipeline/data/QRA
+  split: train
+  train_limit: 0
+
+output:
+  root_dir: rl_qra_pipeline/modelparameter
+
+eval:
+  batch_size: 1
+  eval_batches: 0
+  num_workers: 0
+  datasets: [QRA]
+  output_dir: rl_qra_pipeline/test_result
+
+generation:
+  dataset: QRA
+  num_examples: 5
+  steps: 128
+  max_length: 1024
+  output_dir: rl_qra_pipeline/reports
+
+visual:
+  output_dir: rl_qra_pipeline/visualization
+  bin_size: 25
+  show_raw: false
+
+compare_models:
+  pretrain_start:
+    checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
+  QRA_start:
+    checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
+  rl_pretrain:
+    checkpoint: rl_qra_pipeline/modelparameter/rl_pretrain/best.pth
+  rl_QRA:
+    checkpoint: rl_qra_pipeline/modelparameter/rl_QRA/best.pth
+
+training:
+  steps: 200
+  batch_size: 1
+  lr: 1.0e-6
+  weight_decay: 0.0
+  grad_clip: 1.0
+  ema: 0.9999
+  log_every: 1
+  save_every: 50
+
+reward:
+  answer_weight: 0.80
+  reason_weight: 0.20
+  reasoning_min_tokens: 8
+  reasoning_guardrail_max_tokens: 1600
+
+guided:
+  # 主算法：verifier-guided local ratio policy improvement。
+  # 不依赖真实 rollout 采到正确路径，直接读取 SEDD 在 mask/noisy state 下输出的完整 ratio/probability field。
+  states_per_sample: 3
+  reveal_mode: prefix_grid       # prefix_grid | random_prefix | random_subset
+  base_state: reference_answer_masked
+  corrupt_mode: mask             # mask | limit
+  max_targets_per_state: 16
+
+  # SEDD transition probability construction.
+  transition_kind: analytic
+  step_size: 1.0e-5
+  t_min: 0.05
+  t_max: 0.95
+  # t_values: [0.1, 0.3, 0.5, 0.7, 0.9]
+
+  # Loss: -positive_weight * log p(correct) + negative_weight * penalty(wrong)
+  positive_weight: 1.0
+  negative_weight: 0.30
+  topk_negative: 4
+  wrong_type_negative_weight: 0.80
+  same_type_negative_weight: 0.10
+  structured_negative_weight: 0.25
+  short_text_negative_weight: 0.15
+  eps: 1.0e-8
