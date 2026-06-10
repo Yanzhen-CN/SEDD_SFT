@@ -9,6 +9,7 @@ segment masks:
 import argparse
 import json
 import sys
+import shutil
 from pathlib import Path
 
 import yaml
@@ -136,8 +137,8 @@ def length_stats(samples):
     }
 
 
-def filter_by_tokens(split_name, samples, tokenizer, max_length, min_target_tokens, output_dir):
-    kept, skipped = [], []
+def filter_by_tokens(split_name, samples, tokenizer, max_length, min_target_tokens):
+    kept = []
     all_total, all_train, kept_total, kept_train = [], [], [], []
     reasons = {"overlength": 0, "short_target": 0, "no_train_tokens": 0}
     crop_methods = {}
@@ -157,22 +158,14 @@ def filter_by_tokens(split_name, samples, tokenizer, max_length, min_target_toke
             reason = "overlength"
         if reason:
             reasons[reason] += 1
-            if len(skipped) < 20:
-                skipped.append({
-                    "id": sample.get("id"),
-                    "source_index": sample.get("source_index"),
-                    "reason": reason,
-                    "total_tokens": total,
-                    "train_tokens": train,
-                    "condition_tokens": condition,
-                    "segment_tokens": segment_tokens,
-                    "base_meta": sample.get("base_meta"),
-                })
             continue
         kept.append(sample)
         kept_total.append(total)
         kept_train.append(train)
 
+    # Keep all diagnostics inside sft_reasoning_pipeline/data/manifest.json only.
+    # Do not create per-split report JSON files; QRA folder should contain only
+    # train.jsonl / validation.jsonl / test.jsonl.
     report = {
         "name": "QRA",
         "split": split_name,
@@ -187,10 +180,7 @@ def filter_by_tokens(split_name, samples, tokenizer, max_length, min_target_toke
         "all_train_tokens": summary(all_train),
         "kept_total_tokens": summary(kept_total),
         "kept_train_tokens": summary(kept_train),
-        "skipped_examples": skipped,
-        "note": "Reasoning is fixed condition in QRA. Cropping was done once in root prepare_s1k_split.py.",
     }
-    write_json(Path(output_dir) / "QRA" / f"{split_name}_prepare_filter_report.json", report)
     return kept, report
 
 
@@ -224,12 +214,15 @@ def build(config):
 
     splits, reports = {}, {}
     for split, rows in qra_by_split.items():
-        kept, report = filter_by_tokens(split, rows, tokenizer, max_length, min_target_tokens, output_dir)
+        kept, report = filter_by_tokens(split, rows, tokenizer, max_length, min_target_tokens)
         splits[split] = kept
         reports[split] = report
 
+    qra_dir = Path(output_dir) / "QRA"
+    if qra_dir.exists():
+        shutil.rmtree(qra_dir)
     for split, rows in splits.items():
-        write_jsonl(Path(output_dir) / "QRA" / f"{split}.jsonl", rows)
+        write_jsonl(qra_dir / f"{split}.jsonl", rows)
 
     dataset_summary = {
         "name": "QRA",
@@ -242,7 +235,6 @@ def build(config):
         "train_stats": length_stats(splits["train"]),
         "validation_stats": length_stats(splits["validation"]),
         "test_stats": length_stats(splits["test"]),
-        "token_filter_reports": {split: str(Path(output_dir) / "QRA" / f"{split}_prepare_filter_report.json") for split in splits},
         "token_filter_summary": {
             split: {
                 "input_rows": r["input_rows"],
@@ -251,6 +243,7 @@ def build(config):
                 "skip_reasons": r["skip_reasons"],
                 "crop_method_counts": r["crop_method_counts"],
                 "kept_total_tokens": r["kept_total_tokens"],
+                "kept_train_tokens": r["kept_train_tokens"],
             }
             for split, r in reports.items()
         },

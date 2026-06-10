@@ -13,9 +13,10 @@ Outputs only the standard split structure:
   data/S1K_light/manifest.json
 
 Design:
-  1) Clean the Answer field from `solution` first.
+  1) Strictly clean the Answer field from `solution` first.
      - If solution is already a scalar / option / word / one-sentence short answer, keep it directly.
-     - If solution contains explanation/reasoning, extract only the final answer from structured markers.
+     - If solution is multi-line or explanation-like, only keep it when a clear answer marker exists.
+     - Never use arbitrary tail lines as answers; unclear cases are discarded.
   2) Select a teacher reasoning trace and optionally verify that it reaches the cleaned answer.
   3) Keep question, labels and answer fixed. Only compress the reasoning body.
      Compression is complete-sentence based: no half-sentence truncation.
@@ -49,10 +50,35 @@ DEFAULT_LIGHT_OUTPUT_DIR = REPO_DIR / "data" / "S1K_light"
 ELLIPSIS = "..."
 _TOKEN_CACHE: Dict[str, int] = {}
 
-EXPLANATION_HEADINGS = (
-    "explanation", "definition", "wordplay", "reasoning", "solution", "parse", "clue",
-    "defn", "def", "analysis", "proof", "working", "work", "steps", "rationale",
+FINAL_ANSWER_HEADINGS = (
+    # English heading-style markers. Keep this list intentionally broad, but
+    # candidates are still validated strictly by candidate_ok().
+    "answer", "final answer", "correct answer", "official answer", "target answer",
+    "solution", "final solution", "result", "final result", "response", "output",
+    "choice", "option", "answer choice", "correct choice", "correct option",
+    "selected answer", "selected option", "ans", "final", "conclusion",
+    # Chinese markers, in case mixed data appears.
+    "答案", "最终答案", "正确答案", "解答", "结果", "最终结果", "选项", "正确选项",
 )
+
+EXPLANATION_HEADINGS = (
+    # These headings usually introduce reasoning/explanation rather than the final answer.
+    # Note: "solution" is deliberately NOT only treated as explanation; it can also be
+    # a final-answer marker, e.g. "Solution: 181". Whether it is accepted depends on
+    # the extracted candidate being short and non-reasoning-like.
+    "explanation", "definition", "wordplay", "reasoning", "parse", "clue",
+    "defn", "def", "analysis", "proof", "working", "work", "steps", "rationale",
+    "explain", "derivation", "calculation", "method", "justification",
+)
+
+
+def _heading_alt(headings) -> str:
+    """Regex alternative for headings; spaces become flexible whitespace."""
+    return "|".join(re.escape(h).replace(r"\ ", r"\s+") for h in headings)
+
+
+FINAL_HEADING_ALT = _heading_alt(FINAL_ANSWER_HEADINGS)
+EXPLAIN_HEADING_ALT = _heading_alt(EXPLANATION_HEADINGS)
 BAD_ANSWER_PREFIXES = tuple(x + ":" for x in EXPLANATION_HEADINGS) + (
     "anagram of", "homophone of", "hidden in", "definition of", "clue is",
 )
@@ -184,10 +210,33 @@ def split_sentences(text) -> List[str]:
 def strip_markdown_answer_prefix(text: str) -> str:
     text = clean(text)
     text = re.sub(r"^\s*#{0,6}\s*", "", text).strip()
-    text = re.sub(r"^\s*(?:final\s+)?answer\s*[:：=]\s*", "", text, flags=re.I).strip()
-    text = re.sub(r"^\s*(?:the\s+)?(?:final\s+)?answer\s+(?:is|=)\s*", "", text, flags=re.I).strip()
+    text = re.sub(r"^\s*\*\*\s*", "", text).strip()
+    # Strip explicit final-answer headings only when they appear at the beginning.
+    text = re.sub(
+        r"^\s*(?:" + FINAL_HEADING_ALT + r")\s*(?:\*\*)?\s*(?:[:：=]|[-–—])\s*",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    text = re.sub(
+        r"^\s*(?:the\s+)?(?:correct\s+|final\s+)?answer\s+(?:is|=)\s*",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    text = re.sub(
+        r"^\s*(?:the\s+)?(?:" + FINAL_HEADING_ALT + r")\s+(?:is|=|为|是)\s*",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    text = re.sub(
+        r"^\s*(?:答案|最终答案|正确答案|结果|选项)\s*(?:是|为|=|:|：)\s*",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
     return text
-
 
 def clean_answer_candidate(candidate: str) -> str:
     """Clean a candidate without adding tokens such as 'is'."""
@@ -213,22 +262,60 @@ def clean_answer_candidate(candidate: str) -> str:
     return candidate
 
 
+def has_bad_unicode_or_mojibake(text: str) -> bool:
+    """Reject candidates that are likely decoding artifacts or symbol noise."""
+    t = clean(text)
+    if not t:
+        return True
+    if any(x in t for x in ["�", "Ã", "Â", "â€", "â€™", "â€œ", "â€�", "ï¼"]):
+        return True
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", t):
+        return True
+    visible = re.sub(r"\s+", "", t)
+    if visible:
+        weird = sum(1 for ch in visible if not (ch.isalnum() or ch in "._,;:!?+-*/=()[]{}<>\\/$%°\'\"`~^&|#@ −–—…"))
+        if weird / max(1, len(visible)) > 0.25:
+            return True
+    return False
+
+
 def reject_bad_answer_candidate(text: str) -> bool:
     t = clean(text)
     low = t.lower().strip()
     if not t:
         return True
+    if has_bad_unicode_or_mojibake(t):
+        return True
     if low.startswith(BAD_ANSWER_PREFIXES):
         return True
     if re.search(r"(?im)^\s*#{0,6}\s*(?:" + "|".join(EXPLANATION_HEADINGS) + r")\s*:", t):
+        return True
+    # Answer should not itself look like an explanation block.
+    if re.search(r"(?i)\b(anagram of|definition:|wordplay:|explanation:|proof:|reasoning:)\b", t):
+        return True
+    return False
+
+
+def is_complex_solution_text(solution: str) -> bool:
+    """Whether a solution looks like a worked solution rather than a direct answer."""
+    s = clean(solution)
+    if not s:
+        return True
+    if "\n" in s:
+        return True
+    if len(split_sentences(s)) > 1:
+        return True
+    if re.search(r"(?i)\b(explanation|definition|wordplay|anagram of|proof|reasoning|therefore|because|since|first|next|then|we need|we have|let's|let us)\b", s):
         return True
     return False
 
 
 def is_atomic_solution_answer(solution: str, tokenizer, max_tokens: int, max_chars: int) -> bool:
-    """True when solution is already the final answer: number, option, word, phrase, or one short sentence.
+    """True when solution is already the final answer.
 
-    These cases should be kept directly rather than over-parsed.
+    These cases are kept directly and are NOT re-parsed, so "181" stays "181".
+    Atomic answers include numbers, choices, one word, short phrases, formulas, boxed answers,
+    and one short non-reasoning sentence.
     """
     s = clean(solution)
     if not s or reject_bad_answer_candidate(s):
@@ -237,18 +324,21 @@ def is_atomic_solution_answer(solution: str, tokenizer, max_tokens: int, max_cha
         return False
     if re.search(r"(?i)^\s*#{1,6}\s*(?:answer|solution|explanation)\s*:", s):
         return False
-    if re.search(r"(?i)\b(explanation|definition|wordplay|anagram of|proof|reasoning)\b", s):
-        return False
     if len(s) > max_chars:
         return False
     if token_count(tokenizer, s) > max_tokens:
         return False
-    # Scalar / option / boxed / short phrase.
+    if is_complex_solution_text(s):
+        return False
+
+    # Scalar / option / boxed / equation / short phrase / one-sentence answer.
     if re.fullmatch(r"[A-Da-d]", s) or re.fullmatch(r"\(?[A-Da-d]\)?", s):
         return True
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:/\d+)?(?:\s*[%°])?", s):
         return True
     if re.fullmatch(r"\\boxed\{[^{}]+\}", s):
+        return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z\-']{1,40}", s):
         return True
     if len(split_sentences(s)) <= 1 and token_count(tokenizer, s) <= min(max_tokens, 80):
         return True
@@ -256,89 +346,155 @@ def is_atomic_solution_answer(solution: str, tokenizer, max_tokens: int, max_cha
 
 
 def candidate_ok(candidate: str, tokenizer, max_tokens: int, max_chars: int) -> bool:
+    """Validate an extracted final-answer candidate.
+
+    This is intentionally stricter than old versions:
+    - no arbitrary multi-line answer;
+    - normally at most one sentence;
+    - reject explanation/reasoning-looking text and mojibake;
+    - allow longer one-sentence answers only within token/char budget.
+    """
     c = clean(candidate)
     if not c or reject_bad_answer_candidate(c):
+        return False
+    if "\n" in c:
         return False
     if len(c) > max_chars:
         return False
     if token_count(tokenizer, c) > max_tokens:
         return False
-    # Multi-sentence is allowed if short enough, but reject obvious reasoning blocks.
-    if "\n" in c:
+    if len(split_sentences(c)) > 1:
         return False
-    if len(split_sentences(c)) > 2 and token_count(tokenizer, c) > 80:
+    if re.search(r"\b(first|second|next|then|therefore|because|since|we need to|we can|let us|let's|proof|explanation|definition|wordplay)\b", c, flags=re.I):
         return False
-    if re.search(r"\b(first|second|next|then|therefore|because|since|we need to|we can|let us|let's)\b", c, flags=re.I):
-        if token_count(tokenizer, c) > 40:
+    # Very symbol-heavy candidates are usually malformed extraction.
+    compact = re.sub(r"\s+", "", c)
+    if compact:
+        alnum = sum(ch.isalnum() for ch in compact)
+        if len(compact) >= 12 and alnum / len(compact) < 0.35:
             return False
     return True
 
 
+def _take_until_answer_boundary(text: str) -> str:
+    """Trim a marker capture to the direct answer only."""
+    x = clean(text)
+    # Stop before explanation/proof headings or line breaks.
+    x = re.split(
+        r"(?im)\n\s*#{0,6}\s*(?:" + EXPLAIN_HEADING_ALT + r")\s*(?:[:：=]|[-–—])",
+        x,
+        maxsplit=1,
+    )[0]
+    x = x.split("\n", 1)[0].strip()
+    # If quoted, keep inside the quote.
+    m = re.match(r"^[\"“']([^\"”']{1,260})[\"”']", x)
+    if m:
+        return m.group(1)
+    # Otherwise keep until a strong sentence boundary if the rest looks explanatory.
+    parts = re.split(r"(?<=[.!?])\s+(?=(?:Because|Since|This|It|The|We|I|Therefore|Thus|Hence)\b)", x, maxsplit=1)
+    return parts[0].strip()
+
 def add_solution_answer_candidates(solution: str, candidates: List[Tuple[str, str]]) -> None:
+    """Add candidates only from direct final-answer evidence.
+
+    For complex / multi-line solutions, we do NOT use the last line as fallback.
+    A row is kept only if it has a direct final-answer marker. Supported marker
+    families include Answer, Final Answer, Correct Answer, Solution, Result,
+    Output, Response, Choice/Option, and Chinese equivalents.
+    """
     text = clean(solution)
     if not text:
         return
 
-    # Markdown line: ### Answer: GOATHERDS
-    for line in text.splitlines():
-        m = re.match(r"^\s*#{0,6}\s*(?:final\s+)?answer\s*[:：=]\s*(.+?)\s*$", line, flags=re.I)
-        if m:
-            candidates.append((clean_answer_candidate(m.group(1)), "solution_markdown_answer_line"))
-
-    # Markdown block: Answer:\n...\n### Explanation:
-    heading = r"(?:" + "|".join(EXPLANATION_HEADINGS) + r")"
-    pat = re.compile(
-        r"(?is)(?:^|\n)\s*#{0,6}\s*(?:final\s+)?answer\s*[:：=]\s*(.*?)"
-        r"(?=\n\s*#{0,6}\s*" + heading + r"\s*:|\n\s*\*\*|\Z)"
+    # 1) Heading with answer on the same line:
+    #    ### Answer: GOATHERDS
+    #    Solution: 181
+    #    Correct option - B
+    same_line = re.compile(
+        r"^\s*(?:#{0,6}\s*)?(?:\*\*)?\s*(?:" + FINAL_HEADING_ALT + r")\s*(?:\*\*)?\s*(?:[:：=]|[-–—])\s*(.+?)\s*$",
+        flags=re.I,
     )
-    for m in pat.finditer(text):
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = same_line.match(line)
+        if m:
+            candidates.append((clean_answer_candidate(_take_until_answer_boundary(m.group(1))), "solution_heading_same_line"))
+
+        # 2) Heading on its own line, answer on the next non-empty line:
+        #    ### Solution
+        #    181
+        heading_only = re.match(
+            r"^\s*(?:#{0,6}\s*)?(?:\*\*)?\s*(?:" + FINAL_HEADING_ALT + r")\s*(?:\*\*)?\s*$",
+            line,
+            flags=re.I,
+        )
+        if heading_only:
+            for nxt in lines[i + 1 : i + 5]:
+                nxt = clean(nxt)
+                if not nxt:
+                    continue
+                if re.match(r"^\s*(?:#{0,6}\s*)?(?:" + EXPLAIN_HEADING_ALT + r")\s*(?:[:：=]|[-–—])", nxt, flags=re.I):
+                    break
+                candidates.append((clean_answer_candidate(_take_until_answer_boundary(nxt)), "solution_heading_next_line"))
+                break
+
+    # 3) Markdown block: Answer:\n...\n### Explanation:
+    block_pat = re.compile(
+        r"(?is)(?:^|\n)\s*(?:#{0,6}\s*)?(?:\*\*)?\s*(?:" + FINAL_HEADING_ALT + r")\s*(?:\*\*)?\s*(?:[:：=]|[-–—])\s*(.*?)"
+        r"(?=\n\s*(?:#{0,6}\s*)?(?:\*\*)?\s*(?:" + EXPLAIN_HEADING_ALT + r")\s*(?:\*\*)?\s*(?:[:：=]|[-–—])|\n\s*\*\*|\Z)",
+    )
+    for m in block_pat.finditer(text):
         block = clean(m.group(1))
         if block:
             first = [clean(x) for x in block.splitlines() if clean(x)]
             if first:
-                candidates.append((clean_answer_candidate(first[0]), "solution_markdown_answer_block_first_line"))
-            candidates.append((clean_answer_candidate(block), "solution_markdown_answer_block"))
+                candidates.append((clean_answer_candidate(_take_until_answer_boundary(first[0])), "solution_heading_block_first_line"))
+            candidates.append((clean_answer_candidate(_take_until_answer_boundary(block)), "solution_heading_block"))
 
-    # GSM8K / boxed.
+    # 4) GSM8K and LaTeX-style final-answer markers.
     for m in re.finditer(r"####\s*([^\n]+)", text):
-        candidates.append((clean_answer_candidate(m.group(1)), "solution_gsm8k_hash"))
+        candidates.append((clean_answer_candidate(_take_until_answer_boundary(m.group(1))), "solution_gsm8k_hash"))
     for m in re.finditer(r"\\boxed\s*\{([^{}]+)\}", text, flags=re.DOTALL):
         candidates.append((clean_answer_candidate(m.group(1)), "solution_boxed"))
+    for m in re.finditer(r"\\(?:answer|ans)\s*\{([^{}]+)\}", text, flags=re.DOTALL | re.I):
+        candidates.append((clean_answer_candidate(m.group(1)), "solution_latex_answer_command"))
 
-    # Explicit phrases. Avoid the old bug by requiring a separator/is after 'final answer'.
-    patterns = [
-        r"(?i)(?:the\s+)?final\s+answer\s*(?:is|=|:|：)\s*[\"“']?([^\n\"”']{1,260})[\"”']?",
-        r"(?i)(?:the\s+)?answer\s*(?:is|=|:|：)\s*[\"“']?([^\n\"”']{1,260})[\"”']?",
-        r"(?i)(?:therefore|so|hence),?\s+(?:the\s+)?answer\s*(?:is|=)\s*[\"“']?([^\n\"”']{1,220})[\"”']?",
+    # 5) Explicit natural-language final-answer phrases.
+    phrase_patterns = [
+        r"(?i)(?:the\s+)?(?:correct\s+|official\s+|target\s+)?(?:final\s+)?answer\s*(?:is|=|:|：)\s*([^\n]{1,360})",
+        r"(?i)(?:the\s+)?(?:correct\s+|final\s+)?(?:solution|result|output|response)\s*(?:is|=|:|：)\s*([^\n]{1,360})",
+        r"(?i)(?:therefore|so|hence|thus),?\s+(?:the\s+)?(?:answer|solution|result)\s*(?:is|=|:|：)\s*([^\n]{1,320})",
+        r"(?i)(?:correct\s+)?(?:choice|option|answer\s+choice)\s*(?:is|=|:|：)?\s*(\(?[A-Ea-e]\)?(?:\s*[-–—:]?\s*[^\n]{0,120})?)",
+        r"(?i)(?:答案|最终答案|正确答案|解答|结果|最终结果|选项|正确选项)\s*(?:是|为|=|:|：)\s*([^\n]{1,320})",
     ]
-    for pat in patterns:
-        for m in reversed(list(re.finditer(pat, text))[-8:]):
-            candidates.append((clean_answer_candidate(m.group(1)), "solution_explicit_answer_marker"))
-
-    # Conservative tail fallback only when the tail itself looks like an answer, not an explanation label.
-    lines = [clean(x) for x in text.splitlines() if clean(x)]
-    for line in reversed(lines[-4:]):
-        c = clean_answer_candidate(line)
-        if c and not reject_bad_answer_candidate(c):
-            candidates.append((c, "solution_safe_tail_line"))
-
+    for pat in phrase_patterns:
+        matches = list(re.finditer(pat, text))
+        for m in reversed(matches[-8:]):
+            candidates.append((clean_answer_candidate(_take_until_answer_boundary(m.group(1))), "solution_explicit_final_answer_phrase"))
 
 def extract_clean_answer(solution, tokenizer, data_cfg) -> Tuple[str, str, dict]:
+    """Extract a clean final answer from solution.
+
+    Policy:
+    1. If solution is already atomic/simple, keep it exactly after light cleanup.
+    2. If solution is complex/multi-line, require a direct answer marker.
+    3. If no valid direct answer can be extracted, discard the row.
+    """
     solution = clean(solution)
     if not solution:
         return "", "empty_solution", {}
 
     max_length = int(data_cfg.get("_max_length", 1024))
     frac = float(data_cfg.get("max_answer_fraction_of_max_length", 0.33))
-    # Old configs may still contain max_answer_tokens: 64. Treat it as a soft lower bound, not a hard cap.
     config_tok = int(data_cfg.get("max_answer_tokens", 0) or 0)
     max_tokens = max(config_tok, max(1, int(max_length * frac)))
     max_chars = int(data_cfg.get("max_answer_chars", 1200))
 
+    # Case 1: solution itself is a direct answer. Do not add/remove semantic words.
     if is_atomic_solution_answer(solution, tokenizer, max_tokens=max_tokens, max_chars=max_chars):
-        # Keep simple scalar/word/option answers directly. No added prefixes such as 'is'.
-        return clean_answer_candidate(solution), "solution_atomic", {"max_answer_tokens": max_tokens}
+        return clean_answer_candidate(solution), "solution_atomic", {"max_answer_tokens": max_tokens, "complex_solution": False}
 
+    # Case 2: complex solution. Extract only from high-confidence answer markers.
     candidates: List[Tuple[str, str]] = []
     add_solution_answer_candidates(solution, candidates)
 
@@ -351,16 +507,18 @@ def extract_clean_answer(solution, tokenizer, data_cfg) -> Tuple[str, str, dict]
             continue
         seen.add(key)
         if candidate_ok(cand, tokenizer, max_tokens=max_tokens, max_chars=max_chars):
-            return cand, method, {"max_answer_tokens": max_tokens, "candidate_count": len(candidates)}
-        if len(rejected) < 6:
-            rejected.append({"method": method, "candidate": cand[:160]})
+            return cand, method, {"max_answer_tokens": max_tokens, "candidate_count": len(candidates), "complex_solution": True}
+        if len(rejected) < 8:
+            rejected.append({"method": method, "candidate": cand[:180]})
 
-    # Whole-solution fallback only if it is one short non-reasoning answer.
-    whole = clean_answer_candidate(solution)
-    if candidate_ok(whole, tokenizer, max_tokens=max_tokens, max_chars=max_chars):
-        return whole, "whole_clean_solution", {"max_answer_tokens": max_tokens, "candidate_count": len(candidates)}
-
-    return "", "long_or_unextractable_answer", {"max_answer_tokens": max_tokens, "candidate_count": len(candidates), "rejected_preview": rejected}
+    # No whole-solution or tail-line fallback for complex solutions.
+    return "", "no_direct_clean_answer_marker", {
+        "max_answer_tokens": max_tokens,
+        "candidate_count": len(candidates),
+        "complex_solution": True,
+        "rejected_preview": rejected,
+        "solution_preview": solution[:260],
+    }
 
 
 def normalize_for_match(text) -> str:
@@ -722,7 +880,7 @@ def process_and_split(config: dict) -> dict:
         "reasoning_field_counts": reasoning_field_counts,
         "crop_method_counts": crop_method_counts,
         "token_stats": {k: summary(v) for k, v in token_stats_all.items()},
-        "answer_cleaning_note": "Atomic solution answers such as numbers, options and one-word answers are kept directly. Longer/multi-line solutions are cleaned to final-answer only when structured markers are available.",
+        "answer_cleaning_note": "Strict mode: atomic/simple one-line solutions are kept directly; complex or multi-line solutions are kept only when a direct answer marker is extractable. No tail-line fallback is used.",
         "skipped_examples": skipped_examples,
     }
     write_json(light_output_dir / "manifest.json", manifest)

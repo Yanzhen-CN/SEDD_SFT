@@ -10,6 +10,7 @@ prepare_s1k_split.py and only converts them into segment masks:
 import argparse
 import json
 import sys
+import shutil
 from pathlib import Path
 
 import yaml
@@ -160,8 +161,8 @@ def min_target_for(name, config):
     return int(per_mode.get(name, model_cfg.get("min_target_tokens", 1)))
 
 
-def filter_by_tokens(name, split_name, samples, tokenizer, max_length, min_target_tokens, output_dir):
-    kept, skipped = [], []
+def filter_by_tokens(name, split_name, samples, tokenizer, max_length, min_target_tokens):
+    kept = []
     all_total, all_train, kept_total, kept_train = [], [], [], []
     reasons = {"overlength": 0, "short_target": 0, "no_train_tokens": 0}
     crop_methods = {}
@@ -181,22 +182,14 @@ def filter_by_tokens(name, split_name, samples, tokenizer, max_length, min_targe
             reason = "overlength"
         if reason:
             reasons[reason] += 1
-            if len(skipped) < 20:
-                skipped.append({
-                    "id": sample.get("id"),
-                    "source_index": sample.get("source_index"),
-                    "reason": reason,
-                    "total_tokens": total,
-                    "train_tokens": train,
-                    "condition_tokens": condition,
-                    "segment_tokens": segment_tokens,
-                    "base_meta": sample.get("base_meta"),
-                })
             continue
         kept.append(sample)
         kept_total.append(total)
         kept_train.append(train)
 
+    # Keep all diagnostics inside the pipeline-level manifest only.
+    # Do not create per-split report JSON files; each dataset folder should
+    # contain only train.jsonl / validation.jsonl / test.jsonl.
     report = {
         "name": name,
         "split": split_name,
@@ -211,11 +204,7 @@ def filter_by_tokens(name, split_name, samples, tokenizer, max_length, min_targe
         "all_train_tokens": summary(all_train),
         "kept_total_tokens": summary(kept_total),
         "kept_train_tokens": summary(kept_train),
-        "skipped_examples": skipped,
-        "note": "This adapter only filters final segment samples. Reasoning cropping is done once in root prepare_s1k_split.py.",
     }
-    report_path = Path(output_dir) / name / f"{split_name}_prepare_filter_report.json"
-    write_json(report_path, report)
     return kept, report
 
 
@@ -224,11 +213,13 @@ def save_dataset(name, split_samples, output_dir, tokenizer, max_length, min_tar
     input_samples = []
     for split, samples in split_samples.items():
         input_samples.extend(samples)
-        kept, report = filter_by_tokens(name, split, samples, tokenizer, max_length, min_target_tokens, output_dir)
+        kept, report = filter_by_tokens(name, split, samples, tokenizer, max_length, min_target_tokens)
         splits[split] = kept
         reports[split] = report
 
     base = Path(output_dir) / name
+    if base.exists():
+        shutil.rmtree(base)
     for split, rows in splits.items():
         write_jsonl(base / f"{split}.jsonl", rows)
 
@@ -243,7 +234,6 @@ def save_dataset(name, split_samples, output_dir, tokenizer, max_length, min_tar
         "train_stats": length_stats(splits["train"]),
         "validation_stats": length_stats(splits["validation"]),
         "test_stats": length_stats(splits["test"]),
-        "token_filter_reports": {split: str(Path(output_dir) / name / f"{split}_prepare_filter_report.json") for split in splits},
         "token_filter_summary": {
             split: {
                 "input_rows": r["input_rows"],
@@ -252,6 +242,7 @@ def save_dataset(name, split_samples, output_dir, tokenizer, max_length, min_tar
                 "skip_reasons": r["skip_reasons"],
                 "crop_method_counts": r["crop_method_counts"],
                 "kept_total_tokens": r["kept_total_tokens"],
+                "kept_train_tokens": r["kept_train_tokens"],
             }
             for split, r in reports.items()
         },
