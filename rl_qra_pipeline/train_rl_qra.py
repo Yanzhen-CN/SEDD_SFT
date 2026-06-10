@@ -70,6 +70,44 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def choose_device(cfg: Dict, gpu_override: int | None = None) -> torch.device:
+    """Choose device from CLI first, then config, then default cuda.
+
+    Priority:
+      1) --gpu N from command line
+      2) run.cuda_device in yaml
+      3) top-level cuda_device / gpu in yaml
+      4) cuda if available, else cpu
+
+    Notes:
+      - If you run with CUDA_VISIBLE_DEVICES=2 and --gpu 0, cuda:0 means the
+        first visible GPU, i.e. physical GPU 2.
+      - Set cpu: true or run.cpu: true to force CPU.
+    """
+    run_cfg = cfg.get("run", {}) or {}
+    force_cpu = bool(cfg.get("cpu", False) or run_cfg.get("cpu", False))
+    if force_cpu:
+        return torch.device("cpu")
+
+    if not torch.cuda.is_available():
+        print("[warn] CUDA is not available; using CPU.", flush=True)
+        return torch.device("cpu")
+
+    gpu_value = gpu_override
+    if gpu_value is None:
+        gpu_value = run_cfg.get("cuda_device", cfg.get("cuda_device", cfg.get("gpu", None)))
+
+    if gpu_value is None:
+        return torch.device("cuda")
+
+    if isinstance(gpu_value, str):
+        if gpu_value.strip().lower() in {"", "none", "null", "auto", "cuda"}:
+            return torch.device("cuda")
+        gpu_value = int(gpu_value)
+
+    return torch.device(f"cuda:{int(gpu_value)}")
+
+
 def deep_update(base: Dict, updates: Dict) -> Dict:
     out = copy.deepcopy(base)
     for k, v in (updates or {}).items():
@@ -251,10 +289,10 @@ def print_debug_record(step: int, record: Dict[str, Any], max_rows: int = 8) -> 
     print("", flush=True)
 
 
-def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA") -> Path:
+def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_override: int | None = None) -> Path:
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() and not bool(cfg.get("cpu", False)) else "cpu")
+    device = choose_device(cfg, gpu_override=gpu_override)
 
     out_root = resolve_repo_path(cfg.get("output", {}).get("dir", f"rl_qra_pipeline/modelparameter/rl_{start_name}"))
     output_name = cfg.get("output", {}).get("name", f"rl_{start_name}")
@@ -266,7 +304,14 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA") -> Path:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"[{start_name}] device={device}", flush=True)
+    run_cfg = cfg.get("run", {}) or {}
+    cfg_gpu = run_cfg.get("cuda_device", cfg.get("cuda_device", cfg.get("gpu", None)))
+    print(
+        f"[{start_name}] device={device} "
+        f"cli_gpu={gpu_override} cfg_gpu={cfg_gpu} "
+        f"cuda_visible_devices={__import__('os').environ.get('CUDA_VISIBLE_DEVICES', '')}",
+        flush=True,
+    )
     model, graph, noise, ema, loaded_from = load_policy(cfg, device)
     split = cfg.get("data", {}).get("split", "train")
     samples = load_samples(cfg, split, tokenizer)
@@ -386,10 +431,20 @@ def main():
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
     parser.add_argument("--run-name", type=str, default="rrpi")
     parser.add_argument("--start", type=str, default=None, help="Start key under config.starts, e.g. pretrain, QA, QRA")
+    parser.add_argument("--gpu", type=int, default=None, help="CUDA device index, e.g. --gpu 0. Overrides config run.cuda_device.")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU. Overrides --gpu and config cuda_device.")
     args = parser.parse_args()
+
     raw_cfg = load_config(args.config)
     cfg, start_name = select_start_config(raw_cfg, args.start)
-    train(cfg, args.run_name, start_name=start_name)
+
+    if args.cpu:
+        cfg["cpu"] = True
+        cfg.setdefault("run", {})["cpu"] = True
+    if args.gpu is not None:
+        cfg.setdefault("run", {})["cuda_device"] = int(args.gpu)
+
+    train(cfg, args.run_name, start_name=start_name, gpu_override=args.gpu)
 
 
 if __name__ == "__main__":
