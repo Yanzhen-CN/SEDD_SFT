@@ -5,9 +5,15 @@ import copy
 import csv
 import datetime as dt
 import json
+import os
 import random
 import shutil
 import sys
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Any
 
@@ -257,6 +263,60 @@ def sync_checkpoint(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def safe_copy(src: Path, dst: Path) -> str:
+    """Copy src to dst if src exists, and return the copied path as string."""
+    if not src.exists():
+        return ""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return str(dst)
+
+
+def append_run_index(index_path: Path, row: Dict[str, Any]) -> None:
+    """Append one finished run into a root-level index with a simple file lock.
+
+    Multiple training processes may finish at similar times. The fcntl lock avoids
+    interleaved writes on Linux servers. If fcntl is unavailable, it still appends
+    normally.
+    """
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "run_id",
+        "run_name",
+        "start",
+        "device",
+        "steps",
+        "best_loss",
+        "final_loss",
+        "last_target_prob",
+        "last_target_logp",
+        "last_model_reward",
+        "last_best_reward",
+        "last_reward_gap",
+        "run_dir",
+        "root_best_ckpt",
+        "root_last_ckpt",
+        "root_metrics",
+        "root_debug",
+        "root_run_info",
+        "finished_at",
+    ]
+    exists = index_path.exists()
+    with open(index_path, "a", encoding="utf-8", newline="") as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not exists:
+                writer.writeheader()
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 def print_debug_record(step: int, record: Dict[str, Any], max_rows: int = 8) -> None:
     print(f"\n[RRPI DEBUG step={step}]", flush=True)
     print(f"sample_id={record.get('sample_id', '')} type={record.get('answer_type', '')} state={record.get('state_kind', '')}", flush=True)
@@ -297,7 +357,9 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
     out_root = resolve_repo_path(cfg.get("output", {}).get("dir", f"rl_qra_pipeline/modelparameter/rl_{start_name}"))
     output_name = cfg.get("output", {}).get("name", f"rl_{start_name}")
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = out_root / f"{stamp}_{run_name}"
+    # Include pid to avoid collisions when multiple runs start in the same second.
+    run_id = f"{stamp}_{run_name}_pid{os.getpid()}"
+    out_dir = out_root / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = GPT2TokenizerFast.from_pretrained(cfg["model"].get("tokenizer", "gpt2"))
@@ -334,17 +396,27 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
         out_dir / "run_info.json",
         {
             "algorithm": "RRPI: Ratio-Reward Policy Improvement",
+            "run_id": run_id,
+            "run_name": run_name,
             "start": start_name,
             "output_name": output_name,
+            "output_root": str(out_root),
             "loaded_from": loaded_from,
             "num_samples": len(samples),
             "data_split": split,
             "device": str(device),
+            "pid": os.getpid(),
             "config": cfg,
         },
     )
     metrics_path = out_dir / "metrics.csv"
     debug_path = out_dir / "rrpi_debug.jsonl"
+    run_info_path = out_dir / "run_info.json"
+
+    print(f"run_id={run_id}", flush=True)
+    print(f"run_dir={out_dir}", flush=True)
+    print(f"live_metrics={metrics_path}", flush=True)
+    print("[parallel-safe] This run writes checkpoints only inside its own run_dir during training.", flush=True)
 
     best_loss = float("inf")
     best_path = out_dir / "best_RL_QRA_rrpi.pth"
@@ -413,16 +485,64 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
         if row["loss"] < best_loss:
             best_loss = row["loss"]
             save_checkpoint(best_path, model, ema, optimizer, cfg, step, row)
-            sync_checkpoint(best_path, out_root / "best.pth")
         if save_every > 0 and step % save_every == 0:
             save_checkpoint(last_path, model, ema, optimizer, cfg, step, row)
-            sync_checkpoint(last_path, out_root / "last.pth")
 
-    save_checkpoint(last_path, model, ema, optimizer, cfg, steps, {"loss": best_loss})
-    sync_checkpoint(last_path, out_root / "last.pth")
-    sync_checkpoint(best_path, out_root / "best.pth")
+    final_metrics = row if "row" in locals() else {"loss": best_loss}
+    save_checkpoint(last_path, model, ema, optimizer, cfg, steps, final_metrics)
+
+    # Parallel-safe root-level export.
+    # Each process exports to run-specific filenames only after it finishes, so
+    # different runs do not overwrite each other's root artifacts.
+    root_best = out_root / f"{run_id}_best.pth"
+    root_last = out_root / f"{run_id}_last.pth"
+    root_metrics = out_root / f"{run_id}_metrics.csv"
+    root_debug = out_root / f"{run_id}_rrpi_debug.jsonl"
+    root_info = out_root / f"{run_id}_run_info.json"
+
+    root_best_s = safe_copy(best_path, root_best)
+    root_last_s = safe_copy(last_path, root_last)
+    root_metrics_s = safe_copy(metrics_path, root_metrics)
+    root_debug_s = safe_copy(debug_path, root_debug)
+    root_info_s = safe_copy(run_info_path, root_info)
+
+    # Optional legacy generic sync. Disabled by default because it is unsafe for
+    # simultaneous runs. Enable only when running a single process.
+    output_cfg = cfg.get("output", {}) or {}
+    if bool(output_cfg.get("sync_generic_best_last", False)):
+        sync_checkpoint(best_path, out_root / "best.pth")
+        sync_checkpoint(last_path, out_root / "last.pth")
+
+    append_run_index(
+        out_root / "runs_index.csv",
+        {
+            "run_id": run_id,
+            "run_name": run_name,
+            "start": start_name,
+            "device": str(device),
+            "steps": steps,
+            "best_loss": best_loss,
+            "final_loss": final_metrics.get("loss", ""),
+            "last_target_prob": final_metrics.get("target_prob", ""),
+            "last_target_logp": final_metrics.get("target_logp", ""),
+            "last_model_reward": final_metrics.get("model_reward", ""),
+            "last_best_reward": final_metrics.get("best_reward", ""),
+            "last_reward_gap": final_metrics.get("reward_gap", ""),
+            "run_dir": str(out_dir),
+            "root_best_ckpt": root_best_s,
+            "root_last_ckpt": root_last_s,
+            "root_metrics": root_metrics_s,
+            "root_debug": root_debug_s,
+            "root_run_info": root_info_s,
+            "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
+        },
+    )
+
     print(f"Done. Outputs: {out_dir}", flush=True)
-    print(f"Synced checkpoints: {out_root / 'best.pth'} and {out_root / 'last.pth'}", flush=True)
+    print(f"Exported root artifacts with prefix: {out_root / run_id}", flush=True)
+    print(f"Run index: {out_root / 'runs_index.csv'}", flush=True)
+    if not bool(output_cfg.get("sync_generic_best_last", False)):
+        print("Generic best.pth/last.pth were not overwritten. Set output.sync_generic_best_last=true for single-run legacy sync.", flush=True)
     return out_dir
 
 
