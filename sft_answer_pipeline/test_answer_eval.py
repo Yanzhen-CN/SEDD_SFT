@@ -48,11 +48,13 @@ def make_loader(config, dataset_name, split, batch_size):
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     data_root = Path(config["data"].get("output_dir", SCRIPT_DIR / "data"))
+    per_mode = config["model"].get("min_target_tokens_by_mode", {}) or {}
+    min_target_tokens = int(per_mode.get(dataset_name, config["model"].get("min_target_tokens", 32)))
     return make_answer_loader(
         data_root / dataset_name / f"{split}.jsonl",
         tokenizer,
         int(config["model"].get("max_length", 512)),
-        int(config["model"].get("min_target_tokens", 32)),
+        min_target_tokens,
         batch_size,
         False,
         int(config.get("eval", {}).get("num_workers", 0)),
@@ -74,16 +76,15 @@ def load_pretrained(config, device):
     return model, graph, noise, ema, model_name
 
 
-def load_best(config, run_name, device):
+def load_checkpoint(config, checkpoint_path, device):
     import graph_lib
     import noise_lib
     from model import SEDD
     from model.ema import ExponentialMovingAverage
 
-    model_dir = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / run_name
-    ckpt_path = model_dir / "best.pth"
+    ckpt_path = Path(checkpoint_path)
     if not ckpt_path.exists():
-        print(f"Skip {run_name}-best: {ckpt_path} not found")
+        print(f"Skip checkpoint: {ckpt_path} not found")
         return None
     model = SEDD.from_pretrained(config["model"].get("pretrained", "louaaron/sedd-medium")).to(device)
     model.config.model.length = int(config["model"].get("max_length", model.config.model.length))
@@ -94,6 +95,29 @@ def load_best(config, run_name, device):
     graph = graph_lib.get_graph(model.config, device)
     noise = noise_lib.get_noise(model.config).to(device)
     return model, graph, noise, ema, str(ckpt_path)
+
+
+def eval_datasets(config):
+    explicit = config.get("eval", {}).get("datasets")
+    if explicit:
+        return list(explicit)
+    datasets = []
+    for run_name, run_cfg in (config.get("runs") or {}).items():
+        dataset_name = run_cfg.get("dataset", run_name) if isinstance(run_cfg, dict) else run_name
+        if dataset_name not in datasets:
+            datasets.append(dataset_name)
+    return datasets or ["QA", "QAR", "QRA"]
+
+
+def configured_models(config):
+    compare = config.get("compare_models")
+    if compare:
+        return compare
+    output_root = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter"))
+    models = {"pretrained": {"checkpoint": None}}
+    for name in (config.get("runs") or {}):
+        models[name] = {"checkpoint": str(output_root / name / "best.pth")}
+    return models
 
 
 def eval_model(config, model_name, model_tuple, datasets, device):
@@ -124,22 +148,19 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    datasets = ["QA", "QAR"]
+    datasets = eval_datasets(config)
     rows = []
 
-    try:
-        model_tuple = load_pretrained(config, device)
-        rows.extend(eval_model(config, "pretrained", model_tuple, datasets, device))
-    finally:
-        del model_tuple
-        cleanup()
-
-    for run_name in ["QA", "QAR"]:
-        model_tuple = load_best(config, run_name, device)
+    for model_name, model_cfg in configured_models(config).items():
+        checkpoint = model_cfg.get("checkpoint") if isinstance(model_cfg, dict) else model_cfg
+        if checkpoint:
+            model_tuple = load_checkpoint(config, checkpoint, device)
+        else:
+            model_tuple = load_pretrained(config, device)
         if model_tuple is None:
             continue
         try:
-            rows.extend(eval_model(config, f"{run_name}-best", model_tuple, datasets, device))
+            rows.extend(eval_model(config, model_name, model_tuple, datasets, device))
         finally:
             del model_tuple
             cleanup()
@@ -148,8 +169,8 @@ def main():
     result_dir = output_root / "test_result"
     write_csv(rows, result_dir / "test_results.csv")
     dump_json(rows, result_dir / "test_results.json")
-    for run_name in ["QA", "QAR"]:
-        model_rows = [row for row in rows if row["model"] == f"{run_name}-best"]
+    for run_name in (config.get("runs") or {}):
+        model_rows = [row for row in rows if row["model"] == run_name]
         if model_rows:
             dump_json(model_rows, output_root / run_name / "best_test_result.json")
             write_csv(model_rows, output_root / run_name / "best_test_result.csv")

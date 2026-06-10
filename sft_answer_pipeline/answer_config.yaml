@@ -22,7 +22,7 @@ data:
     max_stride_sentences: 6
 
 run:
-  selected: QAR
+  selected: QRA
   execute: true
   evaluate_after_train: true
   generate_after_train: true
@@ -35,6 +35,9 @@ runs:
   QAR:
     dataset: QAR
     cuda_visible_devices: null
+  QRA:
+    dataset: QRA
+    cuda_visible_devices: null
 
 model:
   pretrained: louaaron/sedd-medium
@@ -44,6 +47,7 @@ model:
   min_target_tokens_by_mode:
     QA: 1
     QAR: 32
+    QRA: 1
   drop_overlength: true
   write_load_reports: true
 
@@ -70,9 +74,21 @@ eval:
   batch_size: 1
   eval_batches: 0
   num_workers: 0
+  datasets: [QRA]
 
 generation:
   num_examples: 5
   steps: 128
   max_length: 1024
   output_dir: sft_answer_pipeline/reports
+  dataset: QRA
+
+compare_models:
+  pretrained:
+    checkpoint: null
+  QA:
+    checkpoint: sft_answer_pipeline/modelparameter/QA/best.pth
+  QAR:
+    checkpoint: sft_answer_pipeline/modelparameter/QAR/best.pth
+  QRA:
+    checkpoint: sft_answer_pipeline/modelparameter/QRA/best.pth

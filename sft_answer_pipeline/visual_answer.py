@@ -233,6 +233,7 @@ def main():
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT))
     parser.add_argument("--qa", action="store_true")
     parser.add_argument("--qar", action="store_true")
+    parser.add_argument("--qra", action="store_true")
     parser.add_argument("--test", action="store_true")
 
     parser.add_argument(
@@ -249,12 +250,14 @@ def main():
 
     args = parser.parse_args()
 
-    plot_all = not any([args.qa, args.qar, args.test])
+    plot_all = not any([args.qa, args.qar, args.qra, args.test])
 
     if plot_all or args.qa:
         plot_curve(args.root, "QA", args.out_dir, bin_size=args.bin_size, show_raw=args.show_raw)
     if plot_all or args.qar:
         plot_curve(args.root, "QAR", args.out_dir, bin_size=args.bin_size, show_raw=args.show_raw)
+    if plot_all or args.qra:
+        plot_curve(args.root, "QRA", args.out_dir, bin_size=args.bin_size, show_raw=args.show_raw)
     if plot_all or args.test:
         plot_test(args.root, args.out_dir)
 

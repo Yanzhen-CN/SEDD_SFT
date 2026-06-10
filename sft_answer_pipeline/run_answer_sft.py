@@ -67,9 +67,17 @@ def maybe_eval(config_path, config):
 def maybe_generate(config_path, config, runs):
     if not config.get("run", {}).get("generate_after_train", False):
         return
+    dataset = config.get("generation", {}).get("dataset")
+    if dataset:
+        run_cmd([sys.executable, SCRIPT_DIR / "generate_answer_examples.py", "--config", config_path, "--dataset", dataset])
+        return
+    seen = set()
     for run_name in runs:
-        if run_name in {"QA", "QAR"}:
-            run_cmd([sys.executable, SCRIPT_DIR / "generate_answer_examples.py", "--config", config_path, "--dataset", run_name])
+        dataset_name = config.get("runs", {}).get(run_name, {}).get("dataset", run_name)
+        if dataset_name in seen:
+            continue
+        seen.add(dataset_name)
+        run_cmd([sys.executable, SCRIPT_DIR / "generate_answer_examples.py", "--config", config_path, "--dataset", dataset_name])
 
 
 def maybe_visual(config):
@@ -78,7 +86,7 @@ def maybe_visual(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="One-command anchored QA/QAR SEDD SFT runner.")
+    parser = argparse.ArgumentParser(description="One-command anchored QA/QAR/QRA SEDD SFT runner.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--gpu", default=None, help="Optional CUDA_VISIBLE_DEVICES override, e.g. --gpu 0")
     parser.add_argument("--force-split", action="store_true", help="Regenerate data/S1K and data/S1K_light before pipeline prepare.")

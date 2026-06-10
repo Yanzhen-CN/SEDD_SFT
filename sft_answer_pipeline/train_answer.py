@@ -60,12 +60,13 @@ def set_seed(seed):
 
 
 def selected_runs(config, explicit_run):
+    available = list((config.get("runs") or {}).keys())
     if explicit_run:
         selected = explicit_run
     else:
         selected = config.get("run", {}).get("selected", "QA")
     if selected == "all":
-        return ["QA", "QAR"]
+        return available
     if isinstance(selected, list):
         return selected
     return [selected]
@@ -80,7 +81,8 @@ def build_loaders(config, run_name):
     dataset_name = config["runs"][run_name].get("dataset", run_name)
     data_dir = data_root / dataset_name
     max_length = int(config["model"].get("max_length", 512))
-    min_target_tokens = int(config["model"].get("min_target_tokens", 32))
+    per_mode = config["model"].get("min_target_tokens_by_mode", {}) or {}
+    min_target_tokens = int(per_mode.get(dataset_name, config["model"].get("min_target_tokens", 32)))
     train_cfg = config["training"]
 
     train_loader = make_answer_loader(
@@ -285,7 +287,7 @@ def train_one(config, run_name):
 def main():
     parser = argparse.ArgumentParser(description="Train answer-conditioned SEDD SFT.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--run", default=None, choices=["QA", "QAR"])
+    parser.add_argument("--run", default=None)
     args = parser.parse_args()
     config = load_config(args.config)
     for run_name in selected_runs(config, args.run):

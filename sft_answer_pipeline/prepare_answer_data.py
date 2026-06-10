@@ -1,16 +1,16 @@
 """
-Pipeline adapter for anchored QA / QAR SEDD SFT data.
+Pipeline adapter for anchored QA / QAR / QRA SEDD SFT data.
 
 This file no longer reads raw S1K directly. It reads root-level S1K_light rows from
 prepare_s1k_split.py and only converts them into segment masks:
-  QA:  train answer only
-  QAR: train reasoning + answer
+  QA:  question -> answer
+  QAR: question -> reasoning + answer
+  QRA: question + teacher reasoning -> answer
 """
 
 import argparse
 import json
 import sys
-import shutil
 from pathlib import Path
 
 import yaml
@@ -35,6 +35,7 @@ QAR_SEGMENT_ORDER = [
     "answer_label",
     "answer",
 ]
+QRA_SEGMENT_ORDER = QAR_SEGMENT_ORDER
 
 
 def load_config(path):
@@ -89,6 +90,29 @@ def make_qar_sample(row):
             "assistant_label": segment("\nAssistant:\n", False),
             "reasoning_label": segment("Reasoning:\n", False),
             "reasoning": segment(clean(row.get("reasoning")), True),
+            "answer_label": segment("\n\nAnswer:\n", False),
+            "answer": segment(clean(row.get("answer")), True),
+        },
+        "answer": clean(row.get("answer")),
+        "reasoning": clean(row.get("reasoning")),
+        "base_meta": _base_meta(row),
+    }
+    return sample
+
+
+def make_qra_sample(row):
+    sample = {
+        "id": row["id"],
+        "mode": "QRA",
+        "source_index": row.get("source_index"),
+        "split": row.get("split"),
+        "segment_order": QRA_SEGMENT_ORDER,
+        "segments": {
+            "user_label": segment("User: ", False),
+            "user": segment(clean(row.get("question")), False),
+            "assistant_label": segment("\nAssistant:\n", False),
+            "reasoning_label": segment("Reasoning:\n", False),
+            "reasoning": segment(clean(row.get("reasoning")), False),
             "answer_label": segment("\n\nAnswer:\n", False),
             "answer": segment(clean(row.get("answer")), True),
         },
@@ -218,8 +242,7 @@ def save_dataset(name, split_samples, output_dir, tokenizer, max_length, min_tar
         reports[split] = report
 
     base = Path(output_dir) / name
-    if base.exists():
-        shutil.rmtree(base)
+    base.mkdir(parents=True, exist_ok=True)
     for split, rows in splits.items():
         write_jsonl(base / f"{split}.jsonl", rows)
 
@@ -278,6 +301,7 @@ def build(config):
     builders = {
         "QA": make_qa_sample,
         "QAR": make_qar_sample,
+        "QRA": make_qra_sample,
     }
     split_samples = {name: {"train": [], "validation": [], "test": []} for name in builders}
     for split, rows in base_splits.items():
@@ -286,7 +310,7 @@ def build(config):
                 split_samples[name][split].append(fn(row))
 
     manifest = {
-        "format": "Pipeline adapter from S1K_light content rows to anchored QA/QAR segment masks.",
+        "format": "Pipeline adapter from S1K_light content rows to anchored QA/QAR/QRA segment masks.",
         "light_dir": str(light_dir),
         "base_manifest_summary": {
             "light_rows": base_manifest.get("light_rows") or base_manifest.get("base_rows"),
@@ -306,7 +330,7 @@ def build(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare anchored QA/QAR data from root-level split/base S1K rows.")
+    parser = argparse.ArgumentParser(description="Prepare anchored QA/QAR/QRA data from root-level split/base S1K rows.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     args = parser.parse_args()
     build(load_config(args.config))

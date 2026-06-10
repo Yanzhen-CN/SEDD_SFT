@@ -28,11 +28,13 @@ def load_filtered_samples(config, dataset_name, split, tokenizer, limit):
     from answer_dataset import AnswerSegmentDataset
 
     data_root = Path(config["data"].get("output_dir", SCRIPT_DIR / "data"))
+    per_mode = config["model"].get("min_target_tokens_by_mode", {}) or {}
+    min_target_tokens = int(per_mode.get(dataset_name, config["model"].get("min_target_tokens", 32)))
     dataset = AnswerSegmentDataset(
         data_root / dataset_name / f"{split}.jsonl",
         tokenizer,
         int(config["generation"].get("max_length", config["model"].get("max_length", 512))),
-        min_target_tokens=int(config["model"].get("min_target_tokens", 32)),
+        min_target_tokens=min_target_tokens,
         drop_overlength=bool(config["model"].get("drop_overlength", True)),
         write_report=bool(config["model"].get("write_load_reports", True)),
     )
@@ -45,7 +47,18 @@ def segment_text(sample, train=None):
     return sample_text(sample, train=train)
 
 
-def load_model_tuple(config, kind, device):
+def configured_models(config):
+    compare = config.get("compare_models")
+    if compare:
+        return compare
+    output_root = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter"))
+    models = {"pretrained": {"checkpoint": None}}
+    for name in (config.get("runs") or {}):
+        models[name] = {"checkpoint": str(output_root / name / "best.pth")}
+    return models
+
+
+def load_model_tuple(config, checkpoint_path, device):
     import graph_lib
     import noise_lib
     from model import SEDD
@@ -57,8 +70,8 @@ def load_model_tuple(config, kind, device):
     ema = ExponentialMovingAverage(model.parameters(), decay=float(config["training"].get("ema", 0.9999)))
     checkpoint = pretrained
 
-    if kind in ["QA", "QAR"]:
-        ckpt = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / kind / "best.pth"
+    if checkpoint_path:
+        ckpt = Path(checkpoint_path)
         if not ckpt.exists():
             return None
         state = torch.load(ckpt, map_location=device)
@@ -135,31 +148,42 @@ def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, ste
     }
 
 
+def generated_sections(dataset_name, row, completion):
+    default_reasoning = row.get("reasoning", "") if dataset_name == "QRA" else ""
+    sections = split_sections(completion, default_reasoning=default_reasoning)
+    if dataset_name == "QRA":
+        sections["reasoning"] = str(row.get("reasoning", "")).strip()
+    elif dataset_name == "QA":
+        sections["reasoning"] = ""
+    return sections
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate qualitative examples from pretrained/QA/QAR models.")
+    parser = argparse.ArgumentParser(description="Generate qualitative examples from pretrained/QA/QAR/QRA models.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--dataset", default="QAR", choices=["QA", "QAR"])
+    parser.add_argument("--dataset", default=None, choices=["QA", "QAR", "QRA"])
     args = parser.parse_args()
 
     config = load_config(args.config)
+    dataset_name = args.dataset or config.get("generation", {}).get("dataset", "QAR")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
 
     rows = load_filtered_samples(
         config,
-        args.dataset,
+        dataset_name,
         "test",
         tokenizer,
         int(config["generation"].get("num_examples", 5)),
     )
 
-    model_kinds = ["pretrained", "QA", "QAR"]
     loaded = {}
-    for kind in model_kinds:
-        model_tuple = load_model_tuple(config, kind if kind != "pretrained" else "pretrained", device)
+    for model_name, model_cfg in configured_models(config).items():
+        checkpoint = model_cfg.get("checkpoint") if isinstance(model_cfg, dict) else model_cfg
+        model_tuple = load_model_tuple(config, checkpoint, device)
         if model_tuple is not None:
-            loaded[kind] = model_tuple
+            loaded[model_name] = model_tuple
 
     records = []
     for idx, row in enumerate(rows):
@@ -175,24 +199,23 @@ def main():
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-            label = "pretrained" if model_name == "pretrained" else f"{model_name}-best"
-            generations[label] = split_sections(sample["generated_completion"])
+            generations[model_name] = generated_sections(dataset_name, row, sample["generated_completion"])
         records.append(
             make_generation_record(
                 row,
-                row.get("mode", args.dataset),
+                row.get("mode", dataset_name),
                 "test",
-                Path(config["data"].get("output_dir", SCRIPT_DIR / "data")) / args.dataset / "test.jsonl",
+                Path(config["data"].get("output_dir", SCRIPT_DIR / "data")) / dataset_name / "test.jsonl",
                 generations,
             )
         )
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))
-    write_generation_markdown(out_dir / f"answer_generation_{args.dataset}.md", f"Answer Generation {args.dataset}", records)
-    (out_dir / f"answer_generation_{args.dataset}.json").write_text(
+    write_generation_markdown(out_dir / f"answer_generation_{dataset_name}.md", f"Answer Generation {dataset_name}", records)
+    (out_dir / f"answer_generation_{dataset_name}.json").write_text(
         json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(f"Wrote {out_dir / f'answer_generation_{args.dataset}.md'}")
+    print(f"Wrote {out_dir / f'answer_generation_{dataset_name}.md'}")
 
 
 if __name__ == "__main__":
