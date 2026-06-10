@@ -40,6 +40,17 @@ def dataset_for_run(config, run_name):
     return config.get("runs", {}).get(run_name, {}).get("dataset", run_name)
 
 
+def compare_models(config, run_name):
+    models = config.get("compare_models")
+    if isinstance(models, dict) and models:
+        return models
+    output_root = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter"))
+    return {
+        "pretrained": {"checkpoint": None},
+        run_name: {"checkpoint": str(output_root / run_name / "best.pth")},
+    }
+
+
 def segment_text(sample, train=None):
     from answer_dataset import sample_text
     return sample_text(sample, train=train)
@@ -67,7 +78,7 @@ def load_filtered_samples(config, dataset_name, tokenizer, limit):
     return dataset.samples[:limit]
 
 
-def load_model_tuple(config, kind, run_name, device):
+def load_model_tuple(config, checkpoint, device):
     import graph_lib
     import noise_lib
     from model import SEDD
@@ -79,8 +90,8 @@ def load_model_tuple(config, kind, run_name, device):
     ema = ExponentialMovingAverage(model.parameters(), decay=float(config["training"].get("ema", 0.9999)))
     checkpoint = pretrained
 
-    if kind == run_name:
-        ckpt = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / run_name / "best.pth"
+    if checkpoint:
+        ckpt = Path(checkpoint)
         if not ckpt.exists():
             return None
         state = torch.load(ckpt, map_location=device)
@@ -155,10 +166,11 @@ def main():
     rows = load_filtered_samples(config, dataset_name, tokenizer, int(config["generation"].get("num_examples", 5)))
 
     loaded = {}
-    for kind in ["pretrained", run_name]:
-        model_tuple = load_model_tuple(config, kind if kind != "pretrained" else "pretrained", run_name, device)
+    for model_name, model_cfg in compare_models(config, run_name).items():
+        checkpoint = model_cfg.get("checkpoint") if isinstance(model_cfg, dict) else model_cfg
+        model_tuple = load_model_tuple(config, checkpoint, device)
         if model_tuple is not None:
-            loaded[kind] = model_tuple
+            loaded[model_name] = model_tuple
 
     records = []
     for idx, row in enumerate(rows):
@@ -175,10 +187,9 @@ def main():
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-            label = "pretrained" if model_name == "pretrained" else f"{model_name}-best"
             sections = split_sections(sample["completion"], default_reasoning=fixed_reasoning)
             sections["reasoning"] = fixed_reasoning.strip()
-            generations[label] = sections
+            generations[model_name] = sections
         records.append(
             make_generation_record(
                 row,

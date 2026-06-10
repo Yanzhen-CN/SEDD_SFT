@@ -33,6 +33,16 @@ runs:
     dataset: QRA
     cuda_visible_devices: null
 
+compare_models:
+  pretrained:
+    checkpoint: null
+  QA:
+    checkpoint: sft_reasoning_pipeline/modelparameter/QA/best.pth
+  QAR:
+    checkpoint: sft_reasoning_pipeline/modelparameter/QAR/best.pth
+  QRA:
+    checkpoint: sft_reasoning_pipeline/modelparameter/QRA/best.pth
+
 model:
   pretrained: louaaron/sedd-medium
   name: medium

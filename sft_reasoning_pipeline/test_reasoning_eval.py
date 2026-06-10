@@ -53,6 +53,17 @@ def selected_runs(config):
     return [selected]
 
 
+def compare_models(config):
+    models = config.get("compare_models")
+    if isinstance(models, dict) and models:
+        return models
+    output_root = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter"))
+    out = {"pretrained": {"checkpoint": None}}
+    for run_name in selected_runs(config):
+        out[run_name] = {"checkpoint": str(output_root / run_name / "best.pth")}
+    return out
+
+
 def make_loader(config, dataset_name, split, batch_size):
     from answer_dataset import make_answer_loader
 
@@ -87,16 +98,15 @@ def load_pretrained(config, device):
     return model, graph, noise, ema, model_name
 
 
-def load_best(config, run_name, device):
+def load_checkpoint(config, checkpoint, device):
     import graph_lib
     import noise_lib
     from model import SEDD
     from model.ema import ExponentialMovingAverage
 
-    model_dir = Path(config["results"].get("output_dir", SCRIPT_DIR / "modelparameter")) / run_name
-    ckpt_path = model_dir / "best.pth"
+    ckpt_path = Path(checkpoint)
     if not ckpt_path.exists():
-        print(f"Skip {run_name}-best: {ckpt_path} not found")
+        print(f"Skip checkpoint: {ckpt_path} not found")
         return None
     model = SEDD.from_pretrained(config["model"].get("pretrained", "louaaron/sedd-medium")).to(device)
     model.config.model.length = int(config["model"].get("max_length", model.config.model.length))
@@ -143,12 +153,15 @@ def main():
             del model_tuple
         cleanup()
 
-    for run_name in selected_runs(config):
-        model_tuple = load_best(config, run_name, device)
+    for model_name, model_cfg in compare_models(config).items():
+        if model_name == "pretrained":
+            continue
+        checkpoint = model_cfg.get("checkpoint") if isinstance(model_cfg, dict) else model_cfg
+        model_tuple = load_checkpoint(config, checkpoint, device)
         if model_tuple is None:
             continue
         try:
-            rows.extend(eval_model(config, f"{run_name}-best", model_tuple, datasets, device))
+            rows.extend(eval_model(config, model_name, model_tuple, datasets, device))
         finally:
             del model_tuple
             cleanup()
