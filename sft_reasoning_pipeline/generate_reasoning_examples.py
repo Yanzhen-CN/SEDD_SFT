@@ -78,7 +78,7 @@ def load_filtered_samples(config, dataset_name, tokenizer, limit):
     return dataset.samples[:limit]
 
 
-def load_model_tuple(config, checkpoint, device):
+def load_model_tuple(config, checkpoint_path, device):
     import graph_lib
     import noise_lib
     from model import SEDD
@@ -90,9 +90,10 @@ def load_model_tuple(config, checkpoint, device):
     ema = ExponentialMovingAverage(model.parameters(), decay=float(config["training"].get("ema", 0.9999)))
     checkpoint = pretrained
 
-    if checkpoint:
-        ckpt = Path(checkpoint)
+    if checkpoint_path:
+        ckpt = Path(checkpoint_path)
         if not ckpt.exists():
+            print(f"Skip checkpoint: {ckpt} not found", flush=True)
             return None
         state = torch.load(ckpt, map_location=device)
         model.load_state_dict(state["model"], strict=True)
@@ -171,6 +172,8 @@ def main():
         model_tuple = load_model_tuple(config, checkpoint, device)
         if model_tuple is not None:
             loaded[model_name] = model_tuple
+    if not loaded:
+        raise RuntimeError("No models were loaded for generation. Check compare_models checkpoint paths.")
 
     records = []
     for idx, row in enumerate(rows):
