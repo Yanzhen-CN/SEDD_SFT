@@ -299,6 +299,11 @@ def append_run_index(index_path: Path, row: Dict[str, Any]) -> None:
         "root_metrics",
         "root_debug",
         "root_run_info",
+        "global_best_updated",
+        "global_best_metric",
+        "global_best_metric_name",
+        "global_best_metric_mode",
+        "global_best_summary",
         "finished_at",
     ]
     exists = index_path.exists()
@@ -316,6 +321,175 @@ def append_run_index(index_path: Path, row: Dict[str, Any]) -> None:
             if fcntl is not None:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
+
+
+def _atomic_copy(src: Path, dst: Path) -> str:
+    """Copy through a temp file and replace atomically."""
+    if not src.exists():
+        return ""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + f".tmp.{os.getpid()}")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+    return str(dst)
+
+
+def _read_json_if_exists(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _metric_is_better(new_value: float, old_value: float | None, mode: str) -> bool:
+    if old_value is None:
+        return True
+    if mode.lower() in {"max", "higher", "higher_is_better"}:
+        return new_value > old_value
+    return new_value < old_value
+
+
+def _safe_float(value: Any, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def compute_selection_metric(best_loss: float, final_metrics: Dict[str, Any], cfg: Dict) -> Tuple[str, str, float]:
+    """Return (metric_name, mode, metric_value) for global-best comparison.
+
+    Default follows the SFT pipelines: lower best training loss wins.  For RRPI
+    you can override with, for example:
+
+      output:
+        best_metric: last_model_reward
+        best_metric_mode: max
+
+    Supported default names include best_loss, final_loss, and any metric key in
+    final_metrics such as model_reward, reward_gap, target_prob, etc.
+    """
+    output_cfg = cfg.get("output", {}) or {}
+    metric_name = str(output_cfg.get("best_metric", "best_loss"))
+    mode = str(output_cfg.get("best_metric_mode", "min"))
+
+    if metric_name == "best_loss":
+        value = float(best_loss)
+    elif metric_name == "final_loss":
+        value = _safe_float(final_metrics.get("loss"))
+    elif metric_name.startswith("last_"):
+        raw_name = metric_name[len("last_"):]
+        value = _safe_float(final_metrics.get(raw_name))
+    else:
+        value = _safe_float(final_metrics.get(metric_name))
+
+    if not np.isfinite(value):
+        # Fallback to loss so the global-best update never crashes just because
+        # a custom metric was absent from this run.
+        metric_name = "best_loss"
+        mode = "min"
+        value = float(best_loss)
+    return metric_name, mode, value
+
+
+def update_root_best_if_better(
+    *,
+    out_root: Path,
+    run_id: str,
+    run_name: str,
+    start_name: str,
+    run_dir: Path,
+    best_path: Path,
+    last_path: Path,
+    metrics_path: Path,
+    debug_path: Path,
+    run_info_path: Path,
+    best_loss: float,
+    final_metrics: Dict[str, Any],
+    cfg: Dict,
+) -> Dict[str, Any]:
+    """Atomically compare this finished run with the root best and promote if better.
+
+    This matches the usual SFT-pipeline behavior while remaining safe for
+    simultaneous runs: every process trains in its own directory; at the end it
+    grabs a root lock, compares its best metric with the current root best, and
+    only then updates root-level best.pth plus the matching metrics/debug/info.
+    """
+    out_root.mkdir(parents=True, exist_ok=True)
+    lock_path = out_root / ".global_best.lock"
+    summary_path = out_root / "best_summary.json"
+
+    metric_name, metric_mode, metric_value = compute_selection_metric(best_loss, final_metrics, cfg)
+    promoted = False
+    previous_value = None
+    previous_run = ""
+
+    with open(lock_path, "a+", encoding="utf-8") as lock_f:
+        if fcntl is not None:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        try:
+            old_summary = _read_json_if_exists(summary_path)
+            previous_run = str(old_summary.get("run_id", ""))
+            old_metric_name = str(old_summary.get("metric_name", metric_name))
+            old_metric_mode = str(old_summary.get("metric_mode", metric_mode))
+            # If user changes best_metric between runs, start a new comparison
+            # under the new metric rather than comparing incompatible numbers.
+            if old_metric_name == metric_name and old_metric_mode == metric_mode:
+                previous_value = old_summary.get("metric_value", None)
+                previous_value = None if previous_value is None else float(previous_value)
+            else:
+                previous_value = None
+
+            if _metric_is_better(metric_value, previous_value, metric_mode):
+                _atomic_copy(best_path, out_root / "best.pth")
+                _atomic_copy(last_path, out_root / "best_run_last.pth")
+                _atomic_copy(metrics_path, out_root / "best_metrics.csv")
+                _atomic_copy(debug_path, out_root / "best_rrpi_debug.jsonl")
+                _atomic_copy(run_info_path, out_root / "best_run_info.json")
+
+                best_summary = {
+                    "run_id": run_id,
+                    "run_name": run_name,
+                    "start": start_name,
+                    "run_dir": str(run_dir),
+                    "metric_name": metric_name,
+                    "metric_mode": metric_mode,
+                    "metric_value": metric_value,
+                    "best_loss": best_loss,
+                    "final_metrics": final_metrics,
+                    "best_ckpt": str(out_root / "best.pth"),
+                    "best_run_last_ckpt": str(out_root / "best_run_last.pth"),
+                    "best_metrics": str(out_root / "best_metrics.csv"),
+                    "best_debug": str(out_root / "best_rrpi_debug.jsonl"),
+                    "best_run_info": str(out_root / "best_run_info.json"),
+                    "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                }
+                tmp_summary = summary_path.with_suffix(".json.tmp")
+                tmp_summary.write_text(json.dumps(best_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+                os.replace(tmp_summary, summary_path)
+                promoted = True
+
+            # Also maintain last-finished artifacts as a separate namespace. This
+            # is useful for debugging, but it never decides the global best.
+            _atomic_copy(last_path, out_root / "last_finished.pth")
+            _atomic_copy(metrics_path, out_root / "last_finished_metrics.csv")
+            _atomic_copy(debug_path, out_root / "last_finished_rrpi_debug.jsonl")
+            _atomic_copy(run_info_path, out_root / "last_finished_run_info.json")
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    return {
+        "promoted": promoted,
+        "metric_name": metric_name,
+        "metric_mode": metric_mode,
+        "metric_value": metric_value,
+        "previous_metric_value": previous_value,
+        "previous_run_id": previous_run,
+        "summary_path": str(summary_path),
+    }
 
 def print_debug_record(step: int, record: Dict[str, Any], max_rows: int = 8) -> None:
     print(f"\n[RRPI DEBUG step={step}]", flush=True)
@@ -491,9 +665,11 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
     final_metrics = row if "row" in locals() else {"loss": best_loss}
     save_checkpoint(last_path, model, ema, optimizer, cfg, steps, final_metrics)
 
-    # Parallel-safe root-level export.
-    # Each process exports to run-specific filenames only after it finishes, so
-    # different runs do not overwrite each other's root artifacts.
+    # Root-level export and global-best promotion.
+    # Each run still keeps its full private run_dir.  In addition, it exports
+    # run-specific artifacts to the root for easy plotting, then atomically
+    # compares against the current root best.  Only a better run updates
+    # root-level best.pth / best_metrics.csv / best_rrpi_debug.jsonl / best_run_info.json.
     root_best = out_root / f"{run_id}_best.pth"
     root_last = out_root / f"{run_id}_last.pth"
     root_metrics = out_root / f"{run_id}_metrics.csv"
@@ -506,12 +682,21 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
     root_debug_s = safe_copy(debug_path, root_debug)
     root_info_s = safe_copy(run_info_path, root_info)
 
-    # Optional legacy generic sync. Disabled by default because it is unsafe for
-    # simultaneous runs. Enable only when running a single process.
-    output_cfg = cfg.get("output", {}) or {}
-    if bool(output_cfg.get("sync_generic_best_last", False)):
-        sync_checkpoint(best_path, out_root / "best.pth")
-        sync_checkpoint(last_path, out_root / "last.pth")
+    best_update = update_root_best_if_better(
+        out_root=out_root,
+        run_id=run_id,
+        run_name=run_name,
+        start_name=start_name,
+        run_dir=out_dir,
+        best_path=best_path,
+        last_path=last_path,
+        metrics_path=metrics_path,
+        debug_path=debug_path,
+        run_info_path=run_info_path,
+        best_loss=best_loss,
+        final_metrics=final_metrics,
+        cfg=cfg,
+    )
 
     append_run_index(
         out_root / "runs_index.csv",
@@ -534,15 +719,34 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
             "root_metrics": root_metrics_s,
             "root_debug": root_debug_s,
             "root_run_info": root_info_s,
+            "global_best_updated": str(bool(best_update.get("promoted"))),
+            "global_best_metric": best_update.get("metric_value", ""),
+            "global_best_metric_name": best_update.get("metric_name", ""),
+            "global_best_metric_mode": best_update.get("metric_mode", ""),
+            "global_best_summary": best_update.get("summary_path", ""),
             "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
         },
     )
 
     print(f"Done. Outputs: {out_dir}", flush=True)
-    print(f"Exported root artifacts with prefix: {out_root / run_id}", flush=True)
+    print(f"Exported run artifacts with prefix: {out_root / run_id}", flush=True)
     print(f"Run index: {out_root / 'runs_index.csv'}", flush=True)
-    if not bool(output_cfg.get("sync_generic_best_last", False)):
-        print("Generic best.pth/last.pth were not overwritten. Set output.sync_generic_best_last=true for single-run legacy sync.", flush=True)
+    if best_update.get("promoted"):
+        print(
+            f"[GLOBAL BEST UPDATED] {run_id} -> {out_root / 'best.pth'} "
+            f"({best_update.get('metric_name')}={float(best_update.get('metric_value')):.6g}, "
+            f"mode={best_update.get('metric_mode')})",
+            flush=True,
+        )
+        print(f"Best metrics: {out_root / 'best_metrics.csv'}", flush=True)
+        print(f"Best summary: {out_root / 'best_summary.json'}", flush=True)
+    else:
+        print(
+            f"[GLOBAL BEST KEPT] current root best is better. "
+            f"this_run {best_update.get('metric_name')}={float(best_update.get('metric_value')):.6g}; "
+            f"previous={best_update.get('previous_metric_value')} run={best_update.get('previous_run_id')}",
+            flush=True,
+        )
     return out_dir
 
 
