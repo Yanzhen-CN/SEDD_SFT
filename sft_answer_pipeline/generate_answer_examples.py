@@ -11,6 +11,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 sys.path.insert(0, str(REPO_DIR))
 DEFAULT_CONFIG = SCRIPT_DIR / "answer_config.yaml"
+from generation_schema import (  # noqa: E402
+    completion_from_full_text,
+    make_generation_record,
+    split_sections,
+    write_generation_markdown,
+)
 
 
 def load_config(path):
@@ -37,41 +43,6 @@ def segment_text(sample, train=None):
     from answer_dataset import sample_text
 
     return sample_text(sample, train=train)
-
-
-def assistant_completion(sample):
-    """Return text after the fixed `Assistant:` header, including fixed anchors.
-
-    This is important when `Reasoning:` and `Answer:` are train=False anchors:
-    `sample_text(train=True)` contains only the generated contents and therefore
-    cannot show the section boundary.
-    """
-    from answer_dataset import ordered_segments
-
-    parts = []
-    seen_assistant = False
-    for name, segment in ordered_segments(sample):
-        if seen_assistant:
-            parts.append(segment.get("text", ""))
-        if name == "assistant_label":
-            seen_assistant = True
-    return "".join(parts)
-
-
-def segment_value(sample, name, default=""):
-    segment = sample.get("segments", {}).get(name)
-    if not segment:
-        return default
-    return segment.get("text", default)
-
-
-def completion_from_full_text(text):
-    raw = str(text or "")
-    marker = "Assistant:"
-    idx = raw.find(marker)
-    if idx >= 0:
-        return raw[idx + len(marker):].strip()
-    return raw.strip()
 
 
 def load_model_tuple(config, kind, device):
@@ -164,35 +135,6 @@ def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, ste
     }
 
 
-def write_report(path, records):
-    lines = ["# Answer SFT Generation Examples", ""]
-    lines.append("Each generated section is stitched back into the fixed assistant scaffold. Read the completion blocks, not the raw target-only string.")
-    lines.append("")
-    for item in records:
-        lines.append(f"## {item['id']}")
-        lines.append("")
-        lines.append(f"Mode: `{item.get('mode', '')}`")
-        lines.append("")
-        lines.append("### Question")
-        lines.append("```text")
-        lines.append(item["question"].strip())
-        lines.append("```")
-        lines.append("")
-        lines.append("### GT")
-        lines.append("```text")
-        lines.append(item["reference_completion"].strip())
-        lines.append("```")
-        lines.append("")
-        for model_name, result in item["generations"].items():
-            lines.append(f"### {model_name}")
-            lines.append("```text")
-            lines.append(result["completion"].strip())
-            lines.append("```")
-            lines.append("")
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text("\n".join(lines), encoding="utf-8")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Generate qualitative examples from pretrained/QA/QAR models.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
@@ -221,17 +163,7 @@ def main():
 
     records = []
     for idx, row in enumerate(rows):
-        item = {
-            "id": row.get("id", str(idx)),
-            "mode": row.get("mode", args.dataset),
-            "question": segment_value(row, "user"),
-            "prompt": segment_text(row, train=False),
-            "reference_target": segment_text(row, train=True),
-            "reference_completion": assistant_completion(row),
-            "answer": row.get("answer", ""),
-            "reasoning": row.get("reasoning", ""),
-            "generations": {},
-        }
+        generations = {}
         for model_name, (model, graph, noise, _) in loaded.items():
             sample = sample_segment_infilling(
                 model,
@@ -243,15 +175,20 @@ def main():
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-            item["generations"][model_name] = {
-                "completion": sample["generated_completion"],
-                "target": sample["generated_target"],
-                "full": sample["generated_full"],
-            }
-        records.append(item)
+            label = "pretrained" if model_name == "pretrained" else f"{model_name}-best"
+            generations[label] = split_sections(sample["generated_completion"])
+        records.append(
+            make_generation_record(
+                row,
+                row.get("mode", args.dataset),
+                "test",
+                Path(config["data"].get("output_dir", SCRIPT_DIR / "data")) / args.dataset / "test.jsonl",
+                generations,
+            )
+        )
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))
-    write_report(out_dir / f"answer_generation_{args.dataset}.md", records)
+    write_generation_markdown(out_dir / f"answer_generation_{args.dataset}.md", f"Answer Generation {args.dataset}", records)
     (out_dir / f"answer_generation_{args.dataset}.json").write_text(
         json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8"
     )

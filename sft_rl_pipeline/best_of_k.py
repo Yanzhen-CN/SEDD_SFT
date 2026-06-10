@@ -6,6 +6,7 @@ import torch
 from transformers import GPT2TokenizerFast
 
 from reward import score_answer
+from generation_schema import make_generation_record, split_sections, write_generation_markdown
 
 
 def numeric_reward_components(reward):
@@ -76,6 +77,7 @@ def main():
                 # QAR, generated_target omits fixed labels such as Reasoning:/Answer:.
                 score_text = generated["generated_completion"]
                 display_answer = generated["generated_completion"]
+                sections = generated.get("generated_sections") or split_sections(display_answer)
                 target_only = generated["generated_target"]
             else:
                 score_text = sample_answer(
@@ -90,6 +92,7 @@ def main():
                     device,
                 )
                 display_answer = score_text
+                sections = split_sections(display_answer)
                 target_only = score_text
             reward = score_answer(score_text, reference_completion, config.get("reward", {}))
             candidates.append(
@@ -98,31 +101,36 @@ def main():
                     "answer": score_text,
                     "target_only": target_only,
                     "display_answer": display_answer,
+                    "sections": sections,
                     "reward": reward,
                 }
             )
 
         best = max(candidates, key=lambda row: row["reward"]["score"])
         first = candidates[0]
-        record = {
-            "id": sample.get("id", str(idx)),
-            "checkpoint": checkpoint,
-            "format_note": "Anchored QAR: fixed Reasoning:/Answer: labels; generated contents are scored through the full assistant completion.",
-            "prompt": prompt,
-            "reference": reference_completion,
+        record = make_generation_record(
+            sample,
+            sample.get("mode", "QAR"),
+            split,
+            Path(config["data"]["data_dir"]) / f"{split}.jsonl",
+            {
+                "first": first["sections"],
+                "best": best["sections"],
+            },
+        )
+        record["checkpoint"] = checkpoint
+        record["generation_metrics"] = {
             "first_reward": first["reward"]["score"],
             "best_reward": best["reward"]["score"],
             "reward_gain": best["reward"]["score"] - first["reward"]["score"],
             "first_components": numeric_reward_components(first["reward"]),
             "best_components": numeric_reward_components(best["reward"]),
-            "first_answer": first.get("display_answer", first["answer"]),
-            "best_answer": best.get("display_answer", best["answer"]),
-            "candidates": candidates,
         }
+        record["candidates"] = candidates
         rows.append(record)
         print(
-            f"{record['id']}: first={record['first_reward']:.3f}, "
-            f"best={record['best_reward']:.3f}, gain={record['reward_gain']:.3f}"
+            f"{record['id']}: first={record['generation_metrics']['first_reward']:.3f}, "
+            f"best={record['generation_metrics']['best_reward']:.3f}, gain={record['generation_metrics']['reward_gain']:.3f}"
         )
 
     out_dir = Path(config["results"].get("report_dir", "sft_rl_pipeline/reports"))
@@ -133,11 +141,11 @@ def main():
 
     summary = {
         "num_examples": len(rows),
-        "mean_first_reward": sum(row["first_reward"] for row in rows) / max(1, len(rows)),
-        "mean_best_reward": sum(row["best_reward"] for row in rows) / max(1, len(rows)),
-        "mean_reward_gain": sum(row["reward_gain"] for row in rows) / max(1, len(rows)),
-        "mean_first_components": mean_dict([row.get("first_components", {}) for row in rows]),
-        "mean_best_components": mean_dict([row.get("best_components", {}) for row in rows]),
+        "mean_first_reward": sum(row["generation_metrics"]["first_reward"] for row in rows) / max(1, len(rows)),
+        "mean_best_reward": sum(row["generation_metrics"]["best_reward"] for row in rows) / max(1, len(rows)),
+        "mean_reward_gain": sum(row["generation_metrics"]["reward_gain"] for row in rows) / max(1, len(rows)),
+        "mean_first_components": mean_dict([row["generation_metrics"].get("first_components", {}) for row in rows]),
+        "mean_best_components": mean_dict([row["generation_metrics"].get("best_components", {}) for row in rows]),
     }
     summary_path = out_dir / f"best_of_k_{run_name}_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -145,11 +153,11 @@ def main():
     md = [
         "# SFT-RL Best-of-K Anchored QAR",
         "",
-        "QAR completion view is `Reasoning: ... Answer: ...`; the labels may be fixed anchors, so candidates are scored on the assistant completion rather than target-only tokens.",
+        "JSON records use the common generation schema. Reward summaries are below.",
         "",
     ]
     if rows:
-        avg_gain = sum(row["reward_gain"] for row in rows) / len(rows)
+        avg_gain = sum(row["generation_metrics"]["reward_gain"] for row in rows) / len(rows)
         md.append(f"Average reward gain over first sample: `{avg_gain:.4f}`")
         md.append(f"Mean first reward: `{summary['mean_first_reward']:.4f}`")
         md.append(f"Mean best reward: `{summary['mean_best_reward']:.4f}`")
@@ -159,35 +167,9 @@ def main():
         md.append(json.dumps({"first": summary["mean_first_components"], "best": summary["mean_best_components"]}, ensure_ascii=False, indent=2))
         md.append("```")
         md.append("")
-    for row in rows:
-        md.extend(
-            [
-                f"## {row['id']}",
-                "",
-                f"first reward: `{row['first_reward']:.4f}`",
-                f"best reward: `{row['best_reward']:.4f}`",
-                "",
-                "### Prompt",
-                "```text",
-                row["prompt"],
-                "```",
-                "### Reference assistant completion",
-                "```text",
-                row["reference"],
-                "```",
-                "### First",
-                "```text",
-                row["first_answer"],
-                "```",
-                "### Best",
-                "```text",
-                row["best_answer"],
-                "```",
-                "",
-            ]
-        )
     md_path = out_dir / f"best_of_k_{run_name}.md"
-    md_path.write_text("\n".join(md), encoding="utf-8")
+    md_path.write_text("\n".join(md) + "\n\n", encoding="utf-8")
+    write_generation_markdown(out_dir / f"best_of_k_{run_name}_examples.md", "SFT-RL Best-of-K Examples", rows)
     print(f"Wrote {json_path}")
     print(f"Wrote {summary_path}")
     print(f"Wrote {md_path}")

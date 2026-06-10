@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 from transformers import GPT2TokenizerFast
 
+from generation_schema import make_generation_record, write_generation_markdown
 from reward import score_answer
 from rl_utils import (
     DEFAULT_CONFIG,
@@ -82,18 +83,22 @@ def main():
         reward = score_answer(generated["generated_completion"], reference_completion, config.get("reward", {}))
         comp = numeric_components(reward)
         components.append(comp)
-        row = {
-            "id": sample.get("id", str(idx)),
-            "checkpoint": checkpoint,
+        row = make_generation_record(
+            sample,
+            sample.get("mode", "QAR"),
+            split,
+            Path(config["data"]["data_dir"]) / f"{split}.jsonl",
+            {"generated": generated.get("generated_sections") or {"reasoning": "", "answer": generated["generated_completion"]}},
+        )
+        row["checkpoint"] = checkpoint
+        row["generation_metrics"] = {
             "score": reward["score"],
             "base_score": reward.get("base_score", reward["score"]),
             "fatal_multiplier": reward.get("fatal_multiplier", 1.0),
-            "generated_completion": generated["generated_completion"],
-            "reference_completion": reference_completion,
             "components": comp,
         }
         rows.append(row)
-        print(f"{row['id']}: reward={row['score']:.4f} fatal={row['fatal_multiplier']:.2f}")
+        print(f"{row['id']}: reward={row['generation_metrics']['score']:.4f} fatal={row['generation_metrics']['fatal_multiplier']:.2f}")
 
     summary = {
         "checkpoint": checkpoint,
@@ -101,9 +106,9 @@ def main():
         "split": split,
         "num_examples": len(rows),
         "steps": steps,
-        "mean_reward": sum(r["score"] for r in rows) / max(1, len(rows)),
-        "mean_base_score": sum(r["base_score"] for r in rows) / max(1, len(rows)),
-        "mean_fatal_multiplier": sum(r["fatal_multiplier"] for r in rows) / max(1, len(rows)),
+        "mean_reward": sum(r["generation_metrics"]["score"] for r in rows) / max(1, len(rows)),
+        "mean_base_score": sum(r["generation_metrics"]["base_score"] for r in rows) / max(1, len(rows)),
+        "mean_fatal_multiplier": sum(r["generation_metrics"]["fatal_multiplier"] for r in rows) / max(1, len(rows)),
         "mean_components": mean_dict(components),
     }
 
@@ -111,9 +116,11 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = args.tag or Path(str(checkpoint)).stem.replace(".", "_")
     json_path = out_dir / f"generation_reward_{tag}.json"
+    md_path = out_dir / f"generation_reward_{tag}.md"
     summary_path = out_dir / f"generation_reward_{tag}_summary.json"
     csv_path = out_dir / f"generation_reward_{tag}_summary.csv"
     json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_generation_markdown(md_path, "Generation Reward Examples", rows)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         fieldnames = ["checkpoint", "config", "split", "num_examples", "steps", "mean_reward", "mean_base_score", "mean_fatal_multiplier"] + [f"component_{k}" for k in summary["mean_components"]]
@@ -123,6 +130,7 @@ def main():
         flat.update({f"component_{k}": v for k, v in summary["mean_components"].items()})
         writer.writerow(flat)
     print(f"Wrote {json_path}")
+    print(f"Wrote {md_path}")
     print(f"Wrote {summary_path}")
     print(f"Wrote {csv_path}")
 

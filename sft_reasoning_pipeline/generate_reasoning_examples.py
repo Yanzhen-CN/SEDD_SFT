@@ -14,6 +14,12 @@ sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(ANSWER_PIPELINE_DIR))
 
 DEFAULT_CONFIG = SCRIPT_DIR / "reasoning_config.yaml"
+from generation_schema import (  # noqa: E402
+    completion_from_full_text,
+    make_generation_record,
+    split_sections,
+    write_generation_markdown,
+)
 
 
 def load_config(path):
@@ -44,28 +50,6 @@ def segment_value(sample, name, default=""):
     if not segment:
         return default
     return segment.get("text", default)
-
-
-def assistant_completion(sample):
-    from answer_dataset import ordered_segments
-
-    parts = []
-    seen_assistant = False
-    for name, segment in ordered_segments(sample):
-        if seen_assistant:
-            parts.append(segment.get("text", ""))
-        if name == "assistant_label":
-            seen_assistant = True
-    return "".join(parts)
-
-
-def completion_from_full_text(text):
-    raw = str(text or "")
-    marker = "Assistant:"
-    idx = raw.find(marker)
-    if idx >= 0:
-        return raw[idx + len(marker):].strip()
-    return raw.strip()
 
 
 def load_filtered_samples(config, dataset_name, tokenizer, limit):
@@ -157,33 +141,6 @@ def sample_infilling(model, graph, noise, tokenizer, sample, length, steps, devi
     }
 
 
-def write_report(path, records, run_name):
-    lines = [f"# {run_name} Generation Examples", ""]
-    lines.append("Generated answer tokens are stitched back into the fixed QRA scaffold for display.")
-    lines.append("")
-    for item in records:
-        lines.append(f"## {item['id']}")
-        lines.append("")
-        lines.append("### Question")
-        lines.append("```text")
-        lines.append(item["question"].strip())
-        lines.append("```")
-        lines.append("")
-        lines.append("### GT")
-        lines.append("```text")
-        lines.append(item["reference_completion"].strip())
-        lines.append("```")
-        lines.append("")
-        for model_name, result in item["generations"].items():
-            lines.append(f"### {model_name}")
-            lines.append("```text")
-            lines.append(result["completion"].strip())
-            lines.append("```")
-            lines.append("")
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text("\n".join(lines), encoding="utf-8")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Generate QRA examples: fixed teacher reasoning -> answer.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
@@ -205,17 +162,10 @@ def main():
 
     records = []
     for idx, row in enumerate(rows):
-        item = {
-            "id": row.get("id", str(idx)),
-            "question": segment_value(row, "user"),
-            "teacher_reasoning": segment_value(row, "reasoning"),
-            "prompt": segment_text(row, train=False),
-            "reference": segment_text(row, train=True),
-            "reference_completion": assistant_completion(row),
-            "generations": {},
-        }
+        generations = {}
+        fixed_reasoning = row.get("reasoning", "") or segment_value(row, "reasoning")
         for model_name, (model, graph, noise, _) in loaded.items():
-            item["generations"][model_name] = sample_infilling(
+            sample = sample_infilling(
                 model,
                 graph,
                 noise,
@@ -225,10 +175,22 @@ def main():
                 int(config["generation"].get("steps", 128)),
                 device,
             )
-        records.append(item)
+            label = "pretrained" if model_name == "pretrained" else f"{model_name}-best"
+            sections = split_sections(sample["completion"], default_reasoning=fixed_reasoning)
+            sections["reasoning"] = fixed_reasoning.strip()
+            generations[label] = sections
+        records.append(
+            make_generation_record(
+                row,
+                row.get("mode", dataset_name),
+                "test",
+                Path(config["data"].get("output_dir", SCRIPT_DIR / "data")) / dataset_name / "test.jsonl",
+                generations,
+            )
+        )
 
     out_dir = Path(config["generation"].get("output_dir", SCRIPT_DIR / "reports"))
-    write_report(out_dir / f"reasoning_answer_generation_{run_name}.md", records, run_name)
+    write_generation_markdown(out_dir / f"reasoning_answer_generation_{run_name}.md", f"{run_name} Generation", records)
     (out_dir / f"reasoning_answer_generation_{run_name}.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Wrote {out_dir / f'reasoning_answer_generation_{run_name}.md'}", flush=True)
 

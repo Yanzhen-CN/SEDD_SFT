@@ -12,6 +12,7 @@ REPO_DIR = SCRIPT_DIR.parent
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_config.yaml"
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(REPO_DIR / "sft_answer_pipeline"))
+from generation_schema import assistant_completion, completion_from_full_text, gt_sections, split_sections  # noqa: E402
 
 
 def load_config(path=DEFAULT_CONFIG):
@@ -48,27 +49,6 @@ def segment_text(sample, train=None):
     from answer_dataset import sample_text
 
     return sample_text(sample, train=train)
-
-
-def assistant_completion(sample):
-    """Text after Assistant:, including fixed anchors and generated contents."""
-    parts = []
-    seen_assistant = False
-    for name, seg in ordered_segments(sample):
-        if seen_assistant:
-            parts.append(seg.get("text", ""))
-        if name == "assistant_label":
-            seen_assistant = True
-    return "".join(parts)
-
-
-def completion_from_full_text(text):
-    raw = str(text or "")
-    marker = "Assistant:"
-    idx = raw.find(marker)
-    if idx >= 0:
-        return raw[idx + len(marker):].strip()
-    return raw.strip()
 
 
 def prompt_until_assistant(sample):
@@ -223,6 +203,7 @@ def sample_segment_infilling(model, graph, noise, tokenizer, sample, length, min
         "reference_completion": assistant_completion(sample),
         "generated": full_text.strip(),
         "generated_completion": completion_from_full_text(full_text),
+        "generated_sections": split_sections(completion_from_full_text(full_text)),
         "generated_target": generated_target.strip(),
         "segment_token_lens": segment_token_lens,
     }
