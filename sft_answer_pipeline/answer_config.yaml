@@ -74,7 +74,7 @@ eval:
   batch_size: 1
   eval_batches: 0
   num_workers: 0
-  datasets: [QRA]
+  datasets: [QA,QAR,QRA]
 
 generation:
   num_examples: 5
