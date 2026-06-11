@@ -483,7 +483,7 @@ def update_global_best(
 ) -> bool:
     """Root stays clean: only global-best files are kept at out_root.
 
-    The individual run keeps all artifacts under out_root/runs/<run_id>/.
+    The individual run keeps all artifacts under out_root/<run_id>/.
     At the end of a run, compare the configured validation metric against root best_metrics.json.
     The default metric is eval_loss with mode=min.
     """
@@ -542,8 +542,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_run = str(run_name).replace("/", "_").replace(" ", "_")
     run_id = f"{stamp}_{safe_run}_pid{os.getpid()}"
-    # Keep root clean. All per-run artifacts live under runs/<run_id>/.
-    out_dir = out_root / "runs" / run_id
+    # Keep root clean. All per-run artifacts live under <run_id>/.
+    out_dir = out_root / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = GPT2TokenizerFast.from_pretrained(cfg["model"].get("tokenizer", "gpt2"))
