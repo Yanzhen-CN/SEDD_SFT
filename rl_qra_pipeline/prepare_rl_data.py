@@ -647,7 +647,7 @@ def build_dataset(args: argparse.Namespace) -> Dict[str, Any]:
     stats["final_split_counts"] = final_counts
     stats["synthetic_total"] = synth_total
     stats["synthetic_fraction_final"] = round(synth_total / max(1, final_total), 4)
-    stats["note"] = "S1F_RL = filtered copy of QRA plus synthetic hard short-answer cases. Real QRA samples are not re-split."
+    stats["note"] = "S1K_RL = filtered copy of QRA plus synthetic hard short-answer cases. Real QRA samples are not re-split."
 
     write_json(output_dir / "build_report.json", stats)
     return stats
@@ -656,9 +656,9 @@ def build_dataset(args: argparse.Namespace) -> Dict[str, Any]:
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
     repo_dir = script_dir.parent
-    parser = argparse.ArgumentParser(description="Build S1F_RL by filtering QRA and adding synthetic hard final-answer cases.")
+    parser = argparse.ArgumentParser(description="Build S1K_RL by filtering QRA and adding synthetic hard final-answer cases.")
     parser.add_argument("--input-dir", type=str, default=str(script_dir / "data" / "QRA"))
-    parser.add_argument("--output-dir", type=str, default=str(script_dir / "data" / "S1F_RL"))
+    parser.add_argument("--output-dir", type=str, default=str(script_dir / "data" / "S1K_RL"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--synthetic-final-fraction", type=float, default=0.35,
                         help="Target fraction of synthetic examples in the final dataset. Default 0.35.")
