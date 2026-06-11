@@ -99,8 +99,8 @@ rollout:
   action_topk: 32
   max_candidates_per_position: 48
   include_gt_candidates: true
-  include_current_candidate: false
-  allow_noop_action: false
+  include_current_candidate: true
+  allow_noop_action: true
   sample_temperature: 1.20
   eps: 1.0e-12
 
