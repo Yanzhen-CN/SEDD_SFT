@@ -534,6 +534,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         agg = {k: 0.0 for k in numeric_keys}
         debug_records: List[Dict[str, Any]] = []
         valid = 0
+        already_backward_count = 0
+        logged_loss_values: List[float] = []
         for _ in range(batch_size):
             sample = next(sample_iter)
             try:
@@ -541,7 +543,18 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
             except Exception as exc:
                 print(f"[warn] skip sample {sample.get('id', '')}: {exc}", flush=True)
                 continue
-            losses.append(loss_i)
+            if bool(stats_i.get("_already_backward", False)):
+                already_backward_count += 1
+                try:
+                    logged_loss_values.append(float(loss_i.detach().item()))
+                except Exception:
+                    pass
+            else:
+                losses.append(loss_i)
+                try:
+                    logged_loss_values.append(float(loss_i.detach().item()))
+                except Exception:
+                    pass
             valid += 1
             for k in numeric_keys:
                 if k in stats_i:
@@ -550,17 +563,22 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                     except Exception:
                         pass
             debug_records.extend(stats_i.get("debug_records", []) or [])
-        if not losses:
+        if not losses and valid <= 0:
             continue
 
-        loss = torch.stack(losses).mean()
-        loss.backward()
+        if losses:
+            loss = torch.stack(losses).mean()
+            loss.backward()
+            loss_value = float(loss.detach().item())
+        else:
+            # Memory-safe rollout already called backward per rollout step.
+            loss_value = float(sum(logged_loss_values) / max(1, len(logged_loss_values)))
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
         ema.update(model.parameters())
 
-        row = {"step": step, "loss": float(loss.detach().item()), "lr": lr}
+        row = {"step": step, "loss": loss_value, "lr": lr}
         for k, v in agg.items():
             row[k] = v / max(1, valid)
         last_row = row

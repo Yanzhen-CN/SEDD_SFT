@@ -14,7 +14,9 @@ rl:
 model:
   pretrained: louaaron/sedd-medium
   tokenizer: gpt2
-  max_length: 1024
+  # 1024 is possible on larger cards, but rollout RL is much heavier than SFT
+  # because one sample contains many reverse-time forwards.  Use 768 first; lower to 512 only if a single replay step still OOM.
+  max_length: 768
   min_target_tokens: 1
   drop_overlength: true
   write_load_reports: false
@@ -83,6 +85,9 @@ rrpi:
 
 rollout:
   # Real generate-chain RL: answer all-mask -> repeated reverse actions.
+  # Memory-safe replay samples the chain with no_grad, then replays each action
+  # one-by-one with grad.  This prevents storing all rollout-step graphs.
+  memory_safe_replay: true
   steps: 32
   num_rollouts: 1
   mode: sample
@@ -96,8 +101,8 @@ rollout:
 
   # Joint action policy over (answer slot, token).  We restrict candidates to
   # avoid full-vocab reward hacking, but still include model top-k.
-  action_topk: 32
-  max_candidates_per_position: 48
+  action_topk: 16
+  max_candidates_per_position: 24
   include_gt_candidates: true
   include_current_candidate: true
   allow_noop_action: true

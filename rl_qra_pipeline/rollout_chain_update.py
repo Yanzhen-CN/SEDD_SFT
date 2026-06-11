@@ -39,6 +39,7 @@ class RolloutAction:
 class RolloutRecord:
     step: int
     t: float
+    x_before_ids: List[int]
     before_ids: List[int]
     after_ids: List[int]
     before_answer: str
@@ -315,6 +316,9 @@ def rollout_answer_chain_with_logprob(
 
     for step, t_value in enumerate(t_values):
         t = torch.tensor([[float(t_value)]], dtype=torch.float32, device=device)
+        # Store the full discrete state on CPU for optional memory-safe replay.
+        # This is cheap (length <= max_length) and avoids keeping 32 transformer graphs alive.
+        x_before_full = [int(v) for v in x[0].detach().cpu().tolist()]
         before_ids = _answer_ids_from_state(x[0], answer_positions)
         before_answer = _decode_answer_ids(tokenizer, before_ids, mask_id)
 
@@ -384,6 +388,7 @@ def rollout_answer_chain_with_logprob(
             RolloutRecord(
                 step=int(step),
                 t=float(t_value),
+                x_before_ids=x_before_full,
                 before_ids=before_ids,
                 after_ids=after_ids,
                 before_answer=before_answer,
@@ -419,6 +424,71 @@ def _compute_returns_advantages(rewards: Sequence[float], cfg: Dict[str, Any], d
     return normalize_advantages(values, clip=clip, device=device, dtype=dtype)
 
 
+
+
+def _recompute_action_terms_from_state(
+    model,
+    graph,
+    noise,
+    tokenizer,
+    sample: Dict[str, Any],
+    cfg: Dict[str, Any],
+    device: torch.device,
+    rec: RolloutRecord,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Recompute logprob/entropy/anchor for one recorded action with grad.
+
+    The first rollout pass can be run under no_grad to choose actions and rewards.
+    This function then replays exactly one recorded state/action and immediately
+    builds the differentiable logprob graph for that single step.  This is much
+    cheaper than keeping all rollout-step graphs alive during generation.
+    """
+    model_cfg = cfg.get("model", {})
+    r_cfg = cfg.get("rollout", {})
+    max_length = int(model_cfg.get("max_length", 1024))
+    encoded = encode_sample(sample, tokenizer, max_length, tokenizer.eos_token_id)
+    answer_positions = [p for p in encoded.layout.answer_positions if p < encoded.layout.real_len]
+    gt_answer = extract_answer_section(encoded.reference_completion)
+    gt_spec = parse_answer_spec(gt_answer)
+    gt_answer_ids = [int(encoded.ids[p]) for p in answer_positions]
+
+    x = torch.tensor([rec.x_before_ids], dtype=torch.long, device=device)
+    t = torch.tensor([[float(rec.t)]], dtype=torch.float32, device=device)
+    probs = transition_probs(
+        model,
+        graph,
+        noise,
+        x,
+        t,
+        float(r_cfg.get("step_size", 1e-5)),
+        str(r_cfg.get("transition_kind", "analytic")),
+        train=True,
+        fixed_locs=encoded.layout.fixed_locs,
+        fixed_ids=encoded.layout.fixed_ids.to(device),
+    )
+    anchor_loss = _anchor_loss_from_probs(probs, answer_positions, gt_answer_ids, float(rec.t), cfg)
+    dist, actions, _ = _build_joint_action_distribution(
+        tokenizer=tokenizer,
+        probs=probs,
+        x=x,
+        answer_positions=answer_positions,
+        gt_answer_ids=gt_answer_ids,
+        answer_kind=gt_spec.type,
+        cfg=cfg,
+    )
+    matched_idx = None
+    for idx, action in enumerate(actions):
+        if int(action.position) == int(rec.action.position) and int(action.token_id) == int(rec.action.token_id):
+            matched_idx = idx
+            break
+    if matched_idx is None:
+        # Candidate pruning should normally keep sampled actions because current/GT/model top-k are included.
+        # If a rare mismatch occurs, use a zero term instead of crashing the whole run.
+        zero = torch.zeros((), device=device, requires_grad=True)
+        return zero, torch.zeros((), device=device), anchor_loss
+    idx_t = torch.tensor(int(matched_idx), dtype=torch.long, device=device)
+    return dist.log_prob(idx_t), dist.entropy(), anchor_loss
+
 def rollout_chain_loss(
     model,
     graph,
@@ -442,44 +512,79 @@ def rollout_chain_loss(
     debug_records: List[Dict[str, Any]] = []
     meta_last: Dict[str, Any] = {}
 
+    memory_safe_replay = bool(r_cfg.get("memory_safe_replay", True))
+
     for ridx in range(max(1, num_rollouts)):
-        records, meta = rollout_answer_chain_with_logprob(
-            model=model,
-            graph=graph,
-            noise=noise,
-            tokenizer=tokenizer,
-            sample=sample,
-            cfg=cfg,
-            device=device,
-            train=torch.is_grad_enabled(),
-        )
+        if memory_safe_replay and torch.is_grad_enabled():
+            # Pass 1: sample the real chain and compute non-differentiable rewards without retaining graphs.
+            with torch.no_grad():
+                records, meta = rollout_answer_chain_with_logprob(
+                    model=model,
+                    graph=graph,
+                    noise=noise,
+                    tokenizer=tokenizer,
+                    sample=sample,
+                    cfg=cfg,
+                    device=device,
+                    train=False,
+                )
+        else:
+            records, meta = rollout_answer_chain_with_logprob(
+                model=model,
+                graph=graph,
+                noise=noise,
+                tokenizer=tokenizer,
+                sample=sample,
+                cfg=cfg,
+                device=device,
+                train=torch.is_grad_enabled(),
+            )
         meta_last = meta
         if not records:
             continue
         rewards = [float(r.reward) for r in records]
-        adv = _compute_returns_advantages(rewards, cfg, device=device, dtype=records[0].logprob.dtype)
+        adv = _compute_returns_advantages(rewards, cfg, device=device, dtype=torch.float32)
         if adv.numel() != len(records):
             continue
 
         pg_terms: List[torch.Tensor] = []
         entropy_terms: List[torch.Tensor] = []
         anchor_terms: List[torch.Tensor] = []
-        for rec, a in zip(records, adv):
-            pg_terms.append(-a.detach() * rec.logprob)
-            entropy_terms.append(rec.entropy)
-            if rec.anchor_loss is not None:
-                anchor_terms.append(rec.anchor_loss)
-            all_rewards.append(float(rec.reward))
-            all_logprobs.append(float(rec.logprob.detach().item()))
-            all_entropies.append(float(rec.entropy.detach().item()))
-            if rec.anchor_loss is not None:
-                all_anchor_losses.append(float(rec.anchor_loss.detach().item()))
+        if memory_safe_replay and torch.is_grad_enabled():
+            # Pass 2: replay each recorded state/action with grad.  We immediately backpropagate
+            # the per-step term, so GPU memory does not grow with rollout.steps.
+            denom = max(1, len(records)) * max(1, num_rollouts)
+            rollout_loss_value = 0.0
+            for rec, a in zip(records, adv):
+                logprob, entropy, anchor_loss = _recompute_action_terms_from_state(
+                    model=model, graph=graph, noise=noise, tokenizer=tokenizer,
+                    sample=sample, cfg=cfg, device=device, rec=rec
+                )
+                loss_step = (policy_scale * (-a.detach() * logprob) + anchor_scale * anchor_loss - entropy_weight * entropy) / float(denom)
+                loss_step.backward()
+                rollout_loss_value += float(loss_step.detach().item())
+                all_rewards.append(float(rec.reward))
+                all_logprobs.append(float(logprob.detach().item()))
+                all_entropies.append(float(entropy.detach().item()))
+                all_anchor_losses.append(float(anchor_loss.detach().item()))
+            all_losses.append(torch.tensor(float(rollout_loss_value), device=device))
+        else:
+            for rec, a in zip(records, adv):
+                pg_terms.append(-a.detach() * rec.logprob)
+                entropy_terms.append(rec.entropy)
+                if rec.anchor_loss is not None:
+                    anchor_terms.append(rec.anchor_loss)
+                all_rewards.append(float(rec.reward))
+                all_logprobs.append(float(rec.logprob.detach().item()))
+                all_entropies.append(float(rec.entropy.detach().item()))
+                if rec.anchor_loss is not None:
+                    all_anchor_losses.append(float(rec.anchor_loss.detach().item()))
 
-        pg_loss = torch.stack(pg_terms).mean()
-        entropy = torch.stack(entropy_terms).mean()
-        anchor_loss = torch.stack(anchor_terms).mean() if anchor_terms else torch.zeros((), device=device, dtype=pg_loss.dtype)
-        loss = policy_scale * pg_loss + anchor_scale * anchor_loss - entropy_weight * entropy
-        all_losses.append(loss)
+            pg_loss = torch.stack(pg_terms).mean()
+            entropy = torch.stack(entropy_terms).mean()
+            anchor_loss = torch.stack(anchor_terms).mean() if anchor_terms else torch.zeros((), device=device, dtype=pg_loss.dtype)
+            loss = policy_scale * pg_loss + anchor_scale * anchor_loss - entropy_weight * entropy
+            all_losses.append(loss)
 
         if len(debug_records) < int(r_cfg.get("debug_records_per_step", 2)):
             max_steps = int(r_cfg.get("max_debug_steps", 12))
@@ -521,6 +626,7 @@ def rollout_chain_loss(
     loss_out = torch.stack(all_losses).mean()
     rewards_t = torch.tensor(all_rewards, dtype=torch.float32) if all_rewards else torch.zeros(1)
     return loss_out, {
+        "_already_backward": bool(r_cfg.get("memory_safe_replay", True)) and torch.is_grad_enabled(),
         "guided_states": float(num_rollouts),
         "guided_targets": float(len(all_rewards)),
         "rrpi_loss": float(loss_out.detach().item()),
