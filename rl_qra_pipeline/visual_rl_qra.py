@@ -164,10 +164,8 @@ def collect_metric_files(run_root: Path) -> List[Path]:
     best = run_root / "best_metrics.csv"
     if best.exists():
         files.append(best)
-    runs_dir = run_root / "runs"
-    if runs_dir.exists():
-        files.extend(sorted(runs_dir.glob("*/metrics.csv")))
-    files.extend(sorted(p for p in run_root.glob("*/metrics.csv") if "/runs/" not in str(p)))
+    if run_root.exists():
+        files.extend(sorted(runs_root.glob("*/metrics.csv")))
     seen = set()
     out = []
     for p in files:

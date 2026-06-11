@@ -11,7 +11,7 @@ import shutil
 import time
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Any
+from typing import Dict, Iterable, List, Tuple, Any, Optional
 
 import numpy as np
 import torch
@@ -384,7 +384,41 @@ def get_metric_value(metrics: Dict[str, Any], name: str, default: float) -> floa
         return float(default)
 
 
-def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict, device: torch.device, limit: int = 128) -> Dict[str, Any]:
+def parse_eval_limit(value: Any, default: int = 64) -> Optional[int]:
+    """Parse training.eval_limit.
+
+    Supported values:
+      - positive integer: evaluate that many validation samples
+      - "all" / "full": evaluate the full validation split
+      - -1: evaluate the full validation split
+      - None / "": use default
+
+    We intentionally do not treat 0 as "all" to avoid accidentally making
+    every-step validation extremely expensive when a config leaves a zero-like
+    value around from older pipelines.
+    """
+    if value is None:
+        return int(default)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"all", "full", "complete", "entire"}:
+            return None
+        if v == "":
+            return int(default)
+        value = int(v)
+    value = int(value)
+    if value < 0:
+        return None
+    if value == 0:
+        return int(default)
+    return value
+
+
+def eval_limit_label(limit: Optional[int]) -> str | int:
+    return "all" if limit is None else int(limit)
+
+
+def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict, device: torch.device, limit: Optional[int] = 128) -> Dict[str, Any]:
     eval_cfg = copy.deepcopy(cfg)
     eval_cfg.setdefault("rrpi", {})
     eval_cfg.setdefault("rollout", {})
@@ -540,7 +574,11 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     save_every = int(cfg["training"].get("save_every", 100))
     log_every = int(cfg["training"].get("log_every", 1))
     eval_every = int(cfg["training"].get("eval_every", 50) or 0)
-    eval_limit = int(cfg["training"].get("eval_limit", cfg.get("data", {}).get("eval_limit", 64)) or 64)
+    eval_limit = parse_eval_limit(
+        cfg["training"].get("eval_limit", cfg.get("data", {}).get("eval_limit", 64)),
+        default=int(cfg.get("data", {}).get("eval_limit", 64) or 64),
+    )
+    eval_limit_for_logs = eval_limit_label(eval_limit)
     best_metric_name = str(cfg["training"].get("best_metric", "eval_loss"))
     best_mode = str(cfg["training"].get("best_mode", "min")).lower()
     rrpi_cfg = cfg.get("rrpi", cfg.get("guided", {}))
@@ -563,7 +601,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "num_samples": len(samples),
         "data_split": split,
         "eval_split": eval_split,
-        "eval_limit": eval_limit,
+        "eval_limit": eval_limit_for_logs,
         "eval_every": eval_every,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
@@ -654,7 +692,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
             eval_info_step = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
             eval_info_step.update({
                 "eval_split": eval_split,
-                "eval_limit": eval_limit,
+                "eval_limit": eval_limit_for_logs,
                 "step": step,
                 "run_id": run_id,
                 "best_metric_name": best_metric_name,
@@ -732,7 +770,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         final_eval_for_best = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
         final_eval_for_best.update({
             "eval_split": eval_split,
-            "eval_limit": eval_limit,
+            "eval_limit": eval_limit_for_logs,
             "step": steps,
             "run_id": run_id,
             "best_metric_name": best_metric_name,
@@ -780,7 +818,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     eval_info = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
     eval_info.update({
         "eval_split": eval_split,
-        "eval_limit": eval_limit,
+        "eval_limit": eval_limit_for_logs,
         "run_id": run_id,
         "best_step": best_step,
         "best_metric_name": best_metric_name,
