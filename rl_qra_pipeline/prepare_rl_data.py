@@ -2,86 +2,70 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-SHORT_MAX_CHARS = 128
-SHORT_MAX_TOKENS_APPROX = 32
 
 QUESTION_KEYS = ["question", "problem", "prompt", "input", "query"]
 REASONING_KEYS = [
-    "deepseek_thinking_trajectory",
-    "gemini_thinking_trajectory",
     "reasoning",
     "rationale",
     "thinking",
     "cot",
     "chain_of_thought",
+    "deepseek_thinking_trajectory",
+    "gemini_thinking_trajectory",
 ]
 SOLUTION_KEYS = ["solution", "answer", "final_answer", "target", "output"]
 
-BAD_LONG_MARKERS = ["\\sum", "\\int", "\\prod", "\\lim", "\\begin", "\\end", "aligned", "equation", "cases"]
+VALID_UNITS = [
+    "m/s^2", "m/s", "mm", "cm", "km", "kg", "ms", "Hz", "m", "g", "s", "N", "J", "W", "V", "A",
+]
+UNIT_PATTERN = "(?:" + "|".join(re.escape(u) for u in sorted(VALID_UNITS, key=len, reverse=True)) + ")"
+NUM_PATTERN = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
+VAR_PATTERN = r"[A-Za-z][A-Za-z0-9_]*"
 
-FINAL_TEMPLATES = [
-    " Therefore, the final answer is {answer}.",
-    " Thus, the final solution is {answer}.",
-    " Finally, the answer is {answer}.",
-    " Hence, the answer is {answer}.",
+FINAL_MARKERS = [
+    r"therefore,?\s+the\s+final\s+answer\s+is",
+    r"thus,?\s+the\s+final\s+answer\s+is",
+    r"hence,?\s+the\s+final\s+answer\s+is",
+    r"finally,?\s+the\s+final\s+answer\s+is",
+    r"therefore,?\s+the\s+final\s+solution\s+is",
+    r"thus,?\s+the\s+final\s+solution\s+is",
+    r"hence,?\s+the\s+final\s+solution\s+is",
+    r"finally,?\s+the\s+final\s+solution\s+is",
+    r"the\s+final\s+answer\s+is",
+    r"final\s+answer\s+is",
+    r"final\s+answer\s*[:=]",
+    r"the\s+answer\s+should\s+be",
+    r"the\s+answer\s+is",
+    r"answer\s*[:=]",
+    r"the\s+solution\s+is",
+    r"solution\s*[:=]",
+    r"so\s+the\s+solution\s+is",
+    r"so\s+the\s+answer\s+is",
+    r"our\s+answer\s+is",
+]
+FINAL_MARKER_RE = re.compile(r"(?is)(?:" + "|".join(FINAL_MARKERS) + r")\s*")
+
+BAD_DELIMITER_ONLY = {
+    "", "$", "$$", r"\(", r"\)", r"\[", r"\]", "[", "]", "(", ")",
+    ".", ",", ":", ";", "=", "-", "+", "*", "/", "\\", "|",
+}
+
+KEEP_REASON_FINAL_TEMPLATES = [
+    "Therefore, the final answer is {answer}.",
+    "Thus, the final solution is {answer}.",
+    "So the solution is {answer}.",
+    "The answer should be {answer}.",
+    "Finally, the answer is {answer}.",
 ]
 
-FINAL_MARKER_RE = re.compile(
-    r"(?is)(?:"
-    r"final\s+answer\s*(?:is|=|:)?|"
-    r"final\s+solution\s*(?:is|=|:)?|"
-    r"the\s+answer\s*(?:is|=|:)?|"
-    r"the\s+solution\s*(?:is|=|:)?|"
-    r"answer\s*(?:is|=|:)|"
-    r"solution\s*(?:is|=|:)|"
-    r"therefore[,\s]+(?:the\s+)?(?:final\s+)?(?:answer|solution)\s*(?:is|=|:)?|"
-    r"thus[,\s]+(?:the\s+)?(?:final\s+)?(?:answer|solution)\s*(?:is|=|:)?|"
-    r"hence[,\s]+(?:the\s+)?(?:final\s+)?(?:answer|solution)\s*(?:is|=|:)?|"
-    r"finally[,\s]+(?:the\s+)?(?:answer|solution)\s*(?:is|=|:)?|"
-    r"our\s+answer\s*(?:is|=|:)?"
-    r")"
-)
 
-UNIT_RE = r"(?:m|mm|cm|km|kg|g|s|ms|N|J|W|V|A|Hz|m/s|m/s\^2|m\\/s|m\\/s\^2|\\mathrm\{\s*(?:m|mm|cm|kg|g|s|N|J|W|V|A|Hz)\s*\})"
-NUM_RE = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
-
-# Priority matters: if a window contains r=...=1.903 m, we prefer the final unit decimal over the entire long equation.
-CANDIDATE_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
-    (
-        "interval",
-        re.compile(rf"[\(\[]\s*{NUM_RE}\s*,\s*{NUM_RE}\s*[\)\]]"),
-    ),
-    (
-        "inequality",
-        re.compile(rf"[A-Za-z][A-Za-z0-9_]*\s*(?:<=|>=|<|>)\s*{NUM_RE}"),
-    ),
-    (
-        "unit_decimal",
-        re.compile(rf"{NUM_RE}\s*{UNIT_RE}"),
-    ),
-    (
-        "equation",
-        re.compile(r"[A-Za-z][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_+\-*/^().\\]+"),
-    ),
-    (
-        "symbolic_expression",
-        re.compile(r"(?:\\?sqrt\s*\(?\s*\d+\s*\)?|\d+\s*sqrt\s*\(?\s*\d+\s*\)?|[A-Za-z0-9_]+\s*\^\s*\d+(?:\s*[+\-*/]\s*[A-Za-z0-9_]+\s*\^?\s*\d*)*|\d+\s*/\s*\d+|pi\s*\*\s*r\s*\^\s*2|v\s*\^\s*2\s*=\s*u\s*\^\s*2\s*\+\s*2as)"),
-    ),
-    (
-        "signed_decimal_or_number",
-        re.compile(NUM_RE),
-    ),
-    (
-        "option",
-        re.compile(r"(?<![A-Za-z])(?:[A-E]|[a-e])(?![A-Za-z])"),
-    ),
-]
-
+# -------------------------- basic IO --------------------------
 
 def read_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
@@ -92,16 +76,18 @@ def read_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
     if path.suffix.lower() == ".jsonl":
         rows: List[Dict[str, Any]] = []
         for line in text.splitlines():
-            if line.strip():
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    rows.append(obj)
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                rows.append(obj)
         return rows
     obj = json.loads(text)
     if isinstance(obj, list):
         return [x for x in obj if isinstance(x, dict)]
     if isinstance(obj, dict):
-        for key in ("data", "train", "valid", "validation", "test", "rows", "examples"):
+        for key in ["data", "rows", "examples", "train", "val", "valid", "validation", "test"]:
             value = obj.get(key)
             if isinstance(value, list):
                 return [x for x in value if isinstance(x, dict)]
@@ -127,6 +113,15 @@ def load_split(input_dir: Path, split: str) -> List[Dict[str, Any]]:
     return []
 
 
+def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+# -------------------------- field extraction --------------------------
+
 def pick_first(row: Dict[str, Any], keys: List[str]) -> str:
     for key in keys:
         value = row.get(key)
@@ -135,793 +130,717 @@ def pick_first(row: Dict[str, Any], keys: List[str]) -> str:
     return ""
 
 
+def get_segment_text(row: Dict[str, Any], wanted: List[str]) -> str:
+    segs = row.get("segments")
+    wanted_lower = {w.lower() for w in wanted}
+
+    if isinstance(segs, dict):
+        for key, value in segs.items():
+            key_l = str(key).lower()
+            if key_l in wanted_lower or any(w in key_l for w in wanted_lower):
+                if isinstance(value, dict):
+                    text = value.get("text", "")
+                else:
+                    text = value
+                if str(text).strip():
+                    return str(text).strip()
+
+        # Fallback: answer segment is often the only segment with train=True.
+        if "answer" in wanted_lower:
+            for key, value in segs.items():
+                if isinstance(value, dict) and value.get("train") is True:
+                    text = value.get("text", "")
+                    if str(text).strip():
+                        return str(text).strip()
+
+    if isinstance(segs, list):
+        for item in segs:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("key") or item.get("type") or "").lower()
+            if name in wanted_lower or any(w in name for w in wanted_lower):
+                text = item.get("text", "")
+                if str(text).strip():
+                    return str(text).strip()
+        if "answer" in wanted_lower:
+            for item in segs:
+                if isinstance(item, dict) and item.get("train") is True:
+                    text = item.get("text", "")
+                    if str(text).strip():
+                        return str(text).strip()
+
+    return ""
+
+
+def get_question(row: Dict[str, Any]) -> str:
+    text = get_segment_text(row, ["question", "prompt", "input"])
+    if text:
+        return strip_label_prefix(text, ["Question", "Problem", "Prompt", "Input"])
+    return strip_label_prefix(pick_first(row, QUESTION_KEYS), ["Question", "Problem", "Prompt", "Input"])
+
+
+def get_reasoning(row: Dict[str, Any]) -> str:
+    text = get_segment_text(row, ["reasoning", "rationale", "thinking", "cot"])
+    if text:
+        return strip_label_prefix(text, ["Reasoning", "Rationale", "Thinking", "CoT"])
+    return strip_label_prefix(pick_first(row, REASONING_KEYS), ["Reasoning", "Rationale", "Thinking", "CoT"])
+
+
+def get_answer_source_text(row: Dict[str, Any]) -> str:
+    text = get_segment_text(row, ["answer", "target", "solution"])
+    if text:
+        return text
+    return pick_first(row, SOLUTION_KEYS)
+
+
+def strip_label_prefix(text: str, labels: List[str]) -> str:
+    out = str(text or "").strip()
+    for label in labels:
+        out = re.sub(rf"(?is)^\s*{re.escape(label)}\s*[:：]?\s*", "", out).strip()
+    return out
+
+
+# -------------------------- answer cleaning and typing --------------------------
+
 def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def normalize_answer_text(text: str) -> str:
-    text = str(text or "").strip()
-    text = text.replace("\\,", " ")
-    text = re.sub(r"\\mathrm\{\s*([^{}]+?)\s*\}", r"\1", text)
-    text = re.sub(r"\\text\{\s*([^{}]+?)\s*\}", r"\1", text)
-    text = text.replace("~", " ")
-    text = normalize_spaces(text)
-    text = text.strip("` ")
-    # Strip surrounding math delimiters only when they wrap the whole answer.
-    for left, right in [("$$", "$$"), ("$", "$"), (r"\(", r"\)"), (r"\[", r"\]")]:
-        if text.startswith(left) and text.endswith(right) and len(text) > len(left) + len(right):
-            text = text[len(left): -len(right)].strip()
-    boxed = re.fullmatch(r"\\boxed\{(.+)\}", text, flags=re.S)
+def normalize_latex_units(text: str) -> str:
+    out = str(text or "")
+    # \mathrm{~m}, \mathrm{m/s^2}, \text{ kg } -> m, kg
+    out = re.sub(r"\\(?:mathrm|text)\s*\{\s*~?\s*([^{}]+?)\s*\}", lambda m: " " + m.group(1).strip(), out)
+    out = out.replace("\\,", " ").replace("\\;", " ").replace("~", " ")
+    out = out.replace("−", "-")
+    return out
+
+
+def remove_math_wrappers(text: str) -> str:
+    out = str(text or "").strip()
+    # remove code ticks first
+    out = out.strip("` ")
+    changed = True
+    while changed:
+        changed = False
+        wrappers = [("$$", "$$"), ("$", "$"), (r"\(", r"\)"), (r"\[", r"\]")]
+        for left, right in wrappers:
+            if out.startswith(left) and out.endswith(right) and len(out) > len(left) + len(right):
+                out = out[len(left): -len(right)].strip()
+                changed = True
+    boxed = re.fullmatch(r"\\boxed\s*\{(.+)\}", out, flags=re.S)
     if boxed:
-        text = boxed.group(1).strip()
-    if len(text) > 1 and text[-1] in ".;，。":
+        out = boxed.group(1).strip()
+    return out
+
+
+def clean_candidate_answer(raw: str) -> str:
+    text = normalize_latex_units(str(raw or "").strip())
+    text = remove_math_wrappers(text)
+    text = strip_label_prefix(text, [
+        "Final answer", "Final solution", "The final answer", "The answer", "Answer", "Solution", "Our answer",
+    ])
+    text = normalize_spaces(text)
+    # Remove trailing sentence punctuation, but keep interval bracket and decimals.
+    while len(text) > 1 and text[-1] in ".;，。":
         text = text[:-1].strip()
-    return normalize_spaces(text)
+    # Normalize spaces around common expression operators, except keep unit space.
+    text = re.sub(r"\s*([=<>+*/^,()\[\]])\s*", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Put back one space between number and unit if it became glued.
+    text = re.sub(rf"^({NUM_PATTERN})({UNIT_PATTERN})$", r"\1 \2", text)
+    return text
 
 
-def strip_short_answer_wrappers(raw: str) -> str:
-    text = str(raw or "").strip()
-    marker = re.search(r"(?is)####\s*(.+)$", text)
-    if marker:
-        text = marker.group(1).strip()
-    text = re.sub(
-        r"(?is)^\s*(?:final\s+answer|final\s+solution|the\s+answer|the\s+solution|answer|solution|our\s+answer)\s*(?:is|=|:)?\s*",
-        "",
-        text,
-    ).strip()
-    return normalize_answer_text(text)
-
-
-def has_long_derivation_shape(raw: str) -> bool:
-    raw = str(raw or "").strip()
-    if not raw:
-        return False
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    if len(lines) > 2:
+def is_pure_symbol(answer: str) -> bool:
+    a = str(answer or "").strip()
+    if a in BAD_DELIMITER_ONLY:
         return True
-    if "$$" in raw and "\n" in raw:
-        return True
-    if len(raw) > SHORT_MAX_CHARS * 2 and any(marker in raw for marker in BAD_LONG_MARKERS):
-        return True
-    if len(raw) > 120 and raw.count("=") >= 2 and any(x in raw for x in ["\\frac", "\\sqrt", "\\sin", "\\cos", "\\left", "\\right"]):
+    # No letter/digit at all means pure punctuation/symbol noise.
+    if not re.search(r"[A-Za-z0-9]", a):
         return True
     return False
 
 
-def answer_kind(answer: str) -> str:
-    compact = answer.replace(" ", "")
-    if re.fullmatch(r"^[A-Za-z]$", compact):
-        return "option"
-    if re.fullmatch(rf"^{NUM_RE}$", compact):
-        return "number"
-    if re.fullmatch(rf"^[\(\[]\s*{NUM_RE}\s*,\s*{NUM_RE}\s*[\)\]]$", answer):
-        return "interval"
-    if re.fullmatch(rf"^{NUM_RE}\s*{UNIT_RE}$", answer):
-        return "unit_decimal"
-    if re.fullmatch(rf"^[A-Za-z][A-Za-z0-9_]*\s*(?:<=|>=|<|>)\s*{NUM_RE}$", compact):
-        return "inequality"
-    if re.fullmatch(r"^[A-Za-z][A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_+\-*/^().\\]+$", compact):
-        return "equation"
-    if re.fullmatch(r"^[A-Za-z0-9_+\-*/^=().,\[\]{}\\]+$", compact):
-        return "symbolic_expression"
-    return "short_text"
+def balanced_brackets(s: str) -> bool:
+    pairs = {')': '(', ']': '[', '}': '{'}
+    stack: List[str] = []
+    for ch in s:
+        if ch in "([{":
+            stack.append(ch)
+        elif ch in pairs:
+            if not stack or stack[-1] != pairs[ch]:
+                return False
+            stack.pop()
+    return not stack
 
 
-def is_supported_short_answer(answer: str) -> Tuple[bool, str]:
-    answer = normalize_answer_text(answer)
-    if not answer:
-        return False, "empty_after_clean"
-    if answer in {"$", "$$", r"\[", r"\]", r"\(", r"\)"}:
-        return False, "math_delimiter_only"
-    if "\n" in answer:
-        return False, "newline_after_clean"
-    if len(answer) > SHORT_MAX_CHARS:
-        return False, "too_long"
-    if len(answer.split()) > SHORT_MAX_TOKENS_APPROX:
-        return False, "too_many_words"
-    if any(marker in answer for marker in BAD_LONG_MARKERS):
-        return False, "complex_latex"
+def classify_answer(answer: str) -> Tuple[bool, str, str]:
+    """Return (is_valid, kind, reason)."""
+    a = clean_candidate_answer(answer)
+    compact = a.replace(" ", "")
 
-    kind = answer_kind(answer)
-    if kind in {"option", "number", "interval", "inequality", "unit_decimal", "equation", "symbolic_expression"}:
-        return True, kind
-    return False, "unsupported_short_form"
+    if not a:
+        return False, "invalid", "empty"
+    if is_pure_symbol(a):
+        return False, "invalid", "pure_symbol"
+    if len(a) > 96:
+        return False, "invalid", "too_long"
+    if "\n" in a:
+        return False, "invalid", "newline"
+    if not balanced_brackets(compact):
+        return False, "invalid", "unbalanced_brackets"
+    if compact.count("$$") or compact in BAD_DELIMITER_ONLY:
+        return False, "invalid", "math_delimiter_noise"
+
+    # option letter
+    if re.fullmatch(r"[A-Ea-e]", compact):
+        return True, "option", "valid"
+
+    # integer / decimal
+    if re.fullmatch(NUM_PATTERN, compact):
+        return True, "number", "valid"
+
+    # unit decimal / unit number
+    if re.fullmatch(rf"{NUM_PATTERN}{UNIT_PATTERN}", compact):
+        return True, "unit_number", "valid"
+
+    # interval: (a,b], [a,b), etc. Require left < right.
+    m = re.fullmatch(rf"([\(\[])(?:\s*)({NUM_PATTERN})(?:\s*),(?:\s*)({NUM_PATTERN})(?:\s*)([\)\]])", a)
+    if m:
+        left = float(m.group(2))
+        right = float(m.group(3))
+        if left < right:
+            return True, "interval", "valid"
+        return False, "invalid", "bad_interval_order"
+
+    # inequality: x>3, y<=-2
+    if re.fullmatch(rf"{VAR_PATTERN}(?:<=|>=|<|>){NUM_PATTERN}", compact):
+        return True, "inequality", "valid"
+
+    # equation: exactly one equality, non-empty sides, no x==3
+    if compact.count("=") == 1:
+        lhs, rhs = compact.split("=", 1)
+        if lhs and rhs and re.fullmatch(VAR_PATTERN, lhs):
+            if re.fullmatch(r"[A-Za-z0-9_+\-*/^().\\]+", rhs):
+                return True, "equation", "valid"
+        return False, "invalid", "bad_equation"
+
+    # fraction
+    if re.fullmatch(rf"{NUM_PATTERN}/{NUM_PATTERN}", compact):
+        return True, "fraction", "valid"
+
+    # symbolic expression with variables/numbers and operators.
+    allowed_symbolic = re.fullmatch(r"[A-Za-z0-9_+\-*/^().\\]+", compact) is not None
+    has_content = re.search(r"[A-Za-z]", compact) and re.search(r"[0-9]", compact)
+    has_operator = re.search(r"[+\-*/^()]", compact) is not None
+    if allowed_symbolic and has_content and has_operator:
+        return True, "symbolic_expression", "valid"
+
+    # Very short alphanumeric text is allowed, but long phrases are not useful for this RL dataset.
+    if re.fullmatch(r"[A-Za-z0-9_\-]+", compact) and len(compact) <= 24:
+        return True, "short_text", "valid"
+
+    return False, "invalid", "unsupported_form"
 
 
-def looks_like_short_answer(raw: str) -> Tuple[bool, str, str]:
-    raw = str(raw or "").strip()
-    if not raw:
-        return False, "", "empty_solution"
-    if has_long_derivation_shape(raw):
-        return False, "", "long_derivation_or_display_math"
-    cleaned = strip_short_answer_wrappers(raw)
-    ok, reason_or_kind = is_supported_short_answer(cleaned)
-    if ok:
-        return True, cleaned, "direct_" + reason_or_kind
-    return False, "", reason_or_kind
+def normalize_for_match(text: str) -> str:
+    out = normalize_latex_units(text).lower()
+    out = re.sub(r"\\boxed\s*\{([^{}]+)\}", r"\1", out)
+    out = re.sub(r"[\s$`{}]", "", out)
+    out = out.replace("−", "-")
+    return out
 
 
-def extract_candidates_from_window(window: str) -> List[Tuple[str, str]]:
-    window = str(window or "")
-    # Stop at the next likely sentence if the window is prose. Do not stop at ')' or ']' because intervals need them.
-    window = window[:260]
-    candidates: List[Tuple[str, str]] = []
-    for kind, pattern in CANDIDATE_PATTERNS:
-        for m in pattern.finditer(window):
-            raw = m.group(0)
-            candidate = normalize_answer_text(raw)
-            ok, reason_or_kind = is_supported_short_answer(candidate)
-            if ok:
-                candidates.append((candidate, reason_or_kind))
-    # Deduplicate while preserving order.
-    seen = set()
-    deduped: List[Tuple[str, str]] = []
-    for candidate, kind in candidates:
-        key = candidate.lower().replace(" ", "")
-        if key not in seen:
-            seen.add(key)
-            deduped.append((candidate, kind))
-    return deduped
+def answer_matches_reasoning(reasoning: str, answer: str) -> bool:
+    if not reasoning.strip() or not answer.strip():
+        return False
+    rn = normalize_for_match(reasoning)
+    an = normalize_for_match(answer)
+    if an and an in rn:
+        return True
+    extracted = extract_final_answer(reasoning)
+    if extracted:
+        return normalize_for_match(extracted) == an
+    return False
 
 
-def extract_final_answer(text: str) -> Tuple[bool, str, str]:
-    text = str(text or "")
-    if not text.strip():
-        return False, "", "no_text"
+# -------------------------- final answer extraction --------------------------
 
-    matches = list(FINAL_MARKER_RE.finditer(text))
+def candidate_patterns() -> List[re.Pattern[str]]:
+    # Ordered from structured to generic. Use raw text after normalizing latex units.
+    patterns = [
+        rf"[\(\[]\s*{NUM_PATTERN}\s*,\s*{NUM_PATTERN}\s*[\)\]]",              # interval
+        rf"{VAR_PATTERN}\s*(?:<=|>=|<|>)\s*{NUM_PATTERN}",                        # inequality
+        rf"{VAR_PATTERN}\s*=\s*[A-Za-z0-9_+\-*/^().\\]+",                         # equation
+        rf"{NUM_PATTERN}\s*{UNIT_PATTERN}",                                       # unit number
+        rf"{NUM_PATTERN}\s*/\s*{NUM_PATTERN}",                                    # fraction
+        r"[A-Za-z0-9_+\-*/^().\\]*sqrt\s*\(?\s*\d+\s*\)?[A-Za-z0-9_+\-*/^().\\]*", # sqrt expr
+        r"[A-Za-z][A-Za-z0-9_]*\^\d+(?:[+\-]\d*[A-Za-z][A-Za-z0-9_]*(?:\^\d+)?)*(?:[+\-]\d+)?", # polynomial-ish
+        rf"{NUM_PATTERN}",                                                        # number
+        r"\b[A-Ea-e]\b",                                                          # option
+    ]
+    return [re.compile(p, re.I) for p in patterns]
+
+
+CANDIDATE_RE_LIST = candidate_patterns()
+
+
+def extract_final_answer(text: str) -> str:
+    raw = normalize_latex_units(str(text or ""))
+    if not raw.strip():
+        return ""
+
+    matches = list(FINAL_MARKER_RE.finditer(raw))
+    windows: List[str] = []
     if matches:
-        # Use the last final-answer style marker. This avoids grabbing intermediate numbers.
-        for match in reversed(matches):
-            window = text[match.end(): match.end() + 320]
-            candidates = extract_candidates_from_window(window)
-            if candidates:
-                # Prefer the last candidate in the marker window for chained equations like r=...=1.903 m.
-                answer, kind = candidates[-1]
-                return True, answer, "marker_" + kind
-        return False, "", "marker_found_but_no_supported_answer"
+        for m in matches[-3:]:
+            tail = raw[m.end():]
+            # Do not stop immediately at decimal point; take a conservative window.
+            tail = tail[:240]
+            windows.append(tail)
+    else:
+        # Fallback: last 240 chars, useful for solution fields with no explicit marker.
+        windows.append(raw[-240:])
 
-    # Fallback: if the whole text ends with a supported short answer pattern, keep it.
-    tail = text[-360:]
-    candidates = extract_candidates_from_window(tail)
-    if candidates:
-        answer, kind = candidates[-1]
-        return True, answer, "tail_" + kind
-    return False, "", "no_final_marker"
-
-
-def answer_in_reasoning(reasoning: str, answer: str) -> bool:
-    reasoning_norm = re.sub(r"\s+", "", str(reasoning or "").lower())
-    answer_norm = re.sub(r"\s+", "", str(answer or "").lower())
-    if not answer_norm:
-        return False
-    if answer_norm in reasoning_norm:
-        return True
-    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", answer_norm):
-        return re.search(rf"(?<!\d){re.escape(answer_norm)}(?!\d)", reasoning_norm) is not None
-    return False
+    best = ""
+    for window in reversed(windows):
+        # Remove display math wrappers but keep contents.
+        w = window.replace("$$", " ").replace("$", " ")
+        w = re.sub(r"\\\[|\\\]|\\\(|\\\)", " ", w)
+        for cre in CANDIDATE_RE_LIST:
+            candidates = list(cre.finditer(w))
+            if not candidates:
+                continue
+            # The answer is usually the last structured token in the final window.
+            for match in reversed(candidates):
+                cand = clean_candidate_answer(match.group(0))
+                ok, _, _ = classify_answer(cand)
+                if ok:
+                    return cand
+                if not best:
+                    best = cand
+    return ""
 
 
-def make_sample(row: Dict[str, Any], split: str, idx: int, answer: str, source_tag: str, synthetic: bool = False) -> Dict[str, Any]:
-    question = pick_first(row, QUESTION_KEYS)
-    reasoning = pick_first(row, REASONING_KEYS)
-    if not question:
-        question = str(row.get("text", "")).strip()
-    if not reasoning:
-        reasoning = "First, we analyze the problem step by step."
-    if not answer_in_reasoning(reasoning, answer):
-        template = FINAL_TEMPLATES[idx % len(FINAL_TEMPLATES)]
-        reasoning = reasoning.rstrip() + template.format(answer=answer)
-    sid = row.get("id") or row.get("uid") or f"{split}_{idx:06d}"
-    if synthetic:
-        sid = f"synthetic_{sid}"
-    kind = answer_kind(answer)
+def choose_answer_for_row(row: Dict[str, Any]) -> Tuple[bool, str, str, str]:
+    """Return (ok, cleaned_answer, source, reason)."""
+    answer_text = get_answer_source_text(row)
+    direct = clean_candidate_answer(answer_text)
+    ok, kind, reason = classify_answer(direct)
+    if ok:
+        return True, direct, "direct_answer", kind
+
+    reasoning = get_reasoning(row)
+    extracted = extract_final_answer(reasoning)
+    if extracted:
+        ok2, kind2, reason2 = classify_answer(extracted)
+        if ok2:
+            return True, extracted, "extracted_from_reasoning", kind2
+
+    # Last resort: if solution/answer was long but has a final marker or a final numeric/unit answer.
+    extracted2 = extract_final_answer(answer_text)
+    if extracted2:
+        ok3, kind3, reason3 = classify_answer(extracted2)
+        if ok3:
+            return True, extracted2, "extracted_from_solution", kind3
+
+    return False, "", "drop", reason
+
+
+# -------------------------- sample construction --------------------------
+
+def make_segments(question: str, reasoning: str, answer: str) -> Dict[str, Any]:
     return {
-        "id": f"s1f_rl_{split}_{sid}",
-        "source": source_tag,
-        "answer_kind": kind,
+        "question": {"text": f"Question:\n{question.strip()}\n\n", "train": False},
+        "reasoning": {"text": f"Reasoning:\n{reasoning.strip()}\n", "train": False},
+        "answer_anchor": {"text": "\nAnswer:\n", "train": False},
+        "answer": {"text": answer.strip(), "train": True},
+    }
+
+
+def make_real_sample(row: Dict[str, Any], split: str, idx: int, answer: str, answer_source: str, answer_kind: str) -> Dict[str, Any]:
+    question = get_question(row)
+    reasoning = get_reasoning(row)
+    rid = row.get("id") or row.get("uid") or row.get("sample_id") or f"{split}_{idx:06d}"
+    return {
+        "id": f"s1f_rl_{split}_{rid}",
+        "source": "s1f_rl_filtered_qra",
+        "answer_source": answer_source,
+        "answer_kind": answer_kind,
+        "original_id": rid,
         "question": question,
         "reasoning": reasoning,
         "answer": answer,
         "solution": answer,
-        "segments": {
-            "question": {"text": f"Question:\n{question.strip()}\n\n", "train": False},
-            "reasoning": {"text": f"Reasoning:\n{reasoning.strip()}\n", "train": False},
-            "answer_anchor": {"text": "\nAnswer:\n", "train": False},
-            "answer": {"text": str(answer).strip(), "train": True},
-        },
+        "segments": make_segments(question, reasoning, answer),
     }
 
 
-
-# Synthetic hard cases are generated parametrically.  Unlike the previous
-# paraphrase version, we do NOT create several questions for the same answer.
-# Each generated synthetic example has a unique final answer; only the wording
-# style is randomized across examples of the same type.
-
-SYNTHETIC_FINAL_TEMPLATES = [
-    "Therefore, the final answer is {answer}.",
-    "Thus, the final solution is {answer}.",
-    "Finally, the answer is {answer}.",
-    "Hence, the answer should be {answer}.",
-    "So the solution is {answer}.",
-    "We conclude that the answer is {answer}.",
-    "This gives the final solution: {answer}.",
-    "The required answer is {answer}.",
-]
-
-REASONING_OPENERS = [
-    "To solve the problem, first translate the condition into the target answer form.",
-    "First, identify the boundary values and whether each boundary is included.",
-    "We start by isolating the requested quantity from the given relation.",
-    "The key step is to keep the final response in a compact mathematical form.",
-    "First, simplify the expression and then write only the final result.",
-]
+def make_synthetic_sample(split: str, idx: int, case: Dict[str, str]) -> Dict[str, Any]:
+    answer = clean_candidate_answer(case["answer"])
+    return {
+        "id": f"s1f_rl_{split}_synthetic_{idx:06d}",
+        "source": "s1f_rl_synthetic_hard",
+        "answer_source": "parametric_synthetic",
+        "answer_kind": case["kind"],
+        "question": case["question"],
+        "reasoning": case["reasoning"],
+        "answer": answer,
+        "solution": answer,
+        "segments": make_segments(case["question"], case["reasoning"], answer),
+    }
 
 
-def fmt_num(value: float | int) -> str:
-    if isinstance(value, int) or abs(float(value) - round(float(value))) < 1e-9:
-        return str(int(round(float(value))))
-    text = f"{float(value):.3f}".rstrip("0").rstrip(".")
-    return text if text != "-0" else "0"
+# -------------------------- synthetic generation --------------------------
+
+def final_sentence(rng: random.Random, answer: str) -> str:
+    templates = [
+        "Therefore, the final answer is {answer}.",
+        "Thus, the final solution is {answer}.",
+        "So the solution is {answer}.",
+        "The answer should be {answer}.",
+        "Finally, the answer is {answer}.",
+        "Hence, the answer is {answer}.",
+    ]
+    return rng.choice(templates).format(answer=answer)
 
 
-def make_interval_case(rng: random.Random, idx: int) -> Dict[str, str]:
-    a = rng.randint(-12, 7)
+def gen_interval_case(rng: random.Random) -> Dict[str, str]:
+    a = rng.randint(-8, 5)
     b = rng.randint(a + 1, a + 12)
-    left_closed = rng.choice([True, False])
-    right_closed = rng.choice([True, False])
-    left = "[" if left_closed else "("
-    right = "]" if right_closed else ")"
+    left = rng.choice(["(", "["])
+    right = rng.choice([")", "]"])
     answer = f"{left}{a},{b}{right}"
-
-    lower_symbol = ">=" if left_closed else ">"
-    upper_symbol = "<=" if right_closed else "<"
-    lower_phrase = "included" if left_closed else "excluded"
-    upper_phrase = "included" if right_closed else "excluded"
-
+    lower_op = ">" if left == "(" else ">="
+    upper_op = "<" if right == ")" else "<="
+    var = rng.choice(["x", "t", "r", "y"])
     question_templates = [
-        f"Convert the condition {a} { '<=' if left_closed else '<' } x { '<=' if right_closed else '<' } {b} into interval notation.",
-        f"Write the interval for all x such that x {lower_symbol} {a} and x {upper_symbol} {b}.",
-        f"Give the interval with left endpoint {a} {lower_phrase} and right endpoint {b} {upper_phrase}.",
-        f"A solution set runs from {a} to {b}; the left endpoint is {lower_phrase} and the right endpoint is {upper_phrase}. Write it as an interval.",
+        f"Write the interval notation for all {var} satisfying {a} {lower_op.replace('>', '<')} {var} {upper_op} {b}.",
+        f"Express the solution set {var}{lower_op}{a} and {var}{upper_op}{b} as an interval.",
+        f"Convert the compound inequality {a} {lower_op.replace('>', '<')} {var} {upper_op} {b} into interval notation.",
     ]
     reasoning_templates = [
-        f"First, the left endpoint is {a} and it is {lower_phrase}. The right endpoint is {b} and it is {upper_phrase}.",
-        f"First, translate the left inequality into {'a bracket' if left_closed else 'a parenthesis'} and the right inequality into {'a bracket' if right_closed else 'a parenthesis'}.",
-        f"The lower bound is {a} and the upper bound is {b}. The endpoint symbols follow directly from whether equality is allowed.",
-        f"To solve, keep the two bounds in increasing order and choose the endpoint marks from the inequality signs.",
+        f"To solve, identify the two endpoints {a} and {b}. The left endpoint is {'included' if left == '[' else 'excluded'}, and the right endpoint is {'included' if right == ']' else 'excluded'}. {final_sentence(rng, answer)}",
+        f"First, translate each inequality sign into an endpoint bracket. The lower bound gives {left}, and the upper bound gives {right}. {final_sentence(rng, answer)}",
+        f"We keep all values between {a} and {b}. The endpoint convention determines the brackets. {final_sentence(rng, answer)}",
     ]
-    return {
-        "id": f"param_interval_{idx:04d}",
-        "kind": "interval",
-        "question": rng.choice(question_templates),
-        "reasoning": rng.choice(reasoning_templates) + " " + rng.choice(SYNTHETIC_FINAL_TEMPLATES).format(answer=answer),
-        "solution": answer,
-    }
+    return {"kind": "interval", "question": rng.choice(question_templates), "reasoning": rng.choice(reasoning_templates), "answer": answer}
 
 
-def make_inequality_case(rng: random.Random, idx: int) -> Dict[str, str]:
+def gen_inequality_case(rng: random.Random) -> Dict[str, str]:
     var = rng.choice(["x", "y", "t", "r"])
-    c = rng.randint(-15, 15)
+    c = rng.randint(-9, 9)
     op = rng.choice([">", ">=", "<", "<="])
     answer = f"{var}{op}{c}"
-    phrase = {
-        ">": "greater than",
-        ">=": "greater than or equal to",
-        "<": "less than",
-        "<=": "less than or equal to",
-    }[op]
     question_templates = [
-        f"Write the final inequality if {var} is {phrase} {c}.",
-        f"Convert the verbal condition '{var} is {phrase} {c}' into symbolic form.",
-        f"Give the compact answer for the condition that {var} must be {phrase} {c}.",
-        f"State the solution as a one-sided inequality for variable {var} with threshold {c}.",
+        f"Give a short inequality answer describing all values of {var} that are {op} {c}.",
+        f"Write the solution condition using {var} and the boundary {c}.",
+        f"State the final inequality when the allowed values satisfy {var} {op} {c}.",
     ]
     reasoning_templates = [
-        f"First, keep the variable {var} on the left side and place the threshold {c} on the right side.",
-        f"To solve, choose the inequality symbol that matches the phrase '{phrase}'.",
-        f"The condition is one-sided, so the answer should be written as a single symbolic inequality.",
+        f"To solve, isolate the variable and keep the comparison direction. {final_sentence(rng, answer)}",
+        f"First, identify the boundary value {c}. Then write the allowed side using the same inequality sign. {final_sentence(rng, answer)}",
+        f"The condition is already in one-variable inequality form, so we report it directly. {final_sentence(rng, answer)}",
     ]
-    return {
-        "id": f"param_inequality_{idx:04d}",
-        "kind": "inequality",
-        "question": rng.choice(question_templates),
-        "reasoning": rng.choice(reasoning_templates) + " " + rng.choice(SYNTHETIC_FINAL_TEMPLATES).format(answer=answer),
-        "solution": answer,
-    }
+    return {"kind": "inequality", "question": rng.choice(question_templates), "reasoning": rng.choice(reasoning_templates), "answer": answer}
 
 
-def make_linear_equation_case(rng: random.Random, idx: int) -> Dict[str, str]:
-    var = rng.choice(["x", "y", "a", "t"])
-    value = rng.randint(-12, 18)
-    coef = rng.choice([2, 3, 4, 5, -2, -3])
-    bias = rng.randint(-10, 10)
-    rhs = coef * value + bias
-    answer = f"{var}={value}"
-    question_templates = [
-        f"Solve {coef}{var}+{bias}={rhs}.",
-        f"Find {var} from the linear equation {coef}{var}+{bias}={rhs}.",
-        f"What is the value of {var} if {coef}{var}+{bias} equals {rhs}?",
-        f"Isolate {var} in {coef}{var}+{bias}={rhs}.",
-    ]
-    reasoning_templates = [
-        f"First, subtract {bias} from both sides to get {coef}{var}={coef * value}. Then divide by {coef}.",
-        f"To solve, move the constant term to the right side and then divide by the coefficient of {var}.",
-        f"First isolate the variable term. The resulting value for {var} is {value}.",
-    ]
-    return {
-        "id": f"param_equation_linear_{idx:04d}",
-        "kind": "equation",
-        "question": rng.choice(question_templates),
-        "reasoning": rng.choice(reasoning_templates) + " " + rng.choice(SYNTHETIC_FINAL_TEMPLATES).format(answer=answer),
-        "solution": answer,
-    }
-
-
-def make_formula_equation_case(rng: random.Random, idx: int) -> Dict[str, str]:
-    templates = [
-        ("Solve F=ma for acceleration a.", "a=F/m", "First, divide both sides by m so that acceleration is isolated."),
-        ("Write Newton's second law in compact form.", "F=ma", "First, force equals mass times acceleration in Newton's second law."),
-        ("Write the circle area formula using A and r.", "A=pi*r^2", "First, circle area is pi times radius squared."),
-        ("Write the slope-intercept line with slope {m} and intercept {b}.", None, None),
-        ("Solve v=d/t for distance d.", "d=v*t", "First, multiply both sides by t to isolate distance."),
-        ("Solve p=mv for velocity v.", "v=p/m", "First, divide momentum by mass to isolate velocity."),
-    ]
-    q, ans, reason = rng.choice(templates)
-    if ans is None:
-        m = rng.choice([-3, -2, -1, 1, 2, 3, 4, 5])
+def gen_equation_case(rng: random.Random) -> Dict[str, str]:
+    mode = rng.choice(["linear", "line", "formula"])
+    if mode == "linear":
+        var = rng.choice(["x", "y", "a", "t"])
+        val = rng.randint(-9, 15)
+        coef = rng.choice([2, 3, 4, 5])
+        bias = rng.randint(-6, 6)
+        rhs = coef * val + bias
+        answer = f"{var}={val}"
+        question = f"Solve {coef}{var}+{bias}={rhs}."
+        reasoning = rng.choice([
+            f"To solve, subtract {bias} from both sides and divide by {coef}. {final_sentence(rng, answer)}",
+            f"First isolate the variable term, then divide by the coefficient. {final_sentence(rng, answer)}",
+            f"We rearrange the linear equation until the variable is alone. {final_sentence(rng, answer)}",
+        ])
+    elif mode == "line":
+        m = rng.choice([-3, -2, -1, 1, 2, 3, 4])
         b = rng.randint(-8, 8)
         sign = "+" if b >= 0 else ""
-        ans = f"y={m}x{sign}{b}"
-        q = q.format(m=m, b=b)
-        reason = "First, use y=mx+b. Substitute the given slope and intercept into this form."
-    return {
-        "id": f"param_equation_formula_{idx:04d}",
-        "kind": "equation",
-        "question": q,
-        "reasoning": reason + " " + rng.choice(SYNTHETIC_FINAL_TEMPLATES).format(answer=ans),
-        "solution": ans,
-    }
-
-
-def make_symbolic_case(rng: random.Random, idx: int) -> Dict[str, str]:
-    family = rng.choice(["sqrt", "square", "fraction", "monomial", "kinematics", "factor"])
-    if family == "sqrt":
-        outside = rng.randint(2, 9)
-        inside = rng.choice([2, 3, 5, 6, 7, 10, 11, 13])
-        n = outside * outside * inside
-        ans = f"{outside}sqrt({inside})"
-        question = rng.choice([
-            f"Simplify sqrt({n}).",
-            f"Write sqrt({n}) in simplified radical form.",
-            f"Take the largest square factor out of sqrt({n}).",
+        answer = f"y={m}x{sign}{b}" if b != 0 else f"y={m}x"
+        question = f"Write the line with slope {m} and intercept {b}."
+        reasoning = rng.choice([
+            f"First, use y=mx+b. Substitute m={m} and b={b}. {final_sentence(rng, answer)}",
+            f"The slope-intercept form is y=mx+b, so plug in the given values. {final_sentence(rng, answer)}",
         ])
-        reasoning = f"First, factor {n} as {outside * outside} times {inside}. Then sqrt({outside * outside})={outside}."
-    elif family == "square":
-        k = rng.randint(1, 8)
-        ans = f"x^2+{2*k}x+{k*k}"
-        question = rng.choice([
-            f"Expand (x+{k})^2.",
-            f"Multiply out (x+{k})(x+{k}).",
-            f"Use the square formula to expand (x+{k})^2.",
-        ])
-        reasoning = f"First, use (a+b)^2=a^2+2ab+b^2 with b={k}."
-    elif family == "fraction":
-        den = rng.choice([4, 5, 6, 7, 8, 9, 10, 12])
-        num = rng.randint(1, den - 1)
-        # Keep simple proper fraction answers.
-        ans = f"{num}/{den}"
-        mult = rng.randint(2, 6)
-        question = rng.choice([
-            f"Simplify {num*mult}/{den*mult}.",
-            f"Reduce the fraction {num*mult}/{den*mult} to lowest terms.",
-            f"Write {num*mult} divided by {den*mult} as a simplified fraction.",
-        ])
-        reasoning = f"First, divide numerator and denominator by the common factor {mult}."
-    elif family == "monomial":
-        coef = rng.randint(2, 9)
-        power = rng.randint(2, 4)
-        ans = f"{coef}x^{power}"
-        question = rng.choice([
-            f"Simplify {coef} times " + " times ".join(["x"] * power) + ".",
-            f"Write the product {coef}*" + "*".join(["x"] * power) + " in exponent form.",
-            f"Combine repeated x factors in {coef}*" + "*".join(["x"] * power) + ".",
-        ])
-        reasoning = f"First, combine the {power} repeated x factors into x^{power} and keep the coefficient {coef}."
-    elif family == "kinematics":
-        ans = rng.choice(["v^2=u^2+2as", "s=u*t+0.5*a*t^2", "v=u+a*t"])
-        question = rng.choice([
-            "Write a compact constant-acceleration kinematics formula.",
-            "Give a symbolic expression used in one-dimensional motion.",
-            "State the requested kinematics relation in short form.",
-        ])
-        reasoning = "First, choose the standard relation matching the requested variables and keep it in compact symbolic form."
     else:
-        k = rng.randint(1, 8)
-        ans = f"(x+{k})^2"
-        question = rng.choice([
-            f"Factor x^2+{2*k}x+{k*k}.",
-            f"Write x^2+{2*k}x+{k*k} as a perfect square.",
-            f"Factor the quadratic x^2+{2*k}x+{k*k}.",
+        formulas = [
+            ("Newton's second law solved for acceleration", "a=F/m", "Start from F=ma and divide by m."),
+            ("distance from speed and time", "d=v*t", "Use distance equals speed times time."),
+            ("force from mass and acceleration", "F=ma", "Use Newton's second law directly."),
+            ("circle area formula", "A=pi*r^2", "The area of a circle is pi times radius squared."),
+        ]
+        desc, answer, lead = rng.choice(formulas)
+        question = f"Write the formula for {desc}."
+        reasoning = f"To solve, recall the standard relationship. {lead} {final_sentence(rng, answer)}"
+    return {"kind": "equation", "question": question, "reasoning": reasoning, "answer": answer}
+
+
+def gen_symbolic_case(rng: random.Random) -> Dict[str, str]:
+    mode = rng.choice(["sqrt", "square", "fraction", "physics", "factor"])
+    if mode == "sqrt":
+        n = rng.choice([2, 3, 5, 6, 7])
+        k = rng.randint(2, 8)
+        answer = f"{k}sqrt({n})"
+        question = f"Simplify sqrt({k*k*n})."
+        reasoning = rng.choice([
+            f"First, split {k*k*n} into {k*k} times {n}. The square root of {k*k} is {k}. {final_sentence(rng, answer)}",
+            f"To solve, factor out the largest perfect square. {final_sentence(rng, answer)}",
         ])
-        reasoning = f"First, recognize the perfect square pattern with b={k}."
-    return {
-        "id": f"param_symbolic_{idx:04d}",
-        "kind": "symbolic_expression",
-        "question": question,
-        "reasoning": reasoning + " " + rng.choice(SYNTHETIC_FINAL_TEMPLATES).format(answer=ans),
-        "solution": ans,
-    }
+    elif mode == "square":
+        c = rng.randint(1, 6)
+        answer = f"x^2+{2*c}x+{c*c}"
+        question = f"Expand (x+{c})^2."
+        reasoning = f"First, use (a+b)^2=a^2+2ab+b^2. Substitute b={c}. {final_sentence(rng, answer)}"
+    elif mode == "fraction":
+        den = rng.choice([4, 5, 6, 7, 8, 9])
+        num = rng.randint(1, den - 1)
+        g = math.gcd(num, den)
+        num2, den2 = num // g, den // g
+        scale = rng.choice([2, 3, 4])
+        answer = f"{num2}/{den2}"
+        question = f"Simplify {num2*scale}/{den2*scale}."
+        reasoning = f"To solve, divide numerator and denominator by their common factor {scale}. {final_sentence(rng, answer)}"
+    elif mode == "physics":
+        answer = rng.choice(["v^2=u^2+2as", "p=mv", "E=mc^2"])
+        question = "Write the requested physics relation in symbolic form."
+        reasoning = f"First, recall the standard symbolic relationship and keep all variables in formula form. {final_sentence(rng, answer)}"
+    else:
+        c = rng.randint(1, 6)
+        answer = f"(x+{c})^2"
+        question = f"Factor x^2+{2*c}x+{c*c}."
+        reasoning = f"First, recognize the perfect-square pattern x^2+2cx+c^2. Here c={c}. {final_sentence(rng, answer)}"
+    return {"kind": "symbolic_expression", "question": question, "reasoning": reasoning, "answer": answer}
 
 
-def make_unit_decimal_case(rng: random.Random, idx: int) -> Dict[str, str]:
-    unit = rng.choice(["m", "mm", "cm", "kg", "g", "s", "ms", "N", "J", "m/s", "m/s^2"])
-    value = rng.choice([
-        round(rng.uniform(-12, 12), 2),
-        round(rng.uniform(0.05, 5), 3),
-        rng.choice([-9.8, -2.50, 0.125, 1.903, 3.14]),
-    ])
-    ans = f"{fmt_num(value)} {unit}"
+def gen_unit_case(rng: random.Random) -> Dict[str, str]:
+    unit = rng.choice(VALID_UNITS)
+    value = rng.choice([round(rng.uniform(-9.5, 9.5), 2), round(rng.uniform(0.05, 3.0), 3)])
+    # Keep human-readable trailing zeros sometimes for mm/m cases.
+    if unit in {"mm", "m", "cm"}:
+        number = f"{value:.2f}" if rng.random() < 0.4 else str(value)
+    else:
+        number = str(value)
+    answer = f"{number} {unit}"
     question_templates = [
-        f"Report the measured value {fmt_num(value)} using the unit {unit}.",
-        f"Write the final numerical result as a signed decimal with unit {unit}: {fmt_num(value)}.",
-        f"Give the compact answer for a quantity equal to {fmt_num(value)} {unit}.",
-        f"A calculation gives {fmt_num(value)} in units of {unit}. Write the final answer with unit.",
+        f"Report the measured value {number} using the unit {unit}.",
+        f"Give the final numeric result with unit {unit}: {number}.",
+        f"Write the signed decimal value {number} together with the unit {unit}.",
     ]
     reasoning_templates = [
-        f"First, keep the decimal value {fmt_num(value)} unchanged and attach the unit {unit}.",
-        f"To solve, preserve the sign and decimal places, then write the unit symbol {unit} after the number.",
-        f"The result is already in the requested unit, so only the compact value with unit is needed.",
+        f"To solve, keep the sign and decimal value, then attach the required unit. {final_sentence(rng, answer)}",
+        f"First, preserve the numeric precision. Then include the unit exactly once. {final_sentence(rng, answer)}",
+        f"The result should be written as a short decimal followed by its unit. {final_sentence(rng, answer)}",
     ]
-    return {
-        "id": f"param_unit_decimal_{idx:04d}",
-        "kind": "unit_decimal",
-        "question": rng.choice(question_templates),
-        "reasoning": rng.choice(reasoning_templates) + " " + rng.choice(SYNTHETIC_FINAL_TEMPLATES).format(answer=ans),
-        "solution": ans,
-    }
+    return {"kind": "unit_number", "question": rng.choice(question_templates), "reasoning": rng.choice(reasoning_templates), "answer": answer}
 
 
-def make_number_case(rng: random.Random, idx: int) -> Dict[str, str]:
-    a = round(rng.uniform(-15, 15), 2)
-    b = round(rng.uniform(-8, 8), 2)
-    value = round(a + b, 2)
-    ans = fmt_num(value)
-    question_templates = [
-        f"Compute {fmt_num(a)} + {fmt_num(b)}.",
-        f"Evaluate the signed decimal expression {fmt_num(a)}+{fmt_num(b)}.",
-        f"Add {fmt_num(a)} and {fmt_num(b)} and give only the result.",
-    ]
-    reasoning_templates = [
-        f"First, combine the two signed decimals. The arithmetic result is {ans}.",
-        f"To solve, add the values while preserving the correct sign.",
-        f"First align the decimal places and perform the addition.",
-    ]
-    return {
-        "id": f"param_number_{idx:04d}",
-        "kind": "number",
-        "question": rng.choice(question_templates),
-        "reasoning": rng.choice(reasoning_templates) + " " + rng.choice(SYNTHETIC_FINAL_TEMPLATES).format(answer=ans),
-        "solution": ans,
-    }
+def generate_one_case(rng: random.Random) -> Dict[str, str]:
+    gens = [gen_interval_case, gen_inequality_case, gen_equation_case, gen_symbolic_case, gen_unit_case]
+    weights = [0.24, 0.12, 0.24, 0.24, 0.16]
+    return rng.choices(gens, weights=weights, k=1)[0](rng)
 
 
-SYNTHETIC_GENERATORS = [
-    ("interval", make_interval_case),
-    ("inequality", make_inequality_case),
-    ("equation", make_linear_equation_case),
-    ("equation", make_formula_equation_case),
-    ("symbolic_expression", make_symbolic_case),
-    ("unit_decimal", make_unit_decimal_case),
-    ("number", make_number_case),
-]
-
-
-def make_extra_cases(seed: int = 42, synthetic_count: int = 240) -> List[Dict[str, str]]:
-    """Generate parameterized synthetic cases with unique answers.
-
-    synthetic_count controls the total number of generated synthetic examples.
-    The generator first samples a problem type, then samples parameters such as
-    interval endpoints, inequality threshold, equation coefficients, expression
-    constants, or unit decimal values.  It then constructs the reasoning
-    backwards so that every example ends with a final-answer style marker.
-    """
+def generate_synthetic_cases(count: int, seed: int, seen_answers: set[str]) -> List[Dict[str, str]]:
     rng = random.Random(seed)
-    generated: List[Dict[str, str]] = []
-    seen_answers: set[str] = set()
+    out: List[Dict[str, str]] = []
     attempts = 0
-    max_attempts = max(2000, synthetic_count * 40)
-
-    # Slightly emphasize the hard forms that motivated S1F_RL.
-    weights = {
-        "interval": 0.24,
-        "inequality": 0.12,
-        "equation": 0.20,
-        "symbolic_expression": 0.20,
-        "unit_decimal": 0.18,
-        "number": 0.06,
-    }
-    names = [name for name, _ in SYNTHETIC_GENERATORS]
-    probs = [weights.get(name, 0.1) for name in names]
-
-    while len(generated) < synthetic_count and attempts < max_attempts:
+    while len(out) < count and attempts < count * 80 + 500:
         attempts += 1
-        gen_index = rng.choices(range(len(SYNTHETIC_GENERATORS)), weights=probs, k=1)[0]
-        kind, gen = SYNTHETIC_GENERATORS[gen_index]
-        row = gen(rng, len(generated))
-        answer = normalize_answer_text(row.get("solution", ""))
-        ok, reason_or_kind = is_supported_short_answer(answer)
+        case = generate_one_case(rng)
+        ans = clean_candidate_answer(case["answer"])
+        ok, kind, _ = classify_answer(ans)
         if not ok:
             continue
-        key = answer.lower().replace(" ", "")
+        key = normalize_for_match(ans)
         if key in seen_answers:
             continue
         seen_answers.add(key)
-        row["solution"] = answer
-        row["kind"] = row.get("kind", reason_or_kind)
-        generated.append(row)
-
-    rng.shuffle(generated)
-    return generated
-
-
-
-def allocate_synthetic_quotas(
-    real_counts: Dict[str, int],
-    synthetic_ratio: float,
-    min_synthetic_per_split: int,
-    max_synthetic_fraction: float,
-) -> Dict[str, int]:
-    """Allocate synthetic examples after seeing real extracted counts.
-
-    synthetic_ratio is relative to the real samples in the same split. For example,
-    0.30 means roughly 30 synthetic samples per 100 real samples. The actual
-    fraction in the final dataset is ratio / (1 + ratio).
-
-    min_synthetic_per_split prevents tiny val/test splits such as 4 examples.
-    max_synthetic_fraction avoids synthetic examples dominating a split when the
-    real count is very small.
-    """
-    quotas: Dict[str, int] = {}
-    for split in ["train", "val", "test"]:
-        real_n = int(real_counts.get(split, 0))
-        base = int(round(real_n * synthetic_ratio))
-        quota = max(min_synthetic_per_split, base)
-
-        # If there are no real examples at all in a split, still add a small
-        # diagnostic set, but do not create a huge synthetic-only split.
-        if real_n <= 0:
-            quota = min_synthetic_per_split
-
-        if max_synthetic_fraction > 0 and real_n > 0:
-            # quota / (real_n + quota) <= max_synthetic_fraction
-            max_quota = int(max_synthetic_fraction * real_n / max(1e-8, 1.0 - max_synthetic_fraction))
-            max_quota = max(min_synthetic_per_split, max_quota)
-            quota = min(quota, max_quota)
-
-        quotas[split] = max(0, quota)
-    return quotas
-
-
-def split_extra_cases_by_quota(seed: int, quotas: Dict[str, int]) -> Dict[str, List[Dict[str, Any]]]:
-    total_needed = sum(max(0, int(v)) for v in quotas.values())
-    cases = make_extra_cases(seed=seed, synthetic_count=total_needed)
-
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    cursor = 0
-    for split in ["train", "val", "test"]:
-        n = max(0, int(quotas.get(split, 0)))
-        out[split] = cases[cursor: cursor + n]
-        cursor += n
+        case["answer"] = ans
+        case["kind"] = kind
+        out.append(case)
     return out
 
 
-def build_real_split(rows: List[Dict[str, Any]], split: str, seed: int) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Build only real S1K-derived examples, before adding synthetic data."""
+# -------------------------- split construction --------------------------
+
+def filter_real_split(
+    rows: List[Dict[str, Any]],
+    split: str,
+    require_reasoning_match: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], set[str]]:
     out: List[Dict[str, Any]] = []
     stats: Dict[str, int] = {
-        "total": len(rows),
-        "kept_direct_solution": 0,
-        "kept_extracted_final": 0,
-        "synthetic_added": 0,
+        "raw_total": len(rows),
+        "real_kept": 0,
     }
+    seen_answers: set[str] = set()
 
     for idx, row in enumerate(rows):
-        solution = pick_first(row, SOLUTION_KEYS)
-        ok, answer, reason = looks_like_short_answer(solution)
-        if ok:
-            out.append(make_sample(row, split, idx, answer, source_tag="s1f_rl_direct_solution", synthetic=False))
-            stats["kept_direct_solution"] += 1
-            stats[reason] = stats.get(reason, 0) + 1
-            continue
-
-        reasoning = pick_first(row, REASONING_KEYS)
-        search_text = "\n".join([reasoning, solution])
-        ok2, extracted, extract_reason = extract_final_answer(search_text)
-        if ok2:
-            out.append(make_sample(row, split, idx, extracted, source_tag="s1f_rl_extracted_final", synthetic=False))
-            stats["kept_extracted_final"] += 1
-            stats[extract_reason] = stats.get(extract_reason, 0) + 1
-            continue
-
-        stats[f"drop_{reason}"] = stats.get(f"drop_{reason}", 0) + 1
-        stats[f"extract_fail_{extract_reason}"] = stats.get(f"extract_fail_{extract_reason}", 0) + 1
-
-    stats["kept_real_total"] = stats["kept_direct_solution"] + stats["kept_extracted_final"]
-    stats["kept_total"] = stats["kept_real_total"]
-    return out, stats
-
-
-def add_synthetic_to_split(
-    out: List[Dict[str, Any]],
-    stats: Dict[str, int],
-    split: str,
-    seed: int,
-    add_synthetic: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    existing_answers = {
-        normalize_answer_text(str(item.get("answer", ""))).lower().replace(" ", "")
-        for item in out
-    }
-    start = len(out)
-    for j, row in enumerate(add_synthetic):
-        ok, answer, reason = looks_like_short_answer(row.get("solution", ""))
+        ok, answer, answer_source, kind_or_reason = choose_answer_for_row(row)
         if not ok:
-            stats[f"synthetic_drop_{reason}"] = stats.get(f"synthetic_drop_{reason}", 0) + 1
+            key = f"drop_{kind_or_reason}"
+            stats[key] = stats.get(key, 0) + 1
             continue
-        answer_key = normalize_answer_text(answer).lower().replace(" ", "")
-        if answer_key in existing_answers:
-            stats["synthetic_drop_duplicate_answer"] = stats.get("synthetic_drop_duplicate_answer", 0) + 1
+
+        reasoning = get_reasoning(row)
+        if require_reasoning_match and not answer_matches_reasoning(reasoning, answer):
+            stats["drop_reasoning_answer_mismatch"] = stats.get("drop_reasoning_answer_mismatch", 0) + 1
             continue
-        existing_answers.add(answer_key)
-        out.append(make_sample(row, split, start + j, answer, source_tag="s1f_rl_synthetic_parametric", synthetic=True))
-        stats["synthetic_added"] += 1
 
-    rng = random.Random(seed + {"train": 11, "val": 17, "test": 23}.get(split, 0))
-    rng.shuffle(out)
-    stats["kept_total"] = stats.get("kept_real_total", 0) + stats["synthetic_added"]
-    return out, stats
+        valid, kind, reason = classify_answer(answer)
+        if not valid:
+            stats[f"drop_{reason}"] = stats.get(f"drop_{reason}", 0) + 1
+            continue
+
+        sample = make_real_sample(row, split, idx, answer, answer_source, kind)
+        out.append(sample)
+        stats["real_kept"] += 1
+        stats[f"kept_{kind}"] = stats.get(f"kept_{kind}", 0) + 1
+        stats[f"kept_{answer_source}"] = stats.get(f"kept_{answer_source}", 0) + 1
+        seen_answers.add(normalize_for_match(answer))
+
+    return out, stats, seen_answers
 
 
-def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+def compute_synthetic_quota(
+    real_count: int,
+    split: str,
+    synthetic_ratio: float,
+    min_train: int,
+    min_eval: int,
+    max_synthetic_fraction: float,
+) -> int:
+    min_n = min_train if split == "train" else min_eval
+    base = max(min_n, int(round(real_count * synthetic_ratio)))
+    if max_synthetic_fraction > 0 and real_count > 0:
+        # synth / (real + synth) <= max_fraction
+        max_n = int((max_synthetic_fraction * real_count) / max(1e-8, (1.0 - max_synthetic_fraction)))
+        base = min(base, max(min_n, max_n))
+    return max(0, base)
+
+
+def build_dataset(args: argparse.Namespace) -> Dict[str, Any]:
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    rng = random.Random(args.seed)
+
+    report: Dict[str, Any] = {
+        "input_dir": str(input_dir),
+        "output_dir": str(output_dir),
+        "seed": args.seed,
+        "base": "filtered_qra_plus_parametric_synthetic",
+        "require_reasoning_match": bool(args.require_reasoning_match),
+        "synthetic_ratio": args.synthetic_ratio,
+        "min_synthetic_train": args.min_synthetic_train,
+        "min_synthetic_eval": args.min_synthetic_eval,
+        "max_synthetic_fraction": args.max_synthetic_fraction,
+        "splits": {},
+    }
+
+    global_seen: set[str] = set()
+    split_rows: Dict[str, List[Dict[str, Any]]] = {}
+
+    for split in ["train", "val", "test"]:
+        raw_rows = load_split(input_dir, split)
+        real_rows, stats, seen = filter_real_split(
+            raw_rows,
+            split=split,
+            require_reasoning_match=bool(args.require_reasoning_match),
+        )
+        global_seen.update(seen)
+
+        quota = compute_synthetic_quota(
+            real_count=len(real_rows),
+            split=split,
+            synthetic_ratio=float(args.synthetic_ratio),
+            min_train=int(args.min_synthetic_train),
+            min_eval=int(args.min_synthetic_eval),
+            max_synthetic_fraction=float(args.max_synthetic_fraction),
+        )
+        synth_cases = generate_synthetic_cases(
+            count=quota,
+            seed=args.seed + {"train": 101, "val": 202, "test": 303}[split],
+            seen_answers=global_seen,
+        )
+        synth_rows = [make_synthetic_sample(split, i, c) for i, c in enumerate(synth_cases)]
+        all_rows = real_rows + synth_rows
+        rng.shuffle(all_rows)
+        split_rows[split] = all_rows
+
+        final_count = len(all_rows)
+        synth_count = len(synth_rows)
+        report["splits"][split] = {
+            **stats,
+            "synthetic_quota": quota,
+            "synthetic_added": synth_count,
+            "written": final_count,
+            "synthetic_fraction_final": (synth_count / final_count) if final_count else 0.0,
+        }
+
+    # Do not move real samples across splits. This just reports the achieved ratio.
+    total_written = sum(len(v) for v in split_rows.values())
+    report["total_written"] = total_written
+    if total_written:
+        report["final_split_ratio"] = {
+            split: len(split_rows[split]) / total_written for split in ["train", "val", "test"]
+        }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for split, rows in split_rows.items():
+        write_jsonl(output_dir / f"{split}.jsonl", rows)
+    (output_dir / "build_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return report
 
 
 def main() -> None:
     script_dir = Path(__file__).resolve().parent
     repo_dir = script_dir.parent
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input-dir", type=str, default=str(repo_dir / "data" / "S1K"), help="Original S1K split directory, normally repo_root/data/S1K.")
-    parser.add_argument("--output-dir", type=str, default=str(script_dir / "data" / "S1F_RL"), help="Output directory. Default: rl_qra_pipeline/data/S1F_RL.")
+    parser.add_argument(
+        "--input-dir",
+        type=str,
+        default=str(script_dir / "data" / "QRA"),
+        help="Input QRA data directory. Default: rl_qra_pipeline/data/QRA.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(script_dir / "data" / "S1F_RL"),
+        help="Output directory. Default: rl_qra_pipeline/data/S1F_RL.",
+    )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--synthetic-ratio", type=float, default=0.25)
+    parser.add_argument("--min-synthetic-train", type=int, default=20)
+    parser.add_argument("--min-synthetic-eval", type=int, default=8)
+    parser.add_argument("--max-synthetic-fraction", type=float, default=0.35)
     parser.add_argument(
-        "--synthetic-ratio",
-        type=float,
-        default=0.30,
-        help="Synthetic/real ratio per split after real S1K extraction. 0.30 means synthetic is about 23 percent of the final split.",
-    )
-    parser.add_argument(
-        "--min-synthetic-per-split",
-        type=int,
-        default=8,
-        help="Minimum synthetic examples added to each split, useful when val/test real counts are tiny.",
-    )
-    parser.add_argument(
-        "--max-synthetic-fraction",
-        type=float,
-        default=0.40,
-        help="Maximum synthetic fraction in each final split. Use 0 to disable. Default 0.40 prevents synthetic domination.",
-    )
-    parser.add_argument(
-        "--synthetic-count",
-        type=int,
-        default=None,
-        help="Optional override for total synthetic count. If set, allocation is 8:1:1 with per-split minimum still applied.",
-    )
-    parser.add_argument(
-        "--synthetic-variants-per-case",
-        type=int,
-        default=None,
-        help="Deprecated alias. If provided, it is treated as --synthetic-count for compatibility.",
+        "--require-reasoning-match",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop real QRA rows whose answer cannot be matched in reasoning. Default: true.",
     )
     args = parser.parse_args()
 
-    input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
-
-    # First pass: extract only real S1K-derived examples. This lets us decide
-    # how many synthetic hard cases to add based on the actual real data size.
-    real_built: Dict[str, List[Dict[str, Any]]] = {}
-    split_stats: Dict[str, Dict[str, int]] = {}
-    real_counts: Dict[str, int] = {}
-
-    for split in ["train", "val", "test"]:
-        rows = load_split(input_dir, split)
-        built, stats = build_real_split(rows=rows, split=split, seed=args.seed)
-        real_built[split] = built
-        split_stats[split] = stats
-        real_counts[split] = len(built)
-
-    synthetic_count_override = args.synthetic_count
-    if synthetic_count_override is None and args.synthetic_variants_per_case is not None:
-        synthetic_count_override = args.synthetic_variants_per_case
-
-    if synthetic_count_override is not None:
-        total = max(0, int(synthetic_count_override))
-        quotas = {
-            "train": int(round(total * 0.8)),
-            "val": int(round(total * 0.1)),
-        }
-        quotas["test"] = max(0, total - quotas["train"] - quotas["val"])
-        for split in ["train", "val", "test"]:
-            quotas[split] = max(args.min_synthetic_per_split, quotas[split]) if total > 0 else 0
-    else:
-        quotas = allocate_synthetic_quotas(
-            real_counts=real_counts,
-            synthetic_ratio=args.synthetic_ratio,
-            min_synthetic_per_split=args.min_synthetic_per_split,
-            max_synthetic_fraction=args.max_synthetic_fraction,
-        )
-
-    extra_by_split = split_extra_cases_by_quota(args.seed, quotas)
-
-    summary: Dict[str, Any] = {
-        "input_dir": str(input_dir),
-        "output_dir": str(output_dir),
-        "seed": args.seed,
-        "version": "s1f_rl_v5_final_marker_extraction_plus_ratio_controlled_parametric_synthetic",
-        "real_counts_before_synthetic": real_counts,
-        "synthetic_ratio": args.synthetic_ratio,
-        "min_synthetic_per_split": args.min_synthetic_per_split,
-        "max_synthetic_fraction": args.max_synthetic_fraction,
-        "synthetic_count_override": synthetic_count_override,
-        "synthetic_quotas": quotas,
-        "synthetic_total_assigned": sum(len(v) for v in extra_by_split.values()),
-        "synthetic_policy": "extract real S1K samples first, then add parametric hard cases per split according to real-count ratio; no repeated synthetic answer",
-        "synthetic_types": {
-            "interval": "parametric",
-            "inequality": "parametric",
-            "equation": "parametric",
-            "symbolic_expression": "parametric",
-            "unit_decimal_or_signed_decimal": "parametric",
-        },
-        "splits": {},
-    }
-
-    for split in ["train", "val", "test"]:
-        built, stats = add_synthetic_to_split(
-            out=real_built[split],
-            stats=split_stats[split],
-            split=split,
-            seed=args.seed,
-            add_synthetic=extra_by_split.get(split, []),
-        )
-        write_jsonl(output_dir / f"{split}.jsonl", built)
-        synthetic_fraction = (stats["synthetic_added"] / max(1, len(built))) if built else 0.0
-        summary["splits"][split] = {
-            **stats,
-            "written": len(built),
-            "synthetic_quota": quotas.get(split, 0),
-            "synthetic_assigned": len(extra_by_split.get(split, [])),
-            "synthetic_fraction_final": synthetic_fraction,
-        }
+    report = build_dataset(args)
+    print(f"Wrote {report['output_dir']}")
+    for split, info in report["splits"].items():
         print(
-            f"[{split}] total={stats['total']} "
-            f"real={stats.get('kept_real_total', 0)} "
-            f"direct={stats['kept_direct_solution']} "
-            f"extracted={stats['kept_extracted_final']} "
-            f"synthetic={stats['synthetic_added']} "
-            f"written={len(built)} "
-            f"synthetic_fraction={synthetic_fraction:.3f}"
+            f"[{split}] raw={info['raw_total']} real_kept={info['real_kept']} "
+            f"synthetic={info['synthetic_added']} written={info['written']} "
+            f"synthetic_frac={info['synthetic_fraction_final']:.3f}"
         )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "build_report.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Wrote {output_dir}")
+    if "final_split_ratio" in report:
+        print("final_split_ratio:", json.dumps(report["final_split_ratio"], ensure_ascii=False))
 
 
 if __name__ == "__main__":
