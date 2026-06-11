@@ -235,7 +235,7 @@ def main() -> None:
     split = str(args.split or eval_cfg.get("split") or "test")
     data_dir = resolve_data_dir(config)
     datasets = list(eval_cfg.get("datasets") or [data_dir.name])
-    compare_models = config.get("compare_models") or default_compare_models(config)
+    compare_models = eval_cfg.get("compare_models") or config.get("compare_models") or default_compare_models(config)
 
     print(f"[eval] device={device}", flush=True)
     print(f"[eval] data_dir={data_dir}", flush=True)
@@ -260,7 +260,7 @@ def main() -> None:
     dump_json(rows, out_dir / "test_results.json")
 
     # Robust: config may not have output block.
-    output_root = repo_path((config.get("output") or {}).get("root_dir", "rl_qra_pipeline/modelparameter"))
+    output_root = repo_path((selected_start_cfg(config).get("output_dir") or (config.get("output") or {}).get("dir") or "rl_qra_pipeline/modelparameter/rl_QRA"))
     for model_name in sorted({row["model"] for row in rows}):
         model_rows = [row for row in rows if row["model"] == model_name]
         model_dir = output_root / model_name

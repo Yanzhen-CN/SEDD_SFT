@@ -451,7 +451,7 @@ def update_global_best(
     return improved
 
 
-def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", cli_gpu: int | None = None, cli_cpu: bool = False) -> Path:
+def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA", cli_gpu: int | None = None, cli_cpu: bool = False) -> Path:
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
     device = choose_device(cfg, cli_gpu=cli_gpu, cli_cpu=cli_cpu)
@@ -515,13 +515,13 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", cli_gpu: i
     run_info_path = out_dir / "run_info.json"
     dump_json(run_info_path, run_info)
     metrics_path = out_dir / "metrics.csv"
-    debug_path = out_dir / "rrpi_debug.jsonl"
+    debug_path = out_dir / "rollout_debug.jsonl"
 
     best_loss = float("inf")
     best_step = 0
     best_row: Dict[str, Any] = {}
-    best_path = out_dir / "best_RL_QRA_rrpi.pth"
-    last_path = out_dir / "last_RL_QRA_rrpi.pth"
+    best_path = out_dir / "best_run.pth"
+    last_path = out_dir / "last_run.pth"
 
     numeric_keys = [k for k in METRIC_FIELDS if k not in {"step", "loss", "lr"}]
     last_debug_records: List[Dict[str, Any]] = []
@@ -643,7 +643,7 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", cli_gpu: i
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
-    parser.add_argument("--run-name", type=str, default="rrpi")
+    parser.add_argument("--run-name", type=str, default="rollout_slotalign")
     parser.add_argument("--start", type=str, default=None, help="Start key under config.starts, e.g. pretrain, QA, QRA")
     parser.add_argument("--gpu", type=int, default=None, help="Use cuda:<gpu>. Overrides run.cuda_device in config.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU.")

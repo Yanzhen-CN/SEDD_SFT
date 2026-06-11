@@ -83,6 +83,16 @@ def choose_device(args: argparse.Namespace, cfg: Dict[str, Any]) -> torch.device
     return torch.device(f"cuda:{int(cfg_gpu)}")
 
 
+def split_cli_values(values):
+    out = []
+    for value in values or []:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
+
+
 def selected_start_name(cfg: Dict[str, Any], cli_start: Optional[str]) -> str:
     return str(cli_start or (cfg.get("run") or {}).get("selected") or cfg.get("selected") or "QRA")
 
@@ -124,7 +134,8 @@ def resolve_compare_models(args: argparse.Namespace, cfg: Dict[str, Any], start_
 
     out: Dict[str, Dict[str, str]] = {}
     for name, spec in compare.items():
-        if args.models and str(name) not in set(args.models):
+        cli_models = set(split_cli_values(args.models))
+        if cli_models and str(name) not in cli_models:
             continue
         if isinstance(spec, dict):
             ckpt = spec.get("checkpoint") or spec.get("path") or spec.get("ckpt")
@@ -139,8 +150,9 @@ def resolve_compare_models(args: argparse.Namespace, cfg: Dict[str, Any], start_
 
 
 def resolve_eval_datasets(args: argparse.Namespace, cfg: Dict[str, Any], start_name: str) -> List[str]:
-    if args.datasets:
-        return list(args.datasets)
+    cli_datasets = split_cli_values(args.datasets)
+    if cli_datasets:
+        return cli_datasets
     eval_cfg = cfg.get("eval") or {}
     base = resolve_base_data_dir(cfg, start_name)
     return list(eval_cfg.get("datasets") or [base.name])
@@ -644,7 +656,7 @@ def main() -> None:
             d: [{"id": s.get("id", ""), "answer": extract_gt_answer(s), "kind": answer_kind(extract_gt_answer(s))} for s in ss]
             for d, ss in selected_by_dataset.items()
         },
-        "note": "This is a chain dump for configured eval models. It does not calculate reward or score.",
+        "note": "Chain dump for configured eval models. Use visual_rl_qra.py --chain-dir on this output for mask/exact trajectory plots.",
     }
     dump_json(out_dir / "summary.json", summary)
 

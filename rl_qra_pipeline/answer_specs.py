@@ -11,6 +11,9 @@ LETTER_RE = re.compile(r"^[A-Za-z]$")
 INTEGER_RE = re.compile(r"^[+-]?\d+$")
 DECIMAL_RE = re.compile(r"^[+-]?(?:\d+\.\d+|\.\d+)$")
 NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$")
+UNIT_RE = r"(?:m|mm|cm|km|kg|g|s|ms|N|J|W|V|A|Hz|m/s|m/s\^2)"
+UNIT_DECIMAL_RE = re.compile(rf"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)\s*{UNIT_RE}$")
+EQUATION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\s*=\s*.+$")
 INTERVAL_RE = re.compile(
     r"^\s*([\(\[])\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*,\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([\)\]])\s*$"
 )
@@ -27,7 +30,7 @@ class AnswerSpec:
 
     @property
     def structured(self) -> bool:
-        return self.type in {"signed_decimal", "interval"}
+        return self.type in {"signed_decimal", "interval", "unit_decimal", "equation", "symbolic_expression"}
 
     @property
     def single(self) -> bool:
@@ -147,6 +150,24 @@ def parse_answer_spec(text: str) -> AnswerSpec:
             type="signed_decimal",
             components={"sign": sign, "int_part": str(int(int_part)) if int_part.isdigit() else int_part, "dot": ".", "frac_part": frac_part},
         )
+
+    if UNIT_DECIMAL_RE.match(compact):
+        m_unit = re.match(rf"^([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*({UNIT_RE})$", compact)
+        if m_unit:
+            number, unit = m_unit.groups()
+            return AnswerSpec(
+                raw=raw,
+                canonical=f"{_canonical_number(number)} {unit}",
+                type="unit_decimal",
+                components={"number": _canonical_number(number), "unit": unit},
+            )
+
+    if EQUATION_RE.match(compact):
+        lhs, rhs = compact.split("=", 1)
+        return AnswerSpec(raw=raw, canonical=f"{lhs}={rhs}", type="equation", components={"lhs": lhs, "equals": "=", "rhs": rhs})
+
+    if any(sym in compact for sym in ["^", "/", "sqrt", "pi", "\\sqrt", "\\frac", "*", "+", "-"]) and re.search(r"[A-Za-z0-9]", compact):
+        return AnswerSpec(raw=raw, canonical=compact, type="symbolic_expression", components={"expr": compact})
 
     return AnswerSpec(raw=raw, canonical=raw.strip().lower(), type="short_text", components={"text": raw.strip().lower()})
 

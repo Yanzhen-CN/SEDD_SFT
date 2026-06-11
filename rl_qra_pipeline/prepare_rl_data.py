@@ -487,7 +487,7 @@ SYNTH_GENERATORS = [synth_interval, synth_inequality, synth_equation, synth_symb
 
 def make_synthetic_row(split: str, idx: int, q: str, r: str, ans: str, source: str) -> Dict[str, Any]:
     return {
-        "id": f"s1f_rl_{source}_{split}_{idx:06d}",
+        "id": f"s1k_rl_{source}_{split}_{idx:06d}",
         "mode": "QRA",
         "split": split,
         "source": source,
