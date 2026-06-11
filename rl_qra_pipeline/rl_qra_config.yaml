@@ -133,7 +133,8 @@ eval:
     - S1K_RL
     - QRA
   compare_models:
-    QRA_base:
+    QRA:
       checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
     rl_QRA:
       checkpoint: rl_qra_pipeline/modelparameter/rl_QRA/best.pth
+    pretrain:
