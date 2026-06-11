@@ -3,24 +3,41 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import random
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-QUESTION_KEYS = ["question", "problem", "prompt", "input", "query"]
-REASONING_KEYS = [
+QRA_SEGMENT_ORDER = [
+    "user_label",
+    "user",
+    "assistant_label",
+    "reasoning_label",
     "reasoning",
-    "rationale",
-    "thinking",
-    "cot",
-    "chain_of_thought",
-    "deepseek_thinking_trajectory",
-    "gemini_thinking_trajectory",
+    "answer_label",
+    "answer",
 ]
-ANSWER_KEYS = ["answer", "solution", "final_answer", "target", "output", "reference_completion", "completion"]
+
+SPLIT_ALIASES = {
+    "train": ["train"],
+    "val": ["val", "valid", "validation"],
+    "test": ["test"],
+}
+
+BAD_MOJIBAKE = ["�", "Ã", "Â", "â€", "â€™", "â€œ", "â€�", "ï¼"]
+BAD_PUNCT = set("》《【】『』「」")
+PURE_SYMBOL_SET = {
+    "", "$", "$$", r"\(", r"\)", r"\[", r"\]",
+    "[", "]", "(", ")", "{", "}", ".", ",", ":", ";",
+    "=", "-", "+", "*", "/", "\\", "|", "<", ">", "_", "^",
+}
+
+FULLWIDTH_TRANS = str.maketrans({
+    "−": "-", "–": "-", "—": "-",
+    "，": ",", "。": ".", "：": ":", "；": ";",
+    "（": "(", "）": ")", "［": "[", "］": "]",
+})
 
 VALID_UNITS = [
     "m/s^2", "m/s", "mm", "cm", "km", "kg", "ms", "Hz",
@@ -28,43 +45,6 @@ VALID_UNITS = [
 ]
 UNIT_PATTERN = "(?:" + "|".join(re.escape(u) for u in sorted(VALID_UNITS, key=len, reverse=True)) + ")"
 NUM_PATTERN = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
-VAR_PATTERN = r"[A-Za-z][A-Za-z0-9_]*"
-
-PURE_SYMBOLS = {
-    "", "$", "$$", r"\(", r"\)", r"\[", r"\]",
-    "[", "]", "(", ")", "{", "}", ".", ",", ":", ";",
-    "=", "-", "+", "*", "/", "\\", "|", "<", ">", "_", "^",
-}
-
-BAD_CHARS_RE = re.compile(r"[�]|[）》《【】『』「」]|>>|<<")
-FULLWIDTH_TRANS = str.maketrans({
-    "−": "-", "–": "-", "—": "-",
-    "，": ",", "。": ".", "：": ":", "；": ";",
-    "（": "(", "）": ")", "［": "[", "］": "]",
-})
-
-FINAL_MARKERS = [
-    r"therefore,?\s+the\s+final\s+answer\s+is",
-    r"thus,?\s+the\s+final\s+answer\s+is",
-    r"hence,?\s+the\s+final\s+answer\s+is",
-    r"finally,?\s+the\s+final\s+answer\s+is",
-    r"therefore,?\s+the\s+final\s+solution\s+is",
-    r"thus,?\s+the\s+final\s+solution\s+is",
-    r"hence,?\s+the\s+final\s+solution\s+is",
-    r"finally,?\s+the\s+final\s+solution\s+is",
-    r"so\s+the\s+solution\s+is",
-    r"so\s+the\s+answer\s+is",
-    r"the\s+answer\s+should\s+be",
-    r"the\s+required\s+answer\s+is",
-    r"the\s+final\s+answer\s+is",
-    r"final\s+answer\s*[:=]?",
-    r"the\s+answer\s*[:=]?",
-    r"answer\s*[:=]",
-    r"the\s+solution\s*[:=]?",
-    r"solution\s*[:=]",
-    r"our\s+answer\s+is",
-]
-FINAL_MARKER_RE = re.compile(r"(?is)(?:" + "|".join(FINAL_MARKERS) + r")\s*")
 
 FINAL_SENTENCES = [
     "Therefore, the final answer is {answer}.",
@@ -73,20 +53,20 @@ FINAL_SENTENCES = [
     "The answer should be {answer}.",
     "Finally, the answer is {answer}.",
     "Hence, the answer is {answer}.",
+    "This gives the final answer as {answer}.",
 ]
 
 
-# ----------------------------- IO -----------------------------
+def clean(text: Any) -> str:
+    return str(text or "").strip()
 
-def read_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     if not path.exists():
-        return []
-    text = path.read_text(encoding="utf-8")
-    if not text.strip():
-        return []
-    if path.suffix.lower() == ".jsonl":
-        rows: List[Dict[str, Any]] = []
-        for line_no, line in enumerate(text.splitlines(), start=1):
+        return rows
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
@@ -96,40 +76,7 @@ def read_json_or_jsonl(path: Path) -> List[Dict[str, Any]]:
                 raise ValueError(f"Failed to parse {path}:{line_no}: {exc}") from exc
             if isinstance(obj, dict):
                 rows.append(obj)
-        return rows
-
-    obj = json.loads(text)
-    if isinstance(obj, list):
-        return [x for x in obj if isinstance(x, dict)]
-    if isinstance(obj, dict):
-        for key in ["data", "rows", "examples", "train", "val", "valid", "validation", "test"]:
-            value = obj.get(key)
-            if isinstance(value, list):
-                return [x for x in value if isinstance(x, dict)]
-    return []
-
-
-def split_candidates(input_dir: Path, split: str) -> List[Path]:
-    names = [split]
-    if split == "val":
-        names += ["valid", "validation"]
-    out: List[Path] = []
-    for name in names:
-        out += [
-            input_dir / f"{name}.jsonl",
-            input_dir / f"{name}.json",
-            input_dir / name / "data.jsonl",
-            input_dir / name / "data.json",
-        ]
-    return out
-
-
-def load_split(input_dir: Path, split: str) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
-    for path in split_candidates(input_dir, split):
-        rows = read_json_or_jsonl(path)
-        if rows:
-            return rows, path
-    return [], None
+    return rows
 
 
 def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
@@ -139,143 +86,129 @@ def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-# ----------------------------- QRA row parsing -----------------------------
+def write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def pick_first(row: Dict[str, Any], keys: List[str]) -> str:
-    for key in keys:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
+
+def load_split(input_dir: Path, split: str) -> Tuple[List[Dict[str, Any]], Optional[Path]]:
+    for name in SPLIT_ALIASES[split]:
+        for path in [
+            input_dir / f"{name}.jsonl",
+            input_dir / f"{name}.json",
+            input_dir / name / "data.jsonl",
+            input_dir / name / "data.json",
+        ]:
+            if path.suffix == ".jsonl":
+                rows = read_jsonl(path)
+            elif path.exists():
+                obj = json.loads(path.read_text(encoding="utf-8"))
+                rows = obj if isinstance(obj, list) else obj.get("data", []) if isinstance(obj, dict) else []
+                rows = [r for r in rows if isinstance(r, dict)]
+            else:
+                rows = []
+            if rows:
+                return rows, path
+    return [], None
+
+
+# ----------------------------- segment parsing -----------------------------
+
+def get_seg(row: Dict[str, Any], key: str) -> str:
+    segs = row.get("segments")
+    if isinstance(segs, dict):
+        value = segs.get(key)
+        if isinstance(value, dict):
+            return clean(value.get("text", ""))
+        return clean(value)
+    if isinstance(segs, list):
+        for item in segs:
+            if not isinstance(item, dict):
+                continue
+            name = clean(item.get("name") or item.get("key") or item.get("type")).lower()
+            if name == key.lower():
+                return clean(item.get("text", ""))
     return ""
 
 
-def strip_label_prefix(text: str, labels: List[str]) -> str:
-    out = str(text or "").strip()
-    for label in labels:
-        out = re.sub(rf"(?is)^\s*{re.escape(label)}\s*[:：]?\s*", "", out).strip()
+def get_train_segments(row: Dict[str, Any]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    segs = row.get("segments")
+    if isinstance(segs, dict):
+        for key, value in segs.items():
+            if isinstance(value, dict) and value.get("train") is True:
+                text = clean(value.get("text", ""))
+                if text:
+                    out.append((str(key), text))
+    elif isinstance(segs, list):
+        for item in segs:
+            if not isinstance(item, dict):
+                continue
+            if item.get("train") is True:
+                name = clean(item.get("name") or item.get("key") or item.get("type"))
+                text = clean(item.get("text", ""))
+                if text:
+                    out.append((name, text))
     return out
 
 
-def is_anchor_like_text(text: str) -> bool:
-    compact = re.sub(r"\s+", "", str(text or "").lower())
-    return compact in {"answer:", "answer", "finalanswer:", "finalanswer", "solution:", "solution"}
-
-
-def is_bad_answer_segment_key(key: str) -> bool:
-    key_l = str(key or "").lower()
-    # In QRA data there is often an answer_anchor segment before the real answer.
-    # Never treat it as the answer itself.
-    return any(x in key_l for x in ["anchor", "prefix", "prompt", "header"])
-
-
-def get_segment_text(row: Dict[str, Any], wanted: List[str]) -> str:
-    wanted_lower = {w.lower() for w in wanted}
-    segs = row.get("segments")
-    wants_answer = "answer" in wanted_lower or "target" in wanted_lower or "solution" in wanted_lower
-
-    def clean_candidate(key: str, text: Any) -> str:
-        if wants_answer and is_bad_answer_segment_key(key):
-            return ""
-        out = str(text or "").strip()
-        if wants_answer and is_anchor_like_text(out):
-            return ""
-        return out
-
-    if isinstance(segs, dict):
-        # 1) Exact key match first. This prevents answer_anchor from shadowing answer.
-        for key, value in segs.items():
-            key_l = str(key).lower()
-            if key_l in wanted_lower:
-                text = value.get("text", "") if isinstance(value, dict) else value
-                out = clean_candidate(key_l, text)
-                if out:
-                    return out
-
-        # 2) For answers, prefer train=True segments over fuzzy name matching.
-        if wants_answer:
-            for key, value in segs.items():
-                if is_bad_answer_segment_key(str(key)):
-                    continue
-                if isinstance(value, dict) and value.get("train") is True:
-                    out = clean_candidate(str(key), value.get("text", ""))
-                    if out:
-                        return out
-
-        # 3) Fuzzy match only after exact and train=True fail.
-        for key, value in segs.items():
-            key_l = str(key).lower()
-            if wants_answer and is_bad_answer_segment_key(key_l):
-                continue
-            if any(w in key_l for w in wanted_lower):
-                text = value.get("text", "") if isinstance(value, dict) else value
-                out = clean_candidate(key_l, text)
-                if out:
-                    return out
-
-    if isinstance(segs, list):
-        # 1) Exact named segment first.
-        for item in segs:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or item.get("key") or item.get("type") or "").lower()
-            if name in wanted_lower:
-                out = clean_candidate(name, item.get("text", ""))
-                if out:
-                    return out
-
-        # 2) train=True for answer.
-        if wants_answer:
-            for item in segs:
-                name = str(item.get("name") or item.get("key") or item.get("type") or "").lower()
-                if is_bad_answer_segment_key(name):
-                    continue
-                if item.get("train") is True:
-                    out = clean_candidate(name, item.get("text", ""))
-                    if out:
-                        return out
-
-        # 3) Fuzzy named segment.
-        for item in segs:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or item.get("key") or item.get("type") or "").lower()
-            if wants_answer and is_bad_answer_segment_key(name):
-                continue
-            if any(w in name for w in wanted_lower):
-                out = clean_candidate(name, item.get("text", ""))
-                if out:
-                    return out
-
+def extract_question(row: Dict[str, Any]) -> str:
+    for key in ["question", "user", "prompt", "input", "problem"]:
+        value = clean(row.get(key)) or get_seg(row, key)
+        if value:
+            value = re.sub(r"(?is)^\s*(?:User|Question|Problem|Prompt)\s*[:：]?\s*", "", value).strip()
+            return value
     return ""
 
 
-def get_question(row: Dict[str, Any]) -> str:
-    text = get_segment_text(row, ["question", "problem", "prompt", "input"])
-    if not text:
-        text = pick_first(row, QUESTION_KEYS)
-    return strip_label_prefix(text, ["Question", "Problem", "Prompt", "Input"])
+def extract_reasoning(row: Dict[str, Any]) -> str:
+    for key in ["reasoning", "rationale", "thinking", "cot", "chain_of_thought"]:
+        value = clean(row.get(key)) or get_seg(row, key)
+        if value:
+            value = re.sub(r"(?is)^\s*(?:Reasoning|Rationale|Thinking|CoT)\s*[:：]?\s*", "", value).strip()
+            return value
+    return ""
 
 
-def get_reasoning(row: Dict[str, Any]) -> str:
-    text = get_segment_text(row, ["reasoning", "rationale", "thinking", "cot"])
-    if not text:
-        text = pick_first(row, REASONING_KEYS)
-    return strip_label_prefix(text, ["Reasoning", "Rationale", "Thinking", "CoT"])
+def extract_answer_raw(row: Dict[str, Any]) -> Tuple[str, str]:
+    """Match the real QRA adapter first.
+
+    Root QRA samples from sft_reasoning_pipeline/prepare_reasoning_data.py store:
+      row["answer"] and segments["answer"]["text"] with train=True.
+    Older QA samples may store answer in segments["assistant"] with train=True.
+    """
+    if clean(row.get("answer")):
+        return clean(row.get("answer")), "top_answer"
+    if clean(row.get("solution")):
+        return clean(row.get("solution")), "top_solution"
+
+    ans = get_seg(row, "answer")
+    if ans:
+        return ans, "segments.answer"
+
+    # Older answer-only data uses assistant as the train=True target.
+    assistant = get_seg(row, "assistant")
+    if assistant and any(k.lower() == "assistant" for k, _ in get_train_segments(row)):
+        return assistant, "segments.assistant_train"
+
+    train_segs = get_train_segments(row)
+    preferred = ["answer", "assistant", "completion", "target", "output"]
+    for pref in preferred:
+        for key, text in train_segs:
+            if key.lower() == pref:
+                return text, f"train_segment.{key}"
+
+    if len(train_segs) == 1:
+        key, text = train_segs[0]
+        return text, f"single_train_segment.{key}"
+
+    return "", "missing_answer"
 
 
-def get_answer_text(row: Dict[str, Any]) -> str:
-    # This is the critical part: prepared QRA often stores answer only in segments/train=True,
-    # not as top-level row["answer"].
-    text = get_segment_text(row, ["answer", "target", "solution"])
-    if text:
-        return text
-    return pick_first(row, ANSWER_KEYS)
-
-
-# ----------------------------- answer cleaning / validity -----------------------------
+# ----------------------------- answer filter -----------------------------
 
 def normalize_latex_units(text: str) -> str:
-    out = str(text or "").translate(FULLWIDTH_TRANS)
+    out = clean(text).translate(FULLWIDTH_TRANS)
     out = re.sub(r"\\(?:mathrm|text)\s*\{\s*~?\s*([^{}]+?)\s*\}", lambda m: " " + m.group(1).strip(), out)
     out = out.replace("\\,", " ").replace("\\;", " ").replace("~", " ")
     out = out.replace("\\cdot", "*").replace("\\times", "*")
@@ -286,189 +219,151 @@ def normalize_latex_units(text: str) -> str:
     return out
 
 
-def strip_math_wrappers(text: str) -> str:
-    out = str(text or "").strip()
-    out = re.sub(r"(?is)^\s*(?:answer|solution|final answer|final solution|the answer|the solution|our answer)\s*(?:is|=|:)?\s*", "", out).strip()
-    for left, right in [("$$", "$$"), ("$", "$"), (r"\(", r"\)"), (r"\[", r"\]")]:
-        if out.startswith(left) and out.endswith(right) and len(out) > len(left) + len(right):
-            out = out[len(left):-len(right)].strip()
-    boxed = re.fullmatch(r"\\boxed\{(.+)\}", out, flags=re.S)
+def strip_answer_wrappers(raw: str) -> str:
+    text = clean(raw)
+    text = re.sub(r"(?is)^\s*(?:answer|solution|final answer|final solution|the answer|the solution|our answer)\s*(?:is|=|:|：)?\s*", "", text).strip()
+    boxed = re.fullmatch(r"\\boxed\{(.+)\}", text, flags=re.S)
     if boxed:
-        out = boxed.group(1).strip()
-    out = out.strip().strip("` ")
-    if len(out) > 1 and out[-1] in ".;":
-        out = out[:-1].strip()
-    out = normalize_latex_units(out)
-    return out
+        text = boxed.group(1).strip()
+    for left, right in [("$$", "$$"), ("$", "$"), (r"\(", r"\)"), (r"\[", r"\]")]:
+        if text.startswith(left) and text.endswith(right) and len(text) > len(left) + len(right):
+            text = text[len(left):-len(right)].strip()
+    text = text.strip().strip("` '")
+    if len(text) > 1 and text.endswith((".", ";", "。")) and not re.search(r"\d\.\d$", text):
+        text = text[:-1].strip()
+    return normalize_latex_units(text)
 
 
-def normalize_answer(raw: str) -> str:
-    out = strip_math_wrappers(raw)
-    out = re.sub(r"\s+", " ", out).strip()
-    # Normalize spacing in units while keeping symbolic expressions compact.
-    out = re.sub(rf"^({NUM_PATTERN})\s*({UNIT_PATTERN})$", r"\1 \2", out)
-    out = re.sub(r"\s*([=<>])\s*", r"\1", out)
-    out = re.sub(r"\s*,\s*", ",", out)
-    return out
+def balanced_brackets(text: str) -> bool:
+    stack: List[str] = []
+    pair = {')': '(', ']': '[', '}': '{'}
+    opens = set(pair.values())
+    for ch in text:
+        if ch in opens:
+            stack.append(ch)
+        elif ch in pair:
+            if not stack or stack[-1] != pair[ch]:
+                return False
+            stack.pop()
+    return not stack
 
 
-def balanced_basic(text: str) -> bool:
-    pairs = [("(", ")"), ("[", "]"), ("{", "}")]
-    for left, right in pairs:
-        if text.count(left) != text.count(right):
-            return False
-    return True
-
-
-def is_pure_symbol(text: str) -> bool:
+def pure_symbol(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
-    if compact in PURE_SYMBOLS:
+    if compact in PURE_SYMBOL_SET:
         return True
     return not re.search(r"[A-Za-z0-9]", compact)
 
 
-def classify_answer(answer: str) -> Tuple[bool, str, str]:
-    ans = normalize_answer(answer)
-    compact = ans.replace(" ", "")
+def symbol_noise_ratio(text: str) -> float:
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return 1.0
+    allowed = set("._,;:!?+-*/=()[]{}<>\\/$%°'\"`~^&|#@")
+    noisy = 0
+    for ch in compact:
+        if ch.isalnum() or ch in allowed:
+            continue
+        noisy += 1
+    return noisy / max(1, len(compact))
+
+
+def validate_answer(raw_answer: str, max_chars: int = 160) -> Tuple[bool, str, str, str]:
+    """Conservative *drop bad only* filter.
+
+    Do not whitelist only math forms. Keep normal short text answers from QRA.
+    Drop only clearly broken targets: pure symbols, mojibake, malformed brackets,
+    display-math leftovers, very long formula-looking strings, and symbol-noisy strings.
+    """
+    raw = clean(raw_answer)
+    if not raw:
+        return False, "", "empty", "empty_answer"
+
+    if any(bad in raw for bad in BAD_MOJIBAKE):
+        return False, "", "mojibake", "mojibake"
+    if any(ch in raw for ch in BAD_PUNCT):
+        return False, "", "bad_punctuation", "bad_punctuation"
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", raw):
+        return False, "", "control_char", "control_char"
+
+    # Multi-line display math is almost always a long derivation answer, not a target answer.
+    if "\n" in raw and ("$$" in raw or r"\[" in raw or r"\begin" in raw):
+        return False, "", "multiline_formula", "multiline_formula"
+
+    ans = strip_answer_wrappers(raw)
+    ans = re.sub(r"\s+", " ", ans).strip()
+    ans = re.sub(r"\s*([=<>])\s*", r"\1", ans)
+    ans = re.sub(r"\s*,\s*", ",", ans)
+    ans = re.sub(rf"^({NUM_PATTERN})\s*({UNIT_PATTERN})$", r"\1 \2", ans)
 
     if not ans:
-        return False, "empty", "empty_answer"
-    if ans in PURE_SYMBOLS or is_pure_symbol(ans):
-        return False, "pure_symbol", "pure_symbol"
-    if BAD_CHARS_RE.search(ans):
-        return False, "bad_chars", "bad_chars"
-    if not balanced_basic(ans):
-        return False, "unbalanced", "unbalanced_brackets"
+        return False, "", "empty_after_clean", "empty_after_clean"
+    if ans in PURE_SYMBOL_SET or pure_symbol(ans):
+        return False, "", "pure_symbol", "pure_symbol"
     if "$$" in ans or ans in {"$", "$$"}:
-        return False, "math_delimiter", "math_delimiter_only"
-    if len(ans) > 120:
-        return False, "too_long", "too_long"
+        return False, "", "math_delimiter", "math_delimiter_only"
+    if not balanced_brackets(ans):
+        return False, "", "unbalanced_brackets", "unbalanced_brackets"
+    if len(ans) > max_chars:
+        return False, "", "too_long", "too_long"
 
-    # option letter
-    if re.fullmatch(r"[A-E]", ans.strip(), flags=re.I):
-        return True, "option", ans.strip().upper()
+    # Very long LaTeX-like formula remnants are usually bad for this RL short-answer set.
+    latex_like = any(x in ans for x in ["\\frac", "\\sqrt", "\\left", "\\right", "\\sin", "\\cos", "\\begin"])
+    if latex_like and len(ans) > 80:
+        return False, "", "long_latex", "long_latex"
 
-    # numeric
-    if re.fullmatch(NUM_PATTERN, compact):
-        return True, "number", ans
+    if len(re.sub(r"\s+", "", ans)) >= 8 and symbol_noise_ratio(ans) > 0.25:
+        return False, "", "symbol_noise", "symbol_noise"
 
-    # number with unit
-    m_unit = re.fullmatch(rf"({NUM_PATTERN})\s*({UNIT_PATTERN})", ans)
-    if m_unit:
-        return True, "unit_decimal", f"{m_unit.group(1)} {m_unit.group(2)}"
+    # Catch common broken strings like 3)5>, x=, =3, x==3.
+    compact = ans.replace(" ", "")
+    if re.search(r"\d[\)\]>]+\d", compact):
+        return False, "", "malformed_symbol_sequence", "malformed_symbol_sequence"
+    if compact.startswith("=") or compact.endswith("=") or "==" in compact:
+        return False, "", "bad_equation", "bad_equation"
 
-    # interval with valid endpoint order
-    m_int = re.fullmatch(rf"([\(\[])(?:\s*)({NUM_PATTERN})(?:\s*),(?:\s*)({NUM_PATTERN})(?:\s*)([\)\]])", ans)
-    if m_int:
-        left = float(m_int.group(2))
-        right = float(m_int.group(3))
-        if left < right:
-            return True, "interval", f"{m_int.group(1)}{m_int.group(2)},{m_int.group(3)}{m_int.group(4)}"
-        return False, "interval", "interval_endpoint_order"
+    # Normalize option letters.
+    if re.fullmatch(r"\(?[A-Ea-e]\)?", ans):
+        ans = ans.strip("()").upper()
 
-    # inequality
-    if re.fullmatch(rf"{VAR_PATTERN}(?:<=|>=|<|>){NUM_PATTERN}", compact):
-        return True, "inequality", compact
-
-    # equation
-    if compact.count("=") == 1:
-        left, right = compact.split("=", 1)
-        if re.fullmatch(VAR_PATTERN, left) and right and not right.startswith("="):
-            if re.fullmatch(r"[A-Za-z0-9_+\-*/^().]+", right):
-                return True, "equation", compact
-        return False, "equation", "invalid_equation"
-
-    # symbolic expression: must contain some math structure and legal chars
-    if re.fullmatch(r"[A-Za-z0-9_+\-*/^().]+", compact):
-        has_math_structure = any(x in compact for x in ["sqrt", "^", "/", "*", "+", "-"])
-        if has_math_structure:
-            return True, "symbolic_expression", compact
-
-    return False, "unsupported", "unsupported_answer_form"
+    return True, ans, "kept", "kept"
 
 
-def candidate_answers_from_text(text: str) -> List[str]:
-    source = normalize_latex_units(text)
-    candidates: List[str] = []
+# ----------------------------- output row construction -----------------------------
 
-    patterns = [
-        rf"[\(\[]\s*{NUM_PATTERN}\s*,\s*{NUM_PATTERN}\s*[\)\]]",
-        rf"{VAR_PATTERN}\s*(?:<=|>=|<|>)\s*{NUM_PATTERN}",
-        rf"{VAR_PATTERN}\s*=\s*[A-Za-z0-9_+\-*/^().]+",
-        rf"{NUM_PATTERN}\s*{UNIT_PATTERN}",
-        rf"{NUM_PATTERN}",
-        r"[A-E]",
-        r"[A-Za-z0-9_+\-*/^().]+",
-    ]
-    for pat in patterns:
-        for m in re.finditer(pat, source):
-            cand = normalize_answer(m.group(0))
-            ok, _, norm = classify_answer(cand)
-            if ok and norm not in candidates:
-                candidates.append(norm)
-    return candidates
-
-
-def extract_final_answer(text: str) -> str:
-    if not text:
-        return ""
-    matches = list(FINAL_MARKER_RE.finditer(text))
-    for match in reversed(matches):
-        tail = text[match.end(): match.end() + 260]
-        tail = tail.split("\n\n", 1)[0]
-        # Stop at a likely sentence boundary, but do not break decimal numbers.
-        tail = re.split(r"(?<!\d)[.;](?!\d)|\n", tail, maxsplit=1)[0]
-        candidates = candidate_answers_from_text(tail)
-        if candidates:
-            return candidates[-1]
-    return ""
-
-
-def normalize_for_match(text: str) -> str:
-    return re.sub(r"\s+", "", normalize_answer(text).lower())
-
-
-def reasoning_conflicts(reasoning: str, answer: str) -> bool:
-    """Conservative mismatch check.
-
-    Only drop when reasoning has an explicit final-answer marker and the extracted final answer is valid
-    but different from answer. Plain containment mismatch is too noisy for QRA and would over-drop.
-    """
-    extracted = extract_final_answer(reasoning)
-    if not extracted:
-        return False
-    return normalize_for_match(extracted) != normalize_for_match(answer)
-
-
-# ----------------------------- row transform -----------------------------
-
-def make_segments(question: str, reasoning: str, answer: str) -> Dict[str, Any]:
+def make_segments(question: str, reasoning: str, answer: str) -> Dict[str, Dict[str, Any]]:
     return {
-        "question": {"text": f"Question:\n{question.strip()}\n\n", "train": False},
-        "reasoning": {"text": f"Reasoning:\n{reasoning.strip()}\n", "train": False},
-        "answer_anchor": {"text": "\nAnswer:\n", "train": False},
-        "answer": {"text": str(answer).strip(), "train": True},
+        "user_label": {"text": "User: ", "train": False},
+        "user": {"text": clean(question), "train": False},
+        "assistant_label": {"text": "\nAssistant:\n", "train": False},
+        "reasoning_label": {"text": "Reasoning:\n", "train": False},
+        "reasoning": {"text": clean(reasoning), "train": False},
+        "answer_label": {"text": "\n\nAnswer:\n", "train": False},
+        "answer": {"text": clean(answer), "train": True},
     }
 
 
-def update_qra_row(row: Dict[str, Any], split: str, idx: int, answer: str, kind: str) -> Dict[str, Any]:
-    new = copy.deepcopy(row)
-    q = get_question(row)
-    r = get_reasoning(row)
+def make_filtered_qra(row: Dict[str, Any], split: str, idx: int, answer: str, method: str) -> Dict[str, Any]:
+    q = extract_question(row)
+    r = extract_reasoning(row)
     if not q:
-        q = str(row.get("text", "")).strip()
+        q = clean(row.get("text")) or f"Question {idx}"
     if not r:
-        r = "First, we solve the problem and derive the final result."
+        r = "First, solve the problem using the given information."
 
-    new["id"] = str(row.get("id") or row.get("uid") or f"qra_{split}_{idx:06d}")
-    new["source"] = "filtered_qra"
-    new["answer"] = answer
-    new["solution"] = answer
-    new["answer_kind"] = kind
-    new["question"] = q
-    new["reasoning"] = r
-    new["segments"] = make_segments(q, r, answer)
-    return new
+    out = copy.deepcopy(row)
+    out["id"] = clean(row.get("id")) or f"qra_{split}_{idx:06d}"
+    out["mode"] = "QRA"
+    out["split"] = split
+    out["source"] = "filtered_qra"
+    out["answer"] = answer
+    out["solution"] = answer
+    out["question"] = q
+    out["reasoning"] = r
+    out["answer_filter_method"] = method
+    out["segment_order"] = QRA_SEGMENT_ORDER
+    out["segments"] = make_segments(q, r, answer)
+    return out
 
 
 # ----------------------------- synthetic generation -----------------------------
@@ -478,396 +373,316 @@ def final_sentence(rng: random.Random, answer: str) -> str:
 
 
 def synth_interval(rng: random.Random) -> Tuple[str, str, str, str]:
-    a = rng.randint(-9, 5)
-    b = rng.randint(a + 1, a + 12)
+    a = rng.randint(-12, 6)
+    b = rng.randint(a + 1, a + 15)
     left = rng.choice(["(", "["])
     right = rng.choice([")", "]"])
     ans = f"{left}{a},{b}{right}"
-    q_templates = [
+    q = rng.choice([
         f"Write the interval for all x such that {a} {'<' if left == '(' else '<='} x {'<' if right == ')' else '<='} {b}.",
         f"Convert the boundary condition from {a} to {b} into interval notation.",
         f"Give the solution interval with {'open' if left == '(' else 'closed'} left endpoint {a} and {'open' if right == ')' else 'closed'} right endpoint {b}.",
-    ]
-    r_templates = [
-        f"To solve, identify the lower and upper boundaries. The lower endpoint is {'excluded' if left == '(' else 'included'} and the upper endpoint is {'excluded' if right == ')' else 'included'}.",
-        f"First, read the inequality endpoints. Then choose {'(' if left == '(' else '['} for the left boundary and {')' if right == ')' else ']'} for the right boundary.",
-        f"We keep the numbers in increasing order and encode the endpoint inclusion with brackets.",
-    ]
-    return rng.choice(q_templates), rng.choice(r_templates), ans, "interval"
+    ])
+    r = rng.choice([
+        f"To solve, identify the two endpoints and whether each endpoint is included. The left endpoint is {'excluded' if left == '(' else 'included'} and the right endpoint is {'excluded' if right == ')' else 'included'}.",
+        f"First, keep the smaller endpoint on the left and the larger endpoint on the right. Then choose the correct bracket type for each boundary.",
+        f"The interval notation is determined by endpoint order and inclusion status.",
+    ])
+    return q, r + " " + final_sentence(rng, ans), ans, "synthetic_interval"
 
 
 def synth_inequality(rng: random.Random) -> Tuple[str, str, str, str]:
     var = rng.choice(["x", "y", "t", "r"])
+    c = rng.randint(-9, 12)
     op = rng.choice([">", ">=", "<", "<="])
-    c = rng.randint(-8, 12)
     ans = f"{var}{op}{c}"
     q = rng.choice([
-        f"Write the final inequality for {var} with boundary {c} and relation {op}.",
-        f"Express the solution as a one-sided inequality using variable {var}.",
-        f"If the solution set is all {var} satisfying {var} {op} {c}, give the short answer.",
+        f"State the final inequality for {var} if the boundary is {c} and the relation is {op}.",
+        f"Write the solution as a simple inequality using variable {var}.",
+        f"Convert the described condition into symbolic inequality form.",
     ])
     r = rng.choice([
-        f"First, isolate {var} on one side. The boundary value is {c} and the direction is {op}.",
-        f"To solve, keep the variable on the left and preserve the inequality direction.",
-        f"The result should be written as a compact inequality with no extra explanation.",
+        f"First, isolate {var}. Then keep the comparison direction as {op}.",
+        f"We translate the verbal condition directly into an inequality with {var} on the left.",
+        f"The threshold is {c}, and the comparison operator is {op}.",
     ])
-    return q, r, ans, "inequality"
+    return q, r + " " + final_sentence(rng, ans), ans, "synthetic_inequality"
 
 
 def synth_equation(rng: random.Random) -> Tuple[str, str, str, str]:
-    templates = []
-    x = rng.randint(-8, 12)
-    a = rng.choice([2, 3, 4, 5])
-    b = rng.randint(-6, 8)
-    c = a * x + b
-    templates.append((
-        f"Solve {a}x + {b} = {c}.",
-        f"First, subtract {b} from both sides to get {a}x={a*x}. Then divide by {a}.",
-        f"x={x}",
-    ))
-    m = rng.choice([-3, -2, -1, 1, 2, 3, 4])
-    intercept = rng.randint(-8, 8)
-    templates.append((
-        f"Write the line with slope {m} and intercept {intercept}.",
-        f"Use y=mx+b. Here the slope is {m} and the intercept is {intercept}.",
-        f"y={m}x{intercept:+d}",
-    ))
-    templates += [
-        ("Write Newton's second law solved for acceleration.", "Start from F=ma and divide both sides by m.", "a=F/m"),
-        ("Write distance as speed times time.", "Distance equals speed multiplied by time.", "d=v*t"),
-        ("Write the area formula for a circle using pi and r.", "The area is pi times the square of the radius.", "A=pi*r^2"),
-    ]
-    q, r, ans = rng.choice(templates)
-    return q, r, ans, "equation"
-
-
-def simplify_fraction(num: int, den: int) -> Tuple[int, int]:
-    g = math.gcd(abs(num), abs(den))
-    return num // g, den // g
+    kind = rng.choice(["linear", "line", "formula"])
+    if kind == "linear":
+        var = rng.choice(["x", "y", "a", "t"])
+        val = rng.randint(-12, 18)
+        ans = f"{var}={val}"
+        q = f"Solve for {var} and give only the final equation."
+        r = f"First, isolate {var} on one side of the equation. The computed value is {val}."
+    elif kind == "line":
+        m = rng.choice([-4, -3, -2, 2, 3, 4, 5])
+        b = rng.randint(-9, 9)
+        ans = f"y={m}x{b:+d}".replace("+0", "")
+        q = f"Write the line with slope {m} and intercept {b}."
+        r = f"Use y=mx+b. Here m={m} and b={b}, so substitute them into the formula."
+    else:
+        ans = rng.choice(["a=F/m", "v=d/t", "F=ma", "A=pi*r^2", "p=mv"])
+        q = "Write the requested physical formula in compact symbolic form."
+        r = "First, identify the standard relationship and isolate the requested quantity."
+    return q, r + " " + final_sentence(rng, ans), ans, "synthetic_equation"
 
 
 def synth_symbolic(rng: random.Random) -> Tuple[str, str, str, str]:
-    choice = rng.choice(["sqrt", "square", "fraction", "physics", "factor"])
-    if choice == "sqrt":
-        n = rng.choice([2, 3, 5, 6, 7])
-        k = rng.randint(2, 9)
-        q = f"Simplify sqrt({k*k*n})."
-        r = f"First, write {k*k*n} as {k*k} times {n}. Then sqrt({k*k})={k}."
-        ans = f"{k}sqrt({n})"
-    elif choice == "square":
-        c = rng.randint(1, 9)
-        q = f"Expand (x+{c})^2."
-        r = f"Use (a+b)^2=a^2+2ab+b^2. Here 2 times {c} is {2*c}."
-        ans = f"x^2+{2*c}x+{c*c}"
-    elif choice == "fraction":
-        den = rng.choice([6, 8, 10, 12, 14, 16, 18, 20])
-        num = rng.randint(2, den - 1)
-        sn, sd = simplify_fraction(num, den)
-        q = f"Simplify {num}/{den}."
-        r = f"Divide the numerator and denominator by their greatest common divisor."
-        ans = f"{sn}/{sd}"
-    elif choice == "physics":
-        q = "Write the constant-acceleration relation for final speed squared."
-        r = "The relation uses initial speed, acceleration, and displacement."
-        ans = "v^2=u^2+2as"
+    kind = rng.choice(["sqrt", "square", "fraction", "physics", "monomial"])
+    if kind == "sqrt":
+        outside = rng.randint(2, 9)
+        inside = rng.choice([2, 3, 5, 6, 7])
+        ans = f"{outside}sqrt({inside})"
+        q = f"Simplify sqrt({outside * outside * inside})."
+        r = f"First, factor out the perfect square {outside * outside}. Then sqrt({outside * outside})={outside}."
+    elif kind == "square":
+        a = rng.randint(1, 7)
+        ans = f"x^2+{2*a}x+{a*a}"
+        q = f"Expand (x+{a})^2."
+        r = "Use the identity (x+a)^2=x^2+2ax+a^2 and substitute the value of a."
+    elif kind == "fraction":
+        den = rng.choice([4, 5, 6, 7, 8, 9])
+        num = rng.randint(1, den - 1)
+        ans = f"{num}/{den}"
+        q = f"Give the simplified fraction form with numerator {num} and denominator {den}."
+        r = "The fraction is already in the target compact form."
+    elif kind == "physics":
+        ans = rng.choice(["v^2=u^2+2as", "KE=1/2mv^2", "p=mv"])
+        q = "Write the compact symbolic expression for the relation."
+        r = "Recall the standard formula and write it without extra explanation."
     else:
-        c = rng.randint(1, 9)
-        q = f"Factor x^2+{2*c}x+{c*c}."
-        r = "Recognize the perfect-square trinomial pattern."
-        ans = f"(x+{c})^2"
-    return q, r, ans, "symbolic_expression"
+        coeff = rng.randint(2, 9)
+        power = rng.choice([2, 3])
+        ans = f"{coeff}x^{power}"
+        q = f"Simplify the product into a compact monomial with coefficient {coeff}."
+        r = f"Combine the repeated x factors into x^{power} and keep the coefficient."
+    return q, r + " " + final_sentence(rng, ans), ans, "synthetic_symbolic"
 
 
 def synth_unit_decimal(rng: random.Random) -> Tuple[str, str, str, str]:
-    unit = rng.choice(["m", "mm", "cm", "kg", "g", "s", "ms", "N", "J", "m/s", "m/s^2"])
-    val = rng.choice([round(rng.uniform(-9.9, 9.9), 2), round(rng.uniform(0.1, 5.0), 3), -9.8, 1.903, -2.50, 0.125])
-    if unit in {"m", "mm", "m/s^2"} and rng.random() < 0.3:
-        val = rng.choice([1.903, -2.50, -9.8, 0.125])
-    ans = f"{val:g} {unit}"
+    unit = rng.choice(VALID_UNITS)
+    value = rng.uniform(-12, 12)
+    decimals = rng.choice([1, 2, 3])
+    ans = f"{value:.{decimals}f} {unit}"
+    if ans.startswith("-0.0"):
+        ans = ans.replace("-0.0", "0.0", 1)
     q = rng.choice([
-        f"Give the measured value {val:g} with unit {unit} as the final answer.",
-        f"Write the numerical result with its unit {unit}.",
-        f"The final computed quantity has value {val:g} in {unit}. Provide the short answer.",
+        f"Report the measured value using unit {unit}.",
+        f"Write the final numerical value with its unit {unit}.",
+        f"Give the signed decimal result together with the unit {unit}.",
     ])
     r = rng.choice([
-        "First, compute the numeric value and then attach the requested unit.",
-        "To solve, keep the sign and decimal precision, then append the unit.",
-        "The result should contain the number followed by the unit.",
+        "First, keep the sign of the value and preserve the unit.",
+        "The final response should contain the decimal number followed by the unit.",
+        "We only need the compact numerical result with the measurement unit.",
     ])
-    return q, r, ans, "unit_decimal"
+    return q, r + " " + final_sentence(rng, ans), ans, "synthetic_unit_decimal"
 
 
-def generate_synthetic_cases(count: int, seed: int, seen_answers: set[str]) -> List[Dict[str, str]]:
+SYNTH_GENERATORS = [synth_interval, synth_inequality, synth_equation, synth_symbolic, synth_unit_decimal]
+
+
+def make_synthetic_row(split: str, idx: int, q: str, r: str, ans: str, source: str) -> Dict[str, Any]:
+    return {
+        "id": f"s1f_rl_{source}_{split}_{idx:06d}",
+        "mode": "QRA",
+        "split": split,
+        "source": source,
+        "question": q,
+        "reasoning": r,
+        "answer": ans,
+        "solution": ans,
+        "segment_order": QRA_SEGMENT_ORDER,
+        "segments": make_segments(q, r, ans),
+    }
+
+
+def generate_synthetic(split: str, count: int, seed: int, seen_answers: set[str]) -> List[Dict[str, Any]]:
     rng = random.Random(seed)
-    generators = [synth_interval, synth_inequality, synth_equation, synth_symbolic, synth_unit_decimal]
-    out: List[Dict[str, str]] = []
+    rows: List[Dict[str, Any]] = []
     attempts = 0
-    while len(out) < count and attempts < count * 100:
+    while len(rows) < count and attempts < count * 50 + 1000:
         attempts += 1
-        gen = generators[attempts % len(generators)] if attempts <= len(generators) * 2 else rng.choice(generators)
-        q, r, ans, kind = gen(rng)
-        ok, _, norm = classify_answer(ans)
+        gen = SYNTH_GENERATORS[(len(rows) + attempts) % len(SYNTH_GENERATORS)]
+        q, r, ans, source = gen(rng)
+        ok, ans_norm, _, reason = validate_answer(ans)
         if not ok:
             continue
-        key = normalize_for_match(norm)
+        key = re.sub(r"\s+", "", ans_norm.lower())
         if key in seen_answers:
             continue
         seen_answers.add(key)
-        reasoning = r.rstrip() + " " + final_sentence(rng, norm)
-        out.append({"question": q, "reasoning": reasoning, "answer": norm, "kind": kind})
-    if len(out) < count:
-        raise RuntimeError(f"Could only generate {len(out)} synthetic cases out of requested {count}.")
-    return out
+        rows.append(make_synthetic_row(split, len(rows), q, r, ans_norm, source))
+    if len(rows) < count:
+        raise RuntimeError(f"Only generated {len(rows)}/{count} synthetic rows for {split}.")
+    return rows
 
 
-def make_synthetic_sample(split: str, idx: int, case: Dict[str, str]) -> Dict[str, Any]:
-    answer = case["answer"]
-    question = case["question"]
-    reasoning = case["reasoning"]
-    return {
-        "id": f"s1f_rl_synth_{split}_{idx:06d}",
-        "source": "synthetic_hard_case",
-        "answer_kind": case.get("kind", "synthetic"),
-        "question": question,
-        "reasoning": reasoning,
-        "answer": answer,
-        "solution": answer,
-        "segments": make_segments(question, reasoning, answer),
-    }
-
-
-# ----------------------------- dataset build -----------------------------
-
-def filter_qra_split(
-    rows: List[Dict[str, Any]],
-    split: str,
-    strict_reasoning_match: bool,
-    max_drop_examples: int,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], set[str]]:
-    out: List[Dict[str, Any]] = []
-    seen_answers: set[str] = set()
-    stats: Dict[str, Any] = {
-        "raw_total": len(rows),
-        "real_kept": 0,
-        "drop_examples": [],
-    }
-
-    for idx, row in enumerate(rows):
-        raw_answer = get_answer_text(row)
-        reasoning = get_reasoning(row)
-
-        source = "qra_answer_segment"
-        answer = normalize_answer(raw_answer)
-
-        ok, kind, normalized_or_reason = classify_answer(answer)
-        if not ok:
-            # If the train=True/answer segment is actually a full completion, extract the last final-answer marker from it.
-            extracted = extract_final_answer(raw_answer)
-            if extracted:
-                ok2, kind2, normalized2 = classify_answer(extracted)
-                if ok2:
-                    ok, kind, normalized_or_reason = True, kind2, normalized2
-                    source = "answer_segment_final_marker"
-
-        if not ok:
-            extracted = extract_final_answer(reasoning)
-            if extracted:
-                ok2, kind2, normalized2 = classify_answer(extracted)
-                if ok2:
-                    ok, kind, normalized_or_reason = True, kind2, normalized2
-                    source = "reasoning_final_marker"
-
-        if not ok:
-            key = f"drop_{normalized_or_reason}"
-            stats[key] = stats.get(key, 0) + 1
-            if len(stats["drop_examples"]) < max_drop_examples:
-                stats["drop_examples"].append({"idx": idx, "reason": key, "raw_answer": raw_answer[:200]})
-            continue
-
-        answer = normalized_or_reason
-        if reasoning_conflicts(reasoning, answer):
-            key = "drop_reasoning_final_marker_conflict"
-            stats[key] = stats.get(key, 0) + 1
-            if len(stats["drop_examples"]) < max_drop_examples:
-                stats["drop_examples"].append({"idx": idx, "reason": key, "answer": answer, "reasoning_tail": reasoning[-240:]})
-            continue
-
-        if strict_reasoning_match and normalize_for_match(answer) not in normalize_for_match(reasoning):
-            key = "drop_strict_reasoning_mismatch"
-            stats[key] = stats.get(key, 0) + 1
-            if len(stats["drop_examples"]) < max_drop_examples:
-                stats["drop_examples"].append({"idx": idx, "reason": key, "answer": answer})
-            continue
-
-        out.append(update_qra_row(row, split, idx, answer, kind))
-        stats["real_kept"] += 1
-        stats[f"kept_{kind}"] = stats.get(f"kept_{kind}", 0) + 1
-        stats[f"kept_from_{source}"] = stats.get(f"kept_from_{source}", 0) + 1
-        seen_answers.add(normalize_for_match(answer))
-
-    return out, stats, seen_answers
-
-
-def compute_synth_quotas(real_total: int, synthetic_final_fraction: float, min_eval: int) -> Dict[str, int]:
-    fraction = max(0.0, min(0.7, synthetic_final_fraction))
+def compute_synth_quotas(real_counts: Dict[str, int], final_fraction: float, min_eval: int) -> Dict[str, int]:
+    real_total = sum(real_counts.values())
     if real_total <= 0:
-        k = int(min_eval)
-        return {"train": 8 * k, "val": k, "test": k}
-    target_total = int(round(real_total * fraction / max(1e-8, 1.0 - fraction)))
-    k = max(int(min_eval), int(math.ceil(target_total / 10.0)))
-    return {"train": 8 * k, "val": k, "test": k}
+        return {"train": 8 * min_eval, "val": min_eval, "test": min_eval}
+    final_fraction = max(0.0, min(0.75, final_fraction))
+    total_synth = int(round(real_total * final_fraction / max(1e-6, 1.0 - final_fraction)))
+    total_synth = max(total_synth, 10 * min_eval)
+    val = max(min_eval, int(round(total_synth * 0.1)))
+    test = max(min_eval, int(round(total_synth * 0.1)))
+    train = max(8 * min_eval, total_synth - val - test)
+    return {"train": train, "val": val, "test": test}
 
+
+# ----------------------------- build -----------------------------
 
 def build_dataset(args: argparse.Namespace) -> Dict[str, Any]:
-    script_dir = Path(__file__).resolve().parent
-    repo_dir = script_dir.parent
     input_dir = Path(args.input_dir)
-    if not input_dir.is_absolute():
-        input_dir = repo_dir / input_dir
     output_dir = Path(args.output_dir)
-    if not output_dir.is_absolute():
-        output_dir = repo_dir / output_dir
 
-    loaded: Dict[str, Tuple[List[Dict[str, Any]], Optional[Path]]] = {
-        split: load_split(input_dir, split) for split in ["train", "val", "test"]
-    }
-    raw_total = sum(len(rows) for rows, _ in loaded.values())
+    loaded: Dict[str, List[Dict[str, Any]]] = {}
+    input_files: Dict[str, str] = {}
+    for split in ["train", "val", "test"]:
+        rows, path = load_split(input_dir, split)
+        loaded[split] = rows
+        input_files[split] = str(path) if path else ""
+
+    raw_total = sum(len(v) for v in loaded.values())
     if raw_total == 0:
-        searched = {split: [str(p) for p in split_candidates(input_dir, split)] for split in ["train", "val", "test"]}
-        raise RuntimeError(
-            "No QRA data was loaded. This script refuses to generate synthetic-only data.\n"
-            f"input_dir={input_dir}\nsearched={json.dumps(searched, ensure_ascii=False, indent=2)}\n"
-            "Pass --input-dir to the real QRA directory, for example --input-dir rl_qra_pipeline/data/QRA."
-        )
+        raise RuntimeError(f"No QRA rows found under {input_dir}. Expected train/validation/test jsonl files.")
 
-    report: Dict[str, Any] = {
-        "base": "copy_filtered_QRA_plus_synthetic_hard_cases_v8_anchor_fixed",
+    output_splits: Dict[str, List[Dict[str, Any]]] = {"train": [], "val": [], "test": []}
+    stats: Dict[str, Any] = {
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
-        "seed": args.seed,
+        "input_files": input_files,
         "raw_total_loaded": raw_total,
-        "strict_reasoning_match": bool(args.strict_reasoning_match),
-        "synthetic_final_fraction_target": args.synthetic_final_fraction,
-        "min_synthetic_eval": args.min_synthetic_eval,
-        "synthetic_split_rule": "8:1:1",
-        "splits": {},
+        "split_stats": {},
+        "drop_reasons": {},
+        "drop_examples": [],
+        "kept_examples": [],
     }
 
-    split_rows: Dict[str, List[Dict[str, Any]]] = {}
-    global_seen: set[str] = set()
+    seen_answers: set[str] = set()
+    for split, rows in loaded.items():
+        kept = 0
+        split_drops: Dict[str, int] = {}
+        answer_sources: Dict[str, int] = {}
+        for idx, row in enumerate(rows):
+            raw_answer, source = extract_answer_raw(row)
+            answer_sources[source] = answer_sources.get(source, 0) + 1
+            ok, answer, _, reason = validate_answer(raw_answer, max_chars=args.max_answer_chars)
+            if not ok:
+                split_drops[reason] = split_drops.get(reason, 0) + 1
+                stats["drop_reasons"][reason] = stats["drop_reasons"].get(reason, 0) + 1
+                if len(stats["drop_examples"]) < args.max_drop_examples:
+                    stats["drop_examples"].append({
+                        "split": split,
+                        "id": row.get("id"),
+                        "answer_source": source,
+                        "reason": reason,
+                        "raw_answer_preview": clean(raw_answer)[:240],
+                        "segment_keys": list((row.get("segments") or {}).keys()) if isinstance(row.get("segments"), dict) else None,
+                        "top_keys": list(row.keys())[:30],
+                    })
+                continue
+            out = make_filtered_qra(row, split, idx, answer, source)
+            output_splits[split].append(out)
+            kept += 1
+            seen_answers.add(re.sub(r"\s+", "", answer.lower()))
+            if len(stats["kept_examples"]) < args.max_kept_examples:
+                stats["kept_examples"].append({
+                    "split": split,
+                    "id": out.get("id"),
+                    "answer_source": source,
+                    "answer": answer,
+                    "question_preview": out.get("question", "")[:160],
+                })
 
-    for split in ["train", "val", "test"]:
-        rows, path = loaded[split]
-        real_rows, stats, seen = filter_qra_split(
-            rows,
-            split=split,
-            strict_reasoning_match=bool(args.strict_reasoning_match),
-            max_drop_examples=int(args.max_drop_examples),
-        )
-        split_rows[split] = real_rows
-        global_seen.update(seen)
-        report["splits"][split] = {**stats, "input_file": str(path) if path else None}
+        stats["split_stats"][split] = {
+            "raw": len(rows),
+            "real_kept": kept,
+            "real_dropped": len(rows) - kept,
+            "answer_sources": answer_sources,
+            "drop_reasons": split_drops,
+        }
 
-    real_total = sum(len(rows) for rows in split_rows.values())
-    if real_total == 0 and not args.allow_zero_real:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        failed_report = output_dir / "build_report_failed_zero_real.json"
-        report["real_total_kept"] = 0
-        failed_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    real_counts = {split: len(rows) for split, rows in output_splits.items()}
+    real_total_kept = sum(real_counts.values())
+    if real_total_kept == 0 and not args.allow_zero_real:
+        debug_path = output_dir / "build_report_failed.json"
+        write_json(debug_path, stats)
         raise RuntimeError(
-            "QRA files were loaded, but 0 real rows survived filtering. Refusing to output synthetic-only data.\n"
-            f"A debug report was written to {failed_report}.\n"
-            "Most likely causes: answer_anchor was selected instead of answer, answer segment contains full completion, "
-            "or filters are still too strict."
+            f"QRA files loaded ({raw_total} rows), but 0 real rows survived filtering. "
+            f"Wrote debug report to {debug_path}. This usually means answer extraction mismatched the QRA format."
         )
 
-    quotas = compute_synth_quotas(real_total, float(args.synthetic_final_fraction), int(args.min_synthetic_eval))
-    report["real_total_kept"] = real_total
-    report["synthetic_quotas"] = quotas
+    quotas = compute_synth_quotas(real_counts, args.synthetic_final_fraction, args.min_synthetic_eval)
+    stats["real_counts_before_synthetic"] = real_counts
+    stats["synthetic_final_fraction_target"] = args.synthetic_final_fraction
+    stats["synthetic_quotas"] = quotas
 
-    rng = random.Random(args.seed)
     for split in ["train", "val", "test"]:
-        synth_cases = generate_synthetic_cases(
-            count=quotas[split],
-            seed=args.seed + {"train": 1001, "val": 2002, "test": 3003}[split],
-            seen_answers=global_seen,
-        )
-        synth_rows = [make_synthetic_sample(split, i, c) for i, c in enumerate(synth_cases)]
-        all_rows = split_rows[split] + synth_rows
-        rng.shuffle(all_rows)
-        split_rows[split] = all_rows
-        info = report["splits"][split]
-        info["synthetic_added"] = len(synth_rows)
-        info["written"] = len(all_rows)
-        info["synthetic_fraction_final"] = (len(synth_rows) / len(all_rows)) if all_rows else 0.0
+        synth = generate_synthetic(split, quotas[split], args.seed + {"train": 101, "val": 202, "test": 303}[split], seen_answers)
+        output_splits[split].extend(synth)
+        random.Random(args.seed + {"train": 11, "val": 22, "test": 33}[split]).shuffle(output_splits[split])
+        stats["split_stats"][split]["synthetic_added"] = len(synth)
+        stats["split_stats"][split]["written"] = len(output_splits[split])
 
-    total_written = sum(len(v) for v in split_rows.values())
-    synth_total = sum(report["splits"][s]["synthetic_added"] for s in ["train", "val", "test"])
-    report["total_written"] = total_written
-    report["final_split_counts"] = {split: len(split_rows[split]) for split in ["train", "val", "test"]}
-    report["final_split_ratio"] = {split: len(split_rows[split]) / total_written for split in ["train", "val", "test"]} if total_written else {}
-    report["synthetic_fraction_overall"] = synth_total / total_written if total_written else 0.0
-
+    if output_dir.exists() and args.overwrite:
+        for name in ["train.jsonl", "val.jsonl", "valid.jsonl", "validation.jsonl", "test.jsonl", "build_report.json", "build_report_failed.json"]:
+            path = output_dir / name
+            if path.exists():
+                path.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
-    for split, rows in split_rows.items():
-        write_jsonl(output_dir / f"{split}.jsonl", rows)
-    (output_dir / "build_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    return report
+    write_jsonl(output_dir / "train.jsonl", output_splits["train"])
+    write_jsonl(output_dir / "val.jsonl", output_splits["val"])
+    write_jsonl(output_dir / "validation.jsonl", output_splits["val"])
+    write_jsonl(output_dir / "test.jsonl", output_splits["test"])
+
+    final_counts = {split: len(rows) for split, rows in output_splits.items()}
+    final_total = sum(final_counts.values())
+    synth_total = sum(quotas.values())
+    stats["final_split_counts"] = final_counts
+    stats["synthetic_total"] = synth_total
+    stats["synthetic_fraction_final"] = round(synth_total / max(1, final_total), 4)
+    stats["note"] = "S1F_RL = filtered copy of QRA plus synthetic hard short-answer cases. Real QRA samples are not re-split."
+
+    write_json(output_dir / "build_report.json", stats)
+    return stats
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--input-dir",
-        type=str,
-        default="rl_qra_pipeline/data/QRA",
-        help="Input QRA data directory. Default: rl_qra_pipeline/data/QRA.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="rl_qra_pipeline/data/S1F_RL",
-        help="Output directory. Default: rl_qra_pipeline/data/S1F_RL.",
-    )
+    script_dir = Path(__file__).resolve().parent
+    repo_dir = script_dir.parent
+    parser = argparse.ArgumentParser(description="Build S1F_RL by filtering QRA and adding synthetic hard final-answer cases.")
+    parser.add_argument("--input-dir", type=str, default=str(script_dir / "data" / "QRA"))
+    parser.add_argument("--output-dir", type=str, default=str(script_dir / "data" / "S1F_RL"))
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--synthetic-final-fraction",
-        type=float,
-        default=0.30,
-        help="Target synthetic fraction in final dataset. Default 0.30.",
-    )
-    parser.add_argument(
-        "--min-synthetic-eval",
-        type=int,
-        default=5,
-        help="Minimum synthetic cases for val and test. Train gets 8x this number. Default 5.",
-    )
-    parser.add_argument(
-        "--strict-reasoning-match",
-        action="store_true",
-        help="Drop rows whose normalized answer is not literally found in reasoning. Off by default because it over-drops QRA.",
-    )
-    parser.add_argument("--allow-zero-real", action="store_true")
+    parser.add_argument("--synthetic-final-fraction", type=float, default=0.35,
+                        help="Target fraction of synthetic examples in the final dataset. Default 0.35.")
+    parser.add_argument("--min-synthetic-eval", type=int, default=5,
+                        help="Minimum synthetic examples in val and test. Train minimum is 8x this value.")
+    parser.add_argument("--max-answer-chars", type=int, default=160)
     parser.add_argument("--max-drop-examples", type=int, default=30)
+    parser.add_argument("--max-kept-examples", type=int, default=20)
+    parser.add_argument("--allow-zero-real", action="store_true")
+    parser.add_argument("--no-overwrite", dest="overwrite", action="store_false")
+    parser.set_defaults(overwrite=True)
     args = parser.parse_args()
 
     report = build_dataset(args)
-
-    print(f"Wrote {report['output_dir']}")
-    print(f"Loaded raw QRA rows: {report['raw_total_loaded']}")
-    print(f"Kept real QRA rows: {report['real_total_kept']}")
-    print(f"Synthetic quotas: {report['synthetic_quotas']}")
-    for split in ["train", "val", "test"]:
-        info = report["splits"][split]
-        print(
-            f"[{split}] input={info.get('input_file')} raw={info['raw_total']} "
-            f"real_kept={info['real_kept']} synth={info['synthetic_added']} "
-            f"written={info['written']} synth_frac={info['synthetic_fraction_final']:.3f}"
-        )
-    print("final_split_counts:", json.dumps(report.get("final_split_counts", {}), ensure_ascii=False))
-    print("final_split_ratio:", json.dumps(report.get("final_split_ratio", {}), ensure_ascii=False))
-    print(f"synthetic_fraction_overall: {report.get('synthetic_fraction_overall', 0.0):.3f}")
+    print(json.dumps({
+        "input_dir": report["input_dir"],
+        "output_dir": report["output_dir"],
+        "raw_total_loaded": report["raw_total_loaded"],
+        "real_counts_before_synthetic": report["real_counts_before_synthetic"],
+        "synthetic_quotas": report["synthetic_quotas"],
+        "final_split_counts": report["final_split_counts"],
+        "synthetic_fraction_final": report["synthetic_fraction_final"],
+        "top_drop_reasons": sorted(report["drop_reasons"].items(), key=lambda x: x[1], reverse=True)[:10],
+    }, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
