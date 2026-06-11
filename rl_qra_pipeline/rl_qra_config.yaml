@@ -22,7 +22,7 @@ data:
 starts:
   pretrain:
     init_checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
-    data_dir: rl_qra_pipeline/data/K_RL
+    data_dir: rl_qra_pipeline/data/S1K_RL
     output_dir: rl_qra_pipeline/modelparameter/rl_pretrain
     output_name: rl_pretrain
 
