@@ -91,7 +91,8 @@ output:
 eval:
   split: test
   datasets:
-    - S1F_RL
+    - S1K_RL
+    - QRA
   output_dir: rl_qra_pipeline/test_result
   batch_size: 1
   num_workers: 0

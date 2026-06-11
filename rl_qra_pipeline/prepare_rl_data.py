@@ -860,8 +860,8 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=str(script_dir / "data" / "S1F_RL"),
-        help="Output directory. Default: rl_qra_pipeline/data/S1F_RL.",
+        default=str(script_dir / "data" / "S1K_RL"),
+        help="Output directory. Default: rl_qra_pipeline/data/S1K_RL.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
