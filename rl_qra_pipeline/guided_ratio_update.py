@@ -128,7 +128,7 @@ def _candidate_texts_for_type(gt_type: str, target_text: str, cfg: Dict[str, Any
         add_variants(_DIGITS + math_ops + variables + units + latex_atoms)
     else:
         # Short text: keep conservative, but still include basic math/unit chars
-        # because S1F_RL mainly contains compact answer forms.
+        # because S1K_RL mainly contains compact answer forms.
         add_variants(([stripped] if stripped else []) + _DIGITS + math_ops + units)
 
     if bool(cfg.get("include_clean_candidates", True)):

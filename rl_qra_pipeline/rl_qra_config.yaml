@@ -22,19 +22,19 @@ data:
 starts:
   pretrain:
     init_checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
-    data_dir: rl_qra_pipeline/data/S1F_RL
+    data_dir: rl_qra_pipeline/data/K_RL
     output_dir: rl_qra_pipeline/modelparameter/rl_pretrain
     output_name: rl_pretrain
 
   QA:
     init_checkpoint: rl_qra_pipeline/modelparameter/QA/best.pth
-    data_dir: rl_qra_pipeline/data/S1F_RL
+    data_dir: rl_qra_pipeline/data/S1K_RL
     output_dir: rl_qra_pipeline/modelparameter/rl_QA
     output_name: rl_QA
 
   QRA:
     init_checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
-    data_dir: rl_qra_pipeline/data/S1F_RL
+    data_dir: rl_qra_pipeline/data/S1K_RL
     output_dir: rl_qra_pipeline/modelparameter/rl_QRA
     output_name: rl_QRA
 

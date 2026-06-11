@@ -82,7 +82,7 @@ def resolve_data_dir(config: Dict[str, Any]) -> Path:
     data_dir = (
         data_cfg.get("data_dir")
         or start_cfg.get("data_dir")
-        or "rl_qra_pipeline/data/S1F_RL"
+        or "rl_qra_pipeline/data/S1K_RL"
     )
     return repo_path(data_dir)
 
@@ -109,7 +109,7 @@ def make_loader(config: Dict[str, Any], dataset_name: str, split: str):
 
     data_dir = resolve_data_dir(config)
 
-    # Normal case: data_dir points to rl_qra_pipeline/data/S1F_RL.
+    # Normal case: data_dir points to rl_qra_pipeline/data/S1K_RL.
     if dataset_name in {".", "current", data_dir.name}:
         data_path = data_dir / f"{split}.jsonl"
     else:
@@ -213,7 +213,7 @@ def eval_model(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate RL-QRA checkpoints on S1F_RL/QRA test or val split.")
+    parser = argparse.ArgumentParser(description="Evaluate RL-QRA checkpoints on S1K_RL/QRA test or val split.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--split", default=None, help="Default: config.eval.split or test.")
     parser.add_argument("--gpu", type=int, default=None)

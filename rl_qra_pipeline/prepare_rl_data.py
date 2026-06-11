@@ -493,8 +493,8 @@ def update_answer_segment(row: Dict[str, Any], answer: str) -> Dict[str, Any]:
 def make_real_sample(row: Dict[str, Any], split: str, idx: int, answer: str, source: str, kind: str) -> Dict[str, Any]:
     new = update_answer_segment(row, answer)
     rid = row.get("id") or row.get("uid") or row.get("sample_id") or f"{split}_{idx:06d}"
-    new["id"] = f"s1f_rl_{split}_{rid}"
-    new["source"] = "s1f_rl_filtered_qra"
+    new["id"] = f"k_rl_{split}_{rid}"
+    new["source"] = "s1k_rl_filtered_qra"
     new["original_source"] = row.get("source", "QRA")
     new["original_id"] = rid
     new["answer_source"] = source
@@ -511,8 +511,8 @@ def make_synthetic_sample(split: str, idx: int, case: Dict[str, str]) -> Dict[st
     question = case["question"]
     reasoning = case["reasoning"]
     return {
-        "id": f"s1f_rl_{split}_synthetic_{idx:06d}",
-        "source": "s1f_rl_synthetic_hard",
+        "id": f"s1k_rl_{split}_synthetic_{idx:06d}",
+        "source": "s1ks_rl_synthetic_hard",
         "answer_source": "parametric_synthetic",
         "answer_kind": case["kind"],
         "question": question,
