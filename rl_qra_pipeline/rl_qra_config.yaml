@@ -5,6 +5,12 @@ run:
   selected: QRA
   cuda_device: null
 
+rl:
+  # True reverse-generation rollout RL.
+  # The rollout action is a joint (answer_slot, token) decision, and the main
+  # reward is position-type alignment for that slot.
+  mode: rollout_chain
+
 model:
   pretrained: louaaron/sedd-medium
   tokenizer: gpt2
@@ -17,7 +23,7 @@ data:
   split: train
   eval_split: val
   train_limit: 0
-  eval_limit: 128
+  eval_limit: 64
 
 starts:
   pretrain:
@@ -39,22 +45,19 @@ starts:
     output_name: rl_QRA
 
 training:
-  steps: 1200
+  # Conservative first run.  Prefer small updates and multiple rounds.
+  steps: 300
   batch_size: 1
-  lr: 2.0e-6
+  lr: 5.0e-7
   weight_decay: 0.0
-  grad_clip: 1.0
+  grad_clip: 0.5
   ema: 0.9999
   log_every: 1
   save_every: 100
 
-reward:
-  answer_weight: 0.80
-  reason_weight: 0.20
-  reasoning_min_tokens: 8
-  reasoning_guardrail_max_tokens: 1600
-
+# Old/local RRPI fallback; kept so the same train script can still run rrpi mode.
 rrpi:
+  mode: rrpi
   states_per_sample: 2
   max_targets_per_state: 8
   reveal_mode: prefix_grid
@@ -69,37 +72,63 @@ rrpi:
   include_clean_candidates: true
   include_bad_continuations: false
   max_candidates: 32
-  reward_temperature: 0.10
-  min_reward_gap: 0.0
+  reward_temperature: 0.20
   rrpi_weight: 1.0
-  sft_anchor_weight: 0.05
+  sft_anchor_weight: 0.10
   eps: 1.0e-8
   debug_every: 20
-  debug_records_per_step: 2
+  debug_records_per_step: 1
   max_debug_candidates: 10
   max_debug_rows: 8
 
-guided:
-  states_per_sample: 2
+rollout:
+  # Real generate-chain RL: answer all-mask -> repeated reverse actions.
+  steps: 32
+  num_rollouts: 1
+  mode: sample
 
-output:
-  root_dir: rl_qra_pipeline/modelparameter
-  # root of selected start still only keeps global best files under starts.QRA.output_dir.
-  best_metric: eval_loss
-  best_metric_mode: min
+  # Reverse time schedule.  Early high t emphasizes position-type alignment;
+  # late low t emphasizes exact correction.
+  t_start: 0.95
+  t_end: 0.01
+  step_size: 1.0e-5
+  transition_kind: analytic
+
+  # Joint action policy over (answer slot, token).  We restrict candidates to
+  # avoid full-vocab reward hacking, but still include model top-k.
+  action_topk: 32
+  max_candidates_per_position: 48
+  include_gt_candidates: true
+  include_current_candidate: false
+  allow_noop_action: false
+  sample_temperature: 1.20
+  eps: 1.0e-12
+
+  # Main knob for probability adjustment size.
+  # First round: 0.02.  Later ablate 0.05 only if chain alignment improves slowly.
+  policy_loss_scale: 0.02
+  advantage_clip: 0.25
+  reward_clip: 1.00
+  gamma: 0.95
+  baseline: reward_to_go_norm
+
+  # Stabilizers.
+  entropy_weight: 0.0005
+  sft_anchor_scale: 0.005
+  anchor_late_power: 1.0
+  freeze_filled: false
+
+  debug_every: 20
+  debug_records_per_step: 1
+  max_debug_steps: 12
 
 eval:
   split: test
   datasets:
     - S1K_RL
     - QRA
-  output_dir: rl_qra_pipeline/test_result
-  batch_size: 1
-  num_workers: 0
-  eval_batches: 0
-
-compare_models:
-  QRA_base:
-    checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
-  rl_QRA:
-    checkpoint: rl_qra_pipeline/modelparameter/rl_QRA/best.pth
+  compare_models:
+    QRA_base:
+      checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
+    rl_QRA:
+      checkpoint: rl_qra_pipeline/modelparameter/rl_QRA/best.pth

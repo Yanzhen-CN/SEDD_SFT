@@ -14,11 +14,6 @@ NUMBER_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$")
 INTERVAL_RE = re.compile(
     r"^\s*([\(\[])\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*,\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([\)\]])\s*$"
 )
-UNIT_DECIMAL_RE = re.compile(
-    r"^\s*([+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*([a-zA-Z]+(?:/[a-zA-Z]+(?:\^?\d+)?)?|[a-zA-Z]+\^?\d+)\s*$"
-)
-EQUATION_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*\s*=\s*.+$")
-SYMBOLIC_CHARS_RE = re.compile(r"^[A-Za-z0-9_+\-*/^=().,\[\]{}\\\s]+$")
 
 NOISE_MARKERS = ["<|endoftext|>", "<pad>", "[MASK]", "□", "�"]
 
@@ -32,7 +27,7 @@ class AnswerSpec:
 
     @property
     def structured(self) -> bool:
-        return self.type in {"signed_decimal", "interval", "unit_decimal", "equation", "symbolic_expression"}
+        return self.type in {"signed_decimal", "interval"}
 
     @property
     def single(self) -> bool:
@@ -43,36 +38,8 @@ def strip_noise(text: str) -> str:
     s = str(text or "")
     for marker in NOISE_MARKERS:
         s = s.replace(marker, "")
+    # Common GPT-2 artifact after decoding invalid / special ids.
     s = s.replace("Ġ", " ")
-    return s
-
-
-def _strip_wrapping_math(s: str) -> str:
-    s = s.strip()
-    for left, right in [("$$", "$$"), ("$", "$"), (r"\(", r"\)"), (r"\[", r"\]")]:
-        if s.startswith(left) and s.endswith(right) and len(s) >= len(left) + len(right):
-            s = s[len(left):-len(right)].strip()
-    return s
-
-
-def normalize_answer(text: str) -> str:
-    s = strip_noise(text).strip()
-    s = re.sub(r"(?is)^\s*answer\s*:\s*", "", s).strip()
-    s = re.sub(
-        r"(?is)^\s*(?:final\s+answer|final\s+solution|the\s+answer|the\s+solution|our\s+answer|answer|solution)\s*(?:is|=|:)?\s*",
-        "",
-        s,
-    ).strip()
-    s = s.strip().strip("` ")
-    s = _strip_wrapping_math(s)
-    box = re.match(r"^\\boxed\{(.+)\}$", s, flags=re.S)
-    if box:
-        s = box.group(1).strip()
-    if len(s) > 1 and s[-1] in ".;":
-        # Keep decimal point for numbers like "1." only if this is the whole answer.
-        if not re.fullmatch(r"[+-]?\d+\.", s):
-            s = s[:-1].strip()
-    s = re.sub(r"\s+", " ", s)
     return s
 
 
@@ -81,22 +48,8 @@ def extract_answer_section(text: str) -> str:
     m = ANSWER_RE.search(raw)
     if m:
         raw = m.group(1)
-    phrase = re.search(
-        r"(?is)(?:final\s+answer|final\s+solution|the\s+answer|the\s+solution|our\s+answer)\s*(?:is|=|:)?\s*(.+)$",
-        raw,
-    )
-    if phrase:
-        raw = phrase.group(1).strip()
-    lines = []
-    for ln in raw.strip().splitlines():
-        line = ln.strip()
-        if not line:
-            continue
-        if line in {"$$", "$", r"\[", r"\]"}:
-            continue
-        if re.fullmatch(r"\\(?:begin|end)\{[^}]+\}", line):
-            continue
-        lines.append(line)
+    # Keep only the first non-empty answer line; QRA answer should be concise.
+    lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
     raw = lines[0] if lines else raw.strip()
     return normalize_answer(raw)
 
@@ -106,26 +59,33 @@ def extract_reasoning_section(text: str) -> str:
     m = REASON_RE.search(raw)
     if m:
         return strip_noise(m.group(1)).strip()
+    # If there is no explicit anchor, use everything before Answer: as weak reasoning.
     raw = re.split(r"(?is)\n\s*answer\s*:", raw)[0]
     raw = re.sub(r"(?is)^\s*reasoning\s*:\s*", "", raw).strip()
     return strip_noise(raw)
 
 
-def compact_math(s: str) -> str:
-    s = normalize_answer(s)
-    s = s.replace(" ", "")
-    s = s.replace("×", "*").replace("−", "-")
-    s = s.replace("\\cdot", "*")
-    s = s.replace("\\times", "*")
-    s = s.replace("\\sqrt", "sqrt")
-    s = s.replace("\\pi", "pi")
+def normalize_answer(text: str) -> str:
+    s = strip_noise(text).strip()
+    s = re.sub(r"(?is)^\s*answer\s*:\s*", "", s).strip()
+    # Remove common trailing sentence punctuation, but never remove interval brackets.
+    s = s.strip().strip("` ")
+    if len(s) > 1 and s[-1] in ".;":
+        s = s[:-1].strip()
+    # Remove LaTeX boxing if present.
+    box = re.match(r"^\\boxed\{(.+)\}$", s)
+    if box:
+        s = box.group(1).strip()
+    # Normalize spaces inside compact mathematical answers.
+    s = re.sub(r"\s+", " ", s)
     return s
 
 
 def _canonical_number(s: str) -> str:
-    s = normalize_answer(s).replace(" ", "")
+    s = normalize_answer(s)
     if s.startswith("+"):
         s = s[1:]
+    # Keep integer spelling for integer answers.
     if INTEGER_RE.match(s):
         try:
             return str(int(s))
@@ -134,16 +94,12 @@ def _canonical_number(s: str) -> str:
     try:
         val = float(s)
         if math.isfinite(val):
-            return "%.12g" % val
+            # Compact float canonicalization while preserving decimal nature.
+            out = ("%.12g" % val)
+            return out
     except Exception:
         pass
     return s
-
-
-def _unit_norm(unit: str) -> str:
-    u = str(unit or "").strip().replace(" ", "")
-    u = u.replace("²", "^2").replace("³", "^3")
-    return u
 
 
 def parse_answer_spec(text: str) -> AnswerSpec:
@@ -160,19 +116,13 @@ def parse_answer_spec(text: str) -> AnswerSpec:
             raw=raw,
             canonical=canonical,
             type="interval",
-            components={"left_bracket": lb, "left_value": left_c, "comma": ",", "right_value": right_c, "right_bracket": rb},
-        )
-
-    m = UNIT_DECIMAL_RE.match(raw)
-    if m:
-        value, unit = m.groups()
-        value_c = _canonical_number(value)
-        unit_c = _unit_norm(unit)
-        return AnswerSpec(
-            raw=raw,
-            canonical=f"{value_c} {unit_c}",
-            type="unit_decimal",
-            components={"value": value_c, "unit": unit_c},
+            components={
+                "left_bracket": lb,
+                "left_value": left_c,
+                "comma": ",",
+                "right_value": right_c,
+                "right_bracket": rb,
+            },
         )
 
     if LETTER_RE.match(compact):
@@ -198,55 +148,26 @@ def parse_answer_spec(text: str) -> AnswerSpec:
             components={"sign": sign, "int_part": str(int(int_part)) if int_part.isdigit() else int_part, "dot": ".", "frac_part": frac_part},
         )
 
-    if EQUATION_RE.match(raw) and len(raw) <= 80:
-        lhs, rhs = raw.split("=", 1)
-        lhs_c = compact_math(lhs)
-        rhs_c = compact_math(rhs)
-        return AnswerSpec(
-            raw=raw,
-            canonical=f"{lhs_c}={rhs_c}",
-            type="equation",
-            components={"lhs": lhs_c, "equals": "=", "rhs": rhs_c},
-        )
-
-    if 1 <= len(raw) <= 80 and SYMBOLIC_CHARS_RE.match(raw) and re.search(r"[A-Za-z]", raw) and re.search(r"[+\-*/^()\\]", raw):
-        return AnswerSpec(raw=raw, canonical=compact_math(raw), type="symbolic_expression", components={"expr": compact_math(raw)})
-
     return AnswerSpec(raw=raw, canonical=raw.strip().lower(), type="short_text", components={"text": raw.strip().lower()})
 
 
 def same_answer_type(pred: AnswerSpec, gt: AnswerSpec) -> bool:
     if pred.type == gt.type:
         return True
+    # Allow numeric equivalence between integer and decimal, but score format separately.
     if pred.type in {"single_integer", "signed_decimal"} and gt.type in {"single_integer", "signed_decimal"}:
         return True
-    # If the target is a numeric value with a unit, a plain number has partial value but wrong unit.
-    if gt.type == "unit_decimal" and pred.type in {"single_integer", "signed_decimal"}:
-        return True
     return False
-
-
-def _safe_float(text: str) -> Optional[float]:
-    try:
-        val = float(str(text).replace("+", ""))
-        if math.isfinite(val):
-            return val
-    except Exception:
-        return None
-    return None
 
 
 def exact_or_numeric_match(pred: AnswerSpec, gt: AnswerSpec, tol: float = 1e-9) -> bool:
     if pred.canonical == gt.canonical:
         return True
     if pred.type in {"single_integer", "signed_decimal"} and gt.type in {"single_integer", "signed_decimal"}:
-        vp, vg = _safe_float(pred.canonical), _safe_float(gt.canonical)
-        return vp is not None and vg is not None and abs(vp - vg) <= tol
-    if pred.type == "unit_decimal" and gt.type == "unit_decimal":
-        if pred.components.get("unit") != gt.components.get("unit"):
+        try:
+            return abs(float(pred.canonical) - float(gt.canonical)) <= tol
+        except Exception:
             return False
-        vp, vg = _safe_float(pred.components.get("value", "")), _safe_float(gt.components.get("value", ""))
-        return vp is not None and vg is not None and abs(vp - vg) <= tol
     return False
 
 
@@ -259,17 +180,22 @@ def longest_common_prefix(a: str, b: str) -> int:
     return n
 
 
-def _char_overlap_score(a: str, b: str) -> float:
-    a = compact_math(a)
-    b = compact_math(b)
-    if not a or not b:
-        return 0.0
-    lcp = longest_common_prefix(a, b) / max(1, len(b))
-    common = sum(1 for ch in set(a) if ch in set(b)) / max(1, len(set(b)))
-    return max(lcp, 0.5 * common)
+def _safe_float(text: str) -> Optional[float]:
+    try:
+        val = float(text)
+        if math.isfinite(val):
+            return val
+    except Exception:
+        return None
+    return None
 
 
 def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
+    """Partial-state potential Phi(x) in [0, 1].
+
+    This is intentionally tolerant to incomplete/noisy decoded states. It is used
+    only for local reward shaping, not for final exact-match reporting.
+    """
     s_raw = normalize_answer(answer_text)
     s = s_raw.replace(" ", "")
     if not s:
@@ -282,6 +208,8 @@ def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
     if gt.type == "interval":
         c = gt.components
         score = 0.0
+        # Component-level potential. A wrong component can lower the potential
+        # because it blocks exact recovery at that position.
         if s.startswith(c["left_bracket"]):
             score += 0.15
         elif s and s[0] in "([":
@@ -292,6 +220,8 @@ def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
             score -= 0.08
         if "," in s:
             score += 0.10
+        # Value matching before/after comma when possible; otherwise use contains
+        # as a weak signal for very noisy intermediate strings.
         if "," in s:
             left_side, right_side = s.split(",", 1)
             if c["left_value"] in left_side:
@@ -310,12 +240,14 @@ def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
     if gt.type == "signed_decimal":
         c = gt.components
         score = 0.0
+        # Type/format potential.
         if DECIMAL_RE.match(s):
             score += 0.15
         elif NUMBER_RE.match(s):
             score += 0.05
         elif LETTER_RE.match(s):
             score -= 0.25
+
         expected_sign = c.get("sign", "")
         if expected_sign:
             if s.startswith(expected_sign):
@@ -327,6 +259,7 @@ def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
                 score += 0.10
             else:
                 score -= 0.05
+
         body = s[1:] if s.startswith(("+", "-")) else s
         int_part = body.split(".", 1)[0] if body else ""
         gt_int = c.get("int_part", "")
@@ -334,6 +267,7 @@ def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
             score += 0.20
         elif gt_int.startswith(int_part) and int_part:
             score += 0.10
+
         if "." in body:
             score += 0.10
             frac = body.split(".", 1)[1]
@@ -341,45 +275,15 @@ def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
             if gt_frac:
                 lcp = longest_common_prefix(frac, gt_frac)
                 score += 0.25 * (lcp / max(1, len(gt_frac)))
-        vp, vg = _safe_float(s), _safe_float(gt.canonical)
-        if vp is not None and vg is not None:
-            scale = max(1.0, abs(vg))
-            score += 0.15 * max(0.0, 1.0 - abs(vp - vg) / scale)
+        val_pred = _safe_float(s)
+        val_gt = _safe_float(gt.canonical)
+        if val_pred is not None and val_gt is not None:
+            scale = max(1.0, abs(val_gt))
+            closeness = max(0.0, 1.0 - abs(val_pred - val_gt) / scale)
+            score += 0.15 * closeness
         return float(max(-0.35, min(1.0, score)))
 
-    if gt.type == "unit_decimal":
-        score = 0.0
-        if pred.type == "unit_decimal":
-            score += 0.20
-            if pred.components.get("unit") == gt.components.get("unit"):
-                score += 0.35
-            elif pred.components.get("unit"):
-                score -= 0.10
-            vp = _safe_float(pred.components.get("value", ""))
-        else:
-            vp = _safe_float(s)
-        vg = _safe_float(gt.components.get("value", ""))
-        if vp is not None and vg is not None:
-            scale = max(1.0, abs(vg))
-            score += 0.35 * max(0.0, 1.0 - abs(vp - vg) / scale)
-        if gt.components.get("unit", "") in compact_math(s_raw):
-            score += 0.10
-        return float(max(-0.35, min(1.0, score)))
-
-    if gt.type == "equation":
-        if pred.type == "equation":
-            score = 0.20
-            if pred.components.get("lhs") == gt.components.get("lhs"):
-                score += 0.25
-            if "=" in s_raw:
-                score += 0.15
-            score += 0.40 * _char_overlap_score(pred.components.get("rhs", ""), gt.components.get("rhs", ""))
-            return float(max(-0.2, min(1.0, score)))
-        return float(0.6 * _char_overlap_score(s_raw, gt.canonical) - 0.2)
-
-    if gt.type == "symbolic_expression":
-        return float(max(-0.2, min(1.0, _char_overlap_score(s_raw, gt.canonical))))
-
+    # For single answers, local potential is deliberately coarse.
     if gt.type == "single_letter":
         if s.upper() == gt.canonical:
             return 1.0
@@ -395,14 +299,19 @@ def answer_potential(answer_text: str, gt: AnswerSpec) -> float:
 
 
 def final_answer_score(pred: AnswerSpec, gt: AnswerSpec) -> float:
+    """Terminal answer score in [-1, 1].
+
+    Design principle:
+    - exact / numerically equivalent: strong positive
+    - same type but wrong content: not catastrophic; it means the format is learned
+    - wrong type: very bad
+    """
     if exact_or_numeric_match(pred, gt):
         return 1.0
     if not same_answer_type(pred, gt):
-        if gt.type in {"equation", "symbolic_expression"}:
-            return max(-0.5, answer_potential(pred.raw, gt) * 0.8)
         return -1.0
     if gt.type in {"single_letter", "single_integer"}:
         return 0.2
     if gt.structured:
-        return max(0.10, answer_potential(pred.raw, gt) * 0.8)
+        return max(0.15, answer_potential(pred.raw, gt) * 0.8)
     return 0.0

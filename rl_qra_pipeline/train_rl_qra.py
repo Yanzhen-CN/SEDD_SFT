@@ -32,6 +32,7 @@ from model.ema import ExponentialMovingAverage  # noqa: E402
 from answer_dataset import AnswerSegmentDataset  # noqa: E402
 
 from guided_ratio_update import guided_ratio_loss  # noqa: E402
+from rollout_chain_update import rollout_chain_loss  # noqa: E402
 
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 
@@ -51,6 +52,15 @@ METRIC_FIELDS = [
     # Compatibility with old scripts.
     "pos_logp",
     "neg_prob",
+    # Rollout-chain RL metrics.
+    "rollout_loss",
+    "rollout_reward",
+    "rollout_reward_min",
+    "rollout_reward_max",
+    "rollout_reward_std",
+    "rollout_entropy",
+    "rollout_logprob",
+    "rollout_anchor_loss",
 ]
 
 
@@ -180,6 +190,18 @@ def load_policy(cfg: Dict, device: torch.device):
     return model, graph, noise, ema, loaded_from
 
 
+def compute_rl_loss(model, graph, noise, tokenizer, sample: Dict, cfg: Dict, device: torch.device):
+    """Select the RL objective.
+
+    rrpi/local: old local candidate-policy update.
+    rollout_chain: true reverse-generation policy gradient.
+    """
+    mode = str(cfg.get("rl", {}).get("mode", cfg.get("rrpi", {}).get("mode", "rrpi")))
+    if mode in {"rollout", "rollout_chain", "chain"}:
+        return rollout_chain_loss(model, graph, noise, tokenizer, sample, cfg, device)
+    return guided_ratio_loss(model, graph, noise, tokenizer, sample, cfg, device)
+
+
 def append_csv(path: Path, row: Dict[str, Any]) -> None:
     exists = path.exists()
     with open(path, "a", encoding="utf-8", newline="") as f:
@@ -222,6 +244,25 @@ def sync_checkpoint(src: Path, dst: Path) -> None:
 
 
 def print_debug_record(step: int, record: Dict[str, Any], max_rows: int = 8) -> None:
+    if "chain" in record:
+        print(f"\n[ROLLOUT DEBUG step={step}]", flush=True)
+        print(f"sample_id={record.get('sample_id', '')} type={record.get('answer_type', '')}", flush=True)
+        print(f"GT: {record.get('gt_answer', '')}", flush=True)
+        print("k | t | pos | token | reward | adv | action_align | skelΔ | exactΔ | before -> after", flush=True)
+        for row in (record.get("chain") or [])[:max_rows]:
+            print(
+                f"{int(row.get('step', 0)):02d} | {float(row.get('t', 0.0)):.2f} | "
+                f"{int(row.get('action_pos', -1)):02d} | {row.get('token', '')!r:8s} | "
+                f"R={float(row.get('reward', 0.0)):+.3f} | A={float(row.get('advantage', 0.0)):+.3f} | "
+                f"align={float(row.get('r_action_align', 0.0)):+.3f} | "
+                f"sk={float(row.get('r_skeleton_delta', 0.0)):+.3f} | "
+                f"ex={float(row.get('r_exact_delta', 0.0)):+.3f} | "
+                f"{row.get('before', '')!r} -> {row.get('after', '')!r}",
+                flush=True,
+            )
+        print("", flush=True)
+        return
+
     print(f"\n[RRPI DEBUG step={step}]", flush=True)
     print(f"sample_id={record.get('sample_id', '')} type={record.get('answer_type', '')} state={record.get('state_kind', '')}", flush=True)
     print(f"GT: {record.get('gt_answer', '')}", flush=True)
@@ -309,9 +350,13 @@ def mean_dict(rows: List[Dict[str, float]]) -> Dict[str, float]:
 def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict, device: torch.device, limit: int = 128) -> Dict[str, Any]:
     eval_cfg = copy.deepcopy(cfg)
     eval_cfg.setdefault("rrpi", {})
+    eval_cfg.setdefault("rollout", {})
     eval_cfg["rrpi"]["transition_train"] = False
     eval_cfg["rrpi"]["debug_records_per_step"] = 0
     eval_cfg["rrpi"]["debug_every"] = 0
+    eval_cfg["rollout"]["debug_records_per_step"] = 0
+    eval_cfg["rollout"]["mode"] = "greedy"
+    eval_cfg["rollout"]["num_rollouts"] = 1
     if limit and limit > 0:
         samples = samples[: min(limit, len(samples))]
     model.eval()
@@ -320,7 +365,7 @@ def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict
     with torch.no_grad():
         for sample in samples:
             try:
-                loss_i, stats_i = guided_ratio_loss(model, graph, noise, tokenizer, sample, eval_cfg, device)
+                loss_i, stats_i = compute_rl_loss(model, graph, noise, tokenizer, sample, eval_cfg, device)
             except Exception:
                 continue
             losses.append(float(loss_i.detach().item()))
@@ -444,11 +489,17 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", cli_gpu: i
     save_every = int(cfg["training"].get("save_every", 100))
     log_every = int(cfg["training"].get("log_every", 1))
     rrpi_cfg = cfg.get("rrpi", cfg.get("guided", {}))
-    debug_every = int(rrpi_cfg.get("debug_every", 20))
-    max_debug_rows = int(rrpi_cfg.get("max_debug_rows", 8))
+    rollout_cfg = cfg.get("rollout", {})
+    mode_for_debug = str(cfg.get("rl", {}).get("mode", rrpi_cfg.get("mode", "rrpi")))
+    if mode_for_debug in {"rollout", "rollout_chain", "chain"}:
+        debug_every = int(rollout_cfg.get("debug_every", rrpi_cfg.get("debug_every", 20)))
+        max_debug_rows = int(rollout_cfg.get("max_debug_steps", rrpi_cfg.get("max_debug_rows", 8)))
+    else:
+        debug_every = int(rrpi_cfg.get("debug_every", 20))
+        max_debug_rows = int(rrpi_cfg.get("max_debug_rows", 8))
 
     run_info = {
-        "algorithm": "RRPI: Ratio-Reward Policy Improvement",
+        "algorithm": str(cfg.get("rl", {}).get("mode", "rrpi")),
         "start": start_name,
         "output_name": output_name,
         "run_id": run_id,
@@ -486,7 +537,7 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", cli_gpu: i
         for _ in range(batch_size):
             sample = next(sample_iter)
             try:
-                loss_i, stats_i = guided_ratio_loss(model, graph, noise, tokenizer, sample, cfg, device)
+                loss_i, stats_i = compute_rl_loss(model, graph, noise, tokenizer, sample, cfg, device)
             except Exception as exc:
                 print(f"[warn] skip sample {sample.get('id', '')}: {exc}", flush=True)
                 continue
@@ -520,10 +571,10 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", cli_gpu: i
             print(
                 f"step={step} loss={row['loss']:.4f} "
                 f"target_logp={row.get('target_logp', 0.0):.4f} "
-                f"p_target={row.get('target_prob', 0.0):.6g} "
                 f"modelR={row.get('model_reward', 0.0):+.3f} "
-                f"bestR={row.get('best_reward', 0.0):+.3f} "
-                f"gap={row.get('reward_gap', 0.0):.3f} "
+                f"Rstd={row.get('rollout_reward_std', 0.0):.3f} "
+                f"entropy={row.get('rollout_entropy', row.get('candidate_entropy', 0.0)):.3f} "
+                f"anchor={row.get('rollout_anchor_loss', 0.0):.4f} "
                 f"targets={row.get('guided_targets', 0.0):.1f}",
                 flush=True,
             )
