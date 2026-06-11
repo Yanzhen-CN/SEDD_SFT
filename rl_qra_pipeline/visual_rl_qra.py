@@ -1,157 +1,201 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import json
 from pathlib import Path
+from typing import Dict, List, Optional
 
-import yaml
-
+import matplotlib.pyplot as plt
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
-DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
+
+DEFAULT_RUN_ROOT = SCRIPT_DIR / "modelparameter" / "rl_QRA"
+DEFAULT_OUT_DIR = SCRIPT_DIR / "visual" / "rl_QRA"
 
 
-def repo_path(path):
-    p = Path(path)
-    return p if p.is_absolute() else REPO_DIR / p
-
-
-def read_csv(path):
-    with open(path, "r", encoding="utf-8-sig") as f:
+def read_csv(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with open(path, "r", encoding="utf-8", newline="") as f:
         return list(csv.DictReader(f))
 
 
-def load_config(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+def to_float(value: object) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
 
 
-def best_metrics_path(root, name):
-    root = Path(root)
-    direct = root / name / "best_metrics.csv"
-    if direct.exists():
-        return direct
-    best_eval = root / name / "best_eval.json"
-    if best_eval.exists():
-        info = json.loads(best_eval.read_text(encoding="utf-8"))
-        run_dir = info.get("run_dir")
-        if run_dir and Path(run_dir).exists():
-            path = Path(run_dir) / "metrics.csv"
-            if path.exists():
-                return path
-    return root / name / "metrics.csv"
+def plot_metric(rows: List[Dict[str, str]], metric: str, out_path: Path, title: str) -> bool:
+    xs: List[float] = []
+    ys: List[float] = []
 
-
-def step_bin_end(step, bin_size):
-    if step <= 0:
-        return 0
-    return ((step - 1) // bin_size + 1) * bin_size
-
-
-def aggregate(rows, bin_size):
-    buckets = {}
-    for row in rows:
-        b = step_bin_end(row["step"], bin_size)
-        buckets.setdefault(b, []).append(row["loss"])
-    return [{"step": b, "loss": sum(vals) / len(vals), "count": len(vals)} for b, vals in sorted(buckets.items())]
-
-
-def plot_curves(root, out_dir, names, bin_size=25, show_raw=False):
-    import matplotlib.pyplot as plt
-
-    plt.figure(figsize=(10, 6))
-    plotted = False
-    for name in names:
-        path = best_metrics_path(root, name)
-        if not path.exists():
-            print(f"Skip {name}: {path} not found")
+    for i, row in enumerate(rows):
+        y = to_float(row.get(metric))
+        if y is None:
             continue
-        rows = []
-        for row in read_csv(path):
-            try:
-                rows.append({"step": int(row["step"]), "loss": float(row["loss"])})
-            except (KeyError, ValueError):
-                pass
-        if not rows:
-            continue
-        rows = sorted(rows, key=lambda r: r["step"])
-        if show_raw:
-            plt.scatter([r["step"] for r in rows], [r["loss"] for r in rows], s=8, alpha=0.18)
-        mean_rows = aggregate(rows, bin_size)
-        plt.plot(
-            [r["step"] for r in mean_rows],
-            [r["loss"] for r in mean_rows],
-            marker="o",
-            linewidth=1.8,
-            label=name,
-        )
-        plotted = True
+        x = to_float(row.get("step"))
+        xs.append(float(i if x is None else x))
+        ys.append(y)
 
-    if not plotted:
-        return
-    plt.title("RL-QRA Guided Ratio Loss")
+    if not ys:
+        return False
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(9, 5))
+    plt.plot(xs, ys, linewidth=1.2)
     plt.xlabel("step")
-    plt.ylabel("guided local ratio loss")
-    plt.grid(alpha=0.25)
-    plt.legend()
-    out = Path(out_dir) / "rl_qra_learning_curves.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.ylabel(metric)
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(out, dpi=180)
+    plt.savefig(out_path, dpi=180)
     plt.close()
-    print(f"Saved {out}")
+    return True
 
 
-def plot_test(test_dir, out_dir):
-    import matplotlib.pyplot as plt
-
-    path = Path(test_dir) / "test_results.csv"
-    if not path.exists():
-        print(f"Skip test: {path} not found")
-        return
-    rows = []
-    for row in read_csv(path):
-        try:
-            rows.append({"dataset": row["dataset"], "model": row["model"], "loss": float(row["loss"])})
-        except (KeyError, ValueError):
-            pass
+def summarize_metrics(path: Path) -> Dict[str, object]:
+    rows = read_csv(path)
     if not rows:
+        return {"metrics_path": str(path), "rows": 0}
+
+    tail = rows[-min(100, len(rows)) :]
+    summary: Dict[str, object] = {
+        "run_dir": str(path.parent),
+        "metrics_path": str(path),
+        "rows": len(rows),
+    }
+
+    for key in [
+        "loss",
+        "target_prob",
+        "target_logp",
+        "model_reward",
+        "best_reward",
+        "reward_gap",
+        "candidate_entropy",
+        "eval_loss",
+    ]:
+        vals = [to_float(row.get(key)) for row in tail]
+        vals = [v for v in vals if v is not None]
+        if vals:
+            summary[f"last100_{key}"] = sum(vals) / len(vals)
+            summary[f"final_{key}"] = vals[-1]
+
+    eval_json = path.parent / "eval.json"
+    if eval_json.exists():
+        try:
+            obj = json.loads(eval_json.read_text(encoding="utf-8"))
+            if isinstance(obj, dict):
+                for key in ["eval_loss", "best_loss", "final_loss"]:
+                    if key in obj:
+                        summary[key] = obj[key]
+        except Exception:
+            pass
+
+    return summary
+
+
+def write_summary(rows: List[Dict[str, object]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
         return
-    datasets = list(dict.fromkeys(row["dataset"] for row in rows))
-    models = list(dict.fromkeys(row["model"] for row in rows))
-    values = {(row["dataset"], row["model"]): row["loss"] for row in rows}
-    width = 0.8 / max(1, len(models))
-    x = list(range(len(datasets)))
 
-    plt.figure(figsize=(10, 6))
-    for i, model in enumerate(models):
-        offsets = [pos - 0.4 + width / 2 + i * width for pos in x]
-        plt.bar(offsets, [values.get((dataset, model), 0) for dataset in datasets], width=width, label=model)
-    plt.xticks(x, datasets)
-    plt.ylabel("target-token score entropy loss")
-    plt.title("RL-QRA Test Loss Comparison")
-    plt.grid(axis="y", alpha=0.25)
-    plt.legend()
-    out = Path(out_dir) / "rl_qra_test_comparison.png"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(out, dpi=180)
-    plt.close()
-    print(f"Saved {out}")
+    keys: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in keys:
+                keys.append(key)
+
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Plot RL-QRA training and test results.")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+def collect_metric_files(run_root: Path) -> List[Path]:
+    files: List[Path] = []
+
+    best = run_root / "best_metrics.csv"
+    if best.exists():
+        files.append(best)
+
+    runs_dir = run_root / "runs"
+    if runs_dir.exists():
+        files.extend(sorted(runs_dir.glob("*/metrics.csv")))
+
+    # Backward compatible with older timestamp folders under root.
+    files.extend(sorted(p for p in run_root.glob("*/metrics.csv") if "/runs/" not in str(p)))
+
+    # Deduplicate while preserving order.
+    seen = set()
+    out = []
+    for p in files:
+        rp = p.resolve()
+        if rp not in seen:
+            out.append(p)
+            seen.add(rp)
+    return out
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Visualize RL-QRA metrics.")
+    parser.add_argument("--run-root", default=str(DEFAULT_RUN_ROOT))
+    parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     args = parser.parse_args()
-    config = load_config(args.config)
-    root = repo_path(config["output"].get("root_dir", "rl_qra_pipeline/modelparameter"))
-    out_dir = repo_path(config.get("visual", {}).get("output_dir", "rl_qra_pipeline/visualization"))
-    test_dir = repo_path(config.get("eval", {}).get("output_dir", "rl_qra_pipeline/test_result"))
-    bin_size = int(config.get("visual", {}).get("bin_size", 25))
-    show_raw = bool(config.get("visual", {}).get("show_raw", False))
-    plot_curves(root, out_dir, ["rl_pretrain", "rl_QRA"], bin_size=bin_size, show_raw=show_raw)
-    plot_test(test_dir, out_dir)
+
+    run_root = Path(args.run_root)
+    out_dir = Path(args.out_dir)
+    metric_files = collect_metric_files(run_root)
+
+    if not metric_files:
+        raise SystemExit(f"No metrics.csv found under {run_root}")
+
+    metrics = [
+        "loss",
+        "target_prob",
+        "target_logp",
+        "model_reward",
+        "best_reward",
+        "reward_gap",
+        "candidate_entropy",
+        "eval_loss",
+    ]
+
+    summaries: List[Dict[str, object]] = []
+    for path in metric_files:
+        rows = read_csv(path)
+        run_name = "global_best" if path.name == "best_metrics.csv" else path.parent.name
+        summaries.append({"run": run_name, **summarize_metrics(path)})
+
+        for metric in metrics:
+            plot_metric(
+                rows,
+                metric,
+                out_dir / run_name / f"{metric}.png",
+                f"{run_name}: {metric}",
+            )
+
+    # Sort summary by eval_loss if available, otherwise by last100 loss.
+    def sort_key(row: Dict[str, object]):
+        for key in ("eval_loss", "last100_eval_loss", "last100_loss", "final_loss"):
+            val = to_float(row.get(key))
+            if val is not None:
+                return val
+        return float("inf")
+
+    summaries.sort(key=sort_key)
+    write_summary(summaries, out_dir / "summary.csv")
+    (out_dir / "summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"Found {len(metric_files)} metrics files.")
+    print(f"Wrote visuals to: {out_dir}")
+    print(f"Wrote summary: {out_dir / 'summary.csv'}")
 
 
 if __name__ == "__main__":

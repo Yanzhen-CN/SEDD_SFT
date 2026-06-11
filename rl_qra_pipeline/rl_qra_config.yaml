@@ -3,7 +3,6 @@ cpu: false
 
 run:
   selected: QRA
-  # 命令行 --gpu 0 会覆盖这里；不写则默认 cuda。
   cuda_device: null
 
 model:
@@ -61,24 +60,20 @@ rrpi:
   reveal_mode: prefix_grid
   base_state: reference_answer_masked
   corrupt_mode: mask
-
   transition_kind: analytic
   transition_train: true
   step_size: 1.0e-5
   t_min: 0.05
   t_max: 0.95
-
   include_model_topk: 4
   include_clean_candidates: true
   include_bad_continuations: false
   max_candidates: 32
-
   reward_temperature: 0.10
   min_reward_gap: 0.0
   rrpi_weight: 1.0
   sft_anchor_weight: 0.05
   eps: 1.0e-8
-
   debug_every: 20
   debug_records_per_step: 2
   max_debug_candidates: 10
@@ -86,3 +81,24 @@ rrpi:
 
 guided:
   states_per_sample: 2
+
+output:
+  root_dir: rl_qra_pipeline/modelparameter
+  # root of selected start still only keeps global best files under starts.QRA.output_dir.
+  best_metric: eval_loss
+  best_metric_mode: min
+
+eval:
+  split: test
+  datasets:
+    - S1F_RL
+  output_dir: rl_qra_pipeline/test_result
+  batch_size: 1
+  num_workers: 0
+  eval_batches: 0
+
+compare_models:
+  QRA_base:
+    checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
+  rl_QRA:
+    checkpoint: rl_qra_pipeline/modelparameter/rl_QRA/best.pth
