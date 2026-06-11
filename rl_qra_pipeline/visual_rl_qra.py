@@ -130,14 +130,20 @@ def summarize_metrics(path: Path) -> Dict[str, object]:
         if vals:
             summary[f"last100_{key}"] = sum(vals) / len(vals)
             summary[f"final_{key}"] = vals[-1]
-    eval_json = path.parent / "eval.json"
-    if eval_json.exists():
+    eval_candidates = [path.parent / "eval.json"]
+    # For root/global-best metrics.csv, the final eval file is named best_eval.json.
+    if path.name == "best_metrics.csv":
+        eval_candidates.insert(0, path.parent / "best_eval.json")
+    for eval_json in eval_candidates:
+        if not eval_json.exists():
+            continue
         try:
             obj = json.loads(eval_json.read_text(encoding="utf-8"))
             if isinstance(obj, dict):
                 for key in ["eval_loss", "eval_count", "eval_split", "rollout_reward", "rollout_entropy", "best_metric_name", "best_metric_value"]:
                     if key in obj:
                         summary[key] = obj[key]
+                break
         except Exception:
             pass
     return summary
@@ -160,12 +166,25 @@ def write_table(rows: List[Dict[str, object]], path: Path) -> None:
 
 
 def collect_metric_files(run_root: Path) -> List[Path]:
+    """Collect root global-best metrics and one-level per-run metrics.
+
+    Current training layout is:
+        run_root/
+          best_metrics.csv
+          <run_id>/metrics.csv
+
+    Older versions used run_root/runs/<run_id>/metrics.csv.  We keep a
+    compatibility fallback but do not require the extra runs/ directory.
+    """
     files: List[Path] = []
     best = run_root / "best_metrics.csv"
     if best.exists():
         files.append(best)
     if run_root.exists():
-        files.extend(sorted(runs_root.glob("*/metrics.csv")))
+        files.extend(sorted(run_root.glob("*/metrics.csv")))
+        legacy_runs = run_root / "runs"
+        if legacy_runs.exists():
+            files.extend(sorted(legacy_runs.glob("*/metrics.csv")))
     seen = set()
     out = []
     for p in files:
