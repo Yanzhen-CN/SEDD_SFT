@@ -85,6 +85,20 @@ def resolve_repo_path(value: str | Path) -> Path:
     return p if p.is_absolute() else REPO_DIR / p
 
 
+def is_disabled_checkpoint(value: object) -> bool:
+    """Return True when the selected start should use the HF/pretrained weights directly.
+
+    This is needed for --start pretrain: other pipelines usually do not have a
+    local pretrain.pth; they initialize from SEDD.from_pretrained(...), which uses
+    the Hugging Face cache/download path.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "none", "null", "pretrained", "hf", "cache", "false"}
+    return False
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -176,7 +190,9 @@ def load_policy(cfg: Dict, device: torch.device):
 
     ckpt_value = cfg.get("model", {}).get("init_checkpoint", "")
     loaded_from = pretrained
-    if ckpt_value:
+    if is_disabled_checkpoint(ckpt_value):
+        print(f"Using pretrained/HF-cache weights: {pretrained}", flush=True)
+    else:
         ckpt_path = resolve_repo_path(ckpt_value)
         if ckpt_path.exists():
             state = torch.load(ckpt_path, map_location=device)
@@ -190,10 +206,14 @@ def load_policy(cfg: Dict, device: torch.device):
                     print(f"[warn] failed to load EMA from checkpoint: {exc}", flush=True)
             loaded_from = str(ckpt_path)
             print(f"Loaded start checkpoint: {ckpt_path}", flush=True)
+        elif bool(cfg.get("model", {}).get("allow_missing_init_checkpoint", False)):
+            print(f"[warn] init checkpoint not found, falling back to pretrained/HF-cache weights: {ckpt_path}", flush=True)
         else:
             raise FileNotFoundError(
                 f"init checkpoint not found: {ckpt_path}\n"
-                "Fix starts.<name>.init_checkpoint in rl_qra_config.yaml, or pass --start to select another start."
+                "For --start pretrain, set starts.pretrain.init_checkpoint: null/''/pretrained "
+                "so SEDD.from_pretrained(...) uses the Hugging Face cache. "
+                "For QA/QRA, fix starts.<name>.init_checkpoint in rl_qra_config.yaml."
             )
 
     graph = graph_lib.get_graph(model.config, device)

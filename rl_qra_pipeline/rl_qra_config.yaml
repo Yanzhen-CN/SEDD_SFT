@@ -28,7 +28,10 @@ data:
 
 starts:
   pretrain:
-    init_checkpoint: rl_qra_pipeline/modelparameter/pretrain/pretrain.pth
+    # No local pretrain.pth is required.  This start uses SEDD.from_pretrained(...)
+    # and therefore works with the Hugging Face cache/download path.
+    pretrained: louaaron/sedd-medium
+    init_checkpoint: null
     data_dir: rl_qra_pipeline/data/S1K_RL
     output_dir: rl_qra_pipeline/modelparameter/rl_pretrain
     output_name: rl_pretrain
