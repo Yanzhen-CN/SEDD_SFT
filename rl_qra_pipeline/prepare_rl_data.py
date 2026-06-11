@@ -156,41 +156,95 @@ def strip_label_prefix(text: str, labels: List[str]) -> str:
     return out
 
 
+def is_anchor_like_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", str(text or "").lower())
+    return compact in {"answer:", "answer", "finalanswer:", "finalanswer", "solution:", "solution"}
+
+
+def is_bad_answer_segment_key(key: str) -> bool:
+    key_l = str(key or "").lower()
+    # In QRA data there is often an answer_anchor segment before the real answer.
+    # Never treat it as the answer itself.
+    return any(x in key_l for x in ["anchor", "prefix", "prompt", "header"])
+
+
 def get_segment_text(row: Dict[str, Any], wanted: List[str]) -> str:
     wanted_lower = {w.lower() for w in wanted}
     segs = row.get("segments")
+    wants_answer = "answer" in wanted_lower or "target" in wanted_lower or "solution" in wanted_lower
+
+    def clean_candidate(key: str, text: Any) -> str:
+        if wants_answer and is_bad_answer_segment_key(key):
+            return ""
+        out = str(text or "").strip()
+        if wants_answer and is_anchor_like_text(out):
+            return ""
+        return out
 
     if isinstance(segs, dict):
-        # First use exact/semantic segment names.
+        # 1) Exact key match first. This prevents answer_anchor from shadowing answer.
         for key, value in segs.items():
             key_l = str(key).lower()
-            if key_l in wanted_lower or any(w in key_l for w in wanted_lower):
+            if key_l in wanted_lower:
                 text = value.get("text", "") if isinstance(value, dict) else value
-                if str(text).strip():
-                    return str(text).strip()
-        # Existing QRA data usually marks only answer segment as train=True.
-        if "answer" in wanted_lower:
-            for value in segs.values():
+                out = clean_candidate(key_l, text)
+                if out:
+                    return out
+
+        # 2) For answers, prefer train=True segments over fuzzy name matching.
+        if wants_answer:
+            for key, value in segs.items():
+                if is_bad_answer_segment_key(str(key)):
+                    continue
                 if isinstance(value, dict) and value.get("train") is True:
-                    text = value.get("text", "")
-                    if str(text).strip():
-                        return str(text).strip()
+                    out = clean_candidate(str(key), value.get("text", ""))
+                    if out:
+                        return out
+
+        # 3) Fuzzy match only after exact and train=True fail.
+        for key, value in segs.items():
+            key_l = str(key).lower()
+            if wants_answer and is_bad_answer_segment_key(key_l):
+                continue
+            if any(w in key_l for w in wanted_lower):
+                text = value.get("text", "") if isinstance(value, dict) else value
+                out = clean_candidate(key_l, text)
+                if out:
+                    return out
 
     if isinstance(segs, list):
+        # 1) Exact named segment first.
         for item in segs:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or item.get("key") or item.get("type") or "").lower()
-            if name in wanted_lower or any(w in name for w in wanted_lower):
-                text = item.get("text", "")
-                if str(text).strip():
-                    return str(text).strip()
-        if "answer" in wanted_lower:
+            if name in wanted_lower:
+                out = clean_candidate(name, item.get("text", ""))
+                if out:
+                    return out
+
+        # 2) train=True for answer.
+        if wants_answer:
             for item in segs:
+                name = str(item.get("name") or item.get("key") or item.get("type") or "").lower()
+                if is_bad_answer_segment_key(name):
+                    continue
                 if item.get("train") is True:
-                    text = item.get("text", "")
-                    if str(text).strip():
-                        return str(text).strip()
+                    out = clean_candidate(name, item.get("text", ""))
+                    if out:
+                        return out
+
+        # 3) Fuzzy named segment.
+        for item in segs:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("key") or item.get("type") or "").lower()
+            if wants_answer and is_bad_answer_segment_key(name):
+                continue
+            if any(w in name for w in wanted_lower):
+                out = clean_candidate(name, item.get("text", ""))
+                if out:
+                    return out
 
     return ""
 
@@ -607,6 +661,15 @@ def filter_qra_split(
 
         ok, kind, normalized_or_reason = classify_answer(answer)
         if not ok:
+            # If the train=True/answer segment is actually a full completion, extract the last final-answer marker from it.
+            extracted = extract_final_answer(raw_answer)
+            if extracted:
+                ok2, kind2, normalized2 = classify_answer(extracted)
+                if ok2:
+                    ok, kind, normalized_or_reason = True, kind2, normalized2
+                    source = "answer_segment_final_marker"
+
+        if not ok:
             extracted = extract_final_answer(reasoning)
             if extracted:
                 ok2, kind2, normalized2 = classify_answer(extracted)
@@ -678,7 +741,7 @@ def build_dataset(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     report: Dict[str, Any] = {
-        "base": "copy_filtered_QRA_plus_synthetic_hard_cases_v7",
+        "base": "copy_filtered_QRA_plus_synthetic_hard_cases_v8_anchor_fixed",
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "seed": args.seed,
@@ -707,9 +770,15 @@ def build_dataset(args: argparse.Namespace) -> Dict[str, Any]:
 
     real_total = sum(len(rows) for rows in split_rows.values())
     if real_total == 0 and not args.allow_zero_real:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        failed_report = output_dir / "build_report_failed_zero_real.json"
+        report["real_total_kept"] = 0
+        failed_report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         raise RuntimeError(
             "QRA files were loaded, but 0 real rows survived filtering. Refusing to output synthetic-only data.\n"
-            "Check build_report/drop_examples by temporarily running with --allow-zero-real, or loosen filters."
+            f"A debug report was written to {failed_report}.\n"
+            "Most likely causes: answer_anchor was selected instead of answer, answer segment contains full completion, "
+            "or filters are still too strict."
         )
 
     quotas = compute_synth_quotas(real_total, float(args.synthetic_final_fraction), int(args.min_synthetic_eval))
