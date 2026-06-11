@@ -61,6 +61,17 @@ METRIC_FIELDS = [
     "rollout_entropy",
     "rollout_logprob",
     "rollout_anchor_loss",
+    # Periodic validation metrics. These are populated only on eval steps.
+    "eval_loss",
+    "eval_count",
+    "eval_rollout_loss",
+    "eval_rollout_reward",
+    "eval_rollout_reward_std",
+    "eval_rollout_entropy",
+    "eval_rollout_logprob",
+    "eval_rollout_anchor_loss",
+    "best_metric_value",
+    "is_best_eval",
 ]
 
 
@@ -347,6 +358,32 @@ def mean_dict(rows: List[Dict[str, float]]) -> Dict[str, float]:
     return out
 
 
+def metric_better(new_value: float, best_value: float, mode: str = "min") -> bool:
+    """Return whether a validation metric improved.
+
+    For eval_loss use mode='min'. For a reward/exact-rate style metric use mode='max'.
+    """
+    try:
+        new_value = float(new_value)
+        best_value = float(best_value)
+    except Exception:
+        return False
+    if not np.isfinite(new_value):
+        return False
+    return new_value > best_value if str(mode).lower() == "max" else new_value < best_value
+
+
+def initial_best_value(mode: str = "min") -> float:
+    return -float("inf") if str(mode).lower() == "max" else float("inf")
+
+
+def get_metric_value(metrics: Dict[str, Any], name: str, default: float) -> float:
+    try:
+        return float(metrics.get(name, default))
+    except Exception:
+        return float(default)
+
+
 def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict, device: torch.device, limit: int = 128) -> Dict[str, Any]:
     eval_cfg = copy.deepcopy(cfg)
     eval_cfg.setdefault("rrpi", {})
@@ -407,12 +444,14 @@ def update_global_best(
     metrics_json: Dict[str, Any],
     run_info_path: Path,
     metrics_path: Path,
+    best_metric_name: str = "eval_loss",
+    best_mode: str = "min",
 ) -> bool:
     """Root stays clean: only global-best files are kept at out_root.
 
     The individual run keeps all artifacts under out_root/runs/<run_id>/.
-    At the end of a run, compare eval_loss against root best_metrics.json.
-    If better, atomically update the root best files.
+    At the end of a run, compare the configured validation metric against root best_metrics.json.
+    The default metric is eval_loss with mode=min.
     """
     out_root.mkdir(parents=True, exist_ok=True)
     lock = out_root / ".global_best.lock"
@@ -420,16 +459,21 @@ def update_global_best(
     improved = False
     try:
         current_path = out_root / "best_metrics.json"
-        current_best = float("inf")
+        current_best = initial_best_value(best_mode)
         if current_path.exists():
             try:
                 current = json.loads(current_path.read_text(encoding="utf-8"))
-                current_best = float(current.get("eval_loss", current.get("best_eval_loss", float("inf"))))
+                # Prefer the same configured metric. Fall back to legacy eval_loss.
+                current_best = get_metric_value(
+                    current,
+                    "best_metric_value",
+                    get_metric_value(current, best_metric_name, get_metric_value(current, "eval_loss", current_best)),
+                )
             except Exception:
-                current_best = float("inf")
+                current_best = initial_best_value(best_mode)
 
-        new_loss = float(eval_info.get("eval_loss", float("inf")))
-        if new_loss < current_best:
+        new_metric = get_metric_value(eval_info, best_metric_name, get_metric_value(eval_info, "eval_loss", initial_best_value(best_mode)))
+        if metric_better(new_metric, current_best, best_mode):
             improved = True
             if best_ckpt.exists():
                 shutil.copy2(best_ckpt, out_root / "best.pth")
@@ -441,8 +485,11 @@ def update_global_best(
             log_row = {
                 "time": dt.datetime.now().isoformat(timespec="seconds"),
                 "run_dir": str(run_dir),
-                "old_eval_loss": current_best,
-                "new_eval_loss": new_loss,
+                "best_metric_name": best_metric_name,
+                "best_mode": best_mode,
+                "old_best_metric": current_best,
+                "new_best_metric": new_metric,
+                "new_eval_loss": eval_info.get("eval_loss"),
                 "improved": True,
             }
             append_jsonl(out_root / "improvement_log.jsonl", log_row)
@@ -481,6 +528,10 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         raise RuntimeError("No training samples loaded.")
     sample_iter = cycle_samples(samples, seed)
 
+    # Load validation samples once.  Best checkpoints are selected by mean validation metrics,
+    # never by the single training sample loss from an update step.
+    eval_samples, eval_split = load_eval_samples(cfg, tokenizer, samples)
+
     lr = float(cfg["training"].get("lr", 2e-6))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(cfg["training"].get("weight_decay", 0.0)))
     batch_size = int(cfg["training"].get("batch_size", 1))
@@ -488,6 +539,10 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     grad_clip = float(cfg["training"].get("grad_clip", 1.0))
     save_every = int(cfg["training"].get("save_every", 100))
     log_every = int(cfg["training"].get("log_every", 1))
+    eval_every = int(cfg["training"].get("eval_every", 50) or 0)
+    eval_limit = int(cfg["training"].get("eval_limit", cfg.get("data", {}).get("eval_limit", 64)) or 64)
+    best_metric_name = str(cfg["training"].get("best_metric", "eval_loss"))
+    best_mode = str(cfg["training"].get("best_mode", "min")).lower()
     rrpi_cfg = cfg.get("rrpi", cfg.get("guided", {}))
     rollout_cfg = cfg.get("rollout", {})
     mode_for_debug = str(cfg.get("rl", {}).get("mode", rrpi_cfg.get("mode", "rrpi")))
@@ -507,6 +562,11 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "loaded_from": loaded_from,
         "num_samples": len(samples),
         "data_split": split,
+        "eval_split": eval_split,
+        "eval_limit": eval_limit,
+        "eval_every": eval_every,
+        "best_metric_name": best_metric_name,
+        "best_mode": best_mode,
         "device": str(device),
         "cli_gpu": cli_gpu,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
@@ -517,13 +577,18 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     metrics_path = out_dir / "metrics.csv"
     debug_path = out_dir / "rollout_debug.jsonl"
 
-    best_loss = float("inf")
+    best_metric_value = initial_best_value(best_mode)
     best_step = 0
     best_row: Dict[str, Any] = {}
+    best_eval_info: Dict[str, Any] = {}
     best_path = out_dir / "best_run.pth"
     last_path = out_dir / "last_run.pth"
 
-    numeric_keys = [k for k in METRIC_FIELDS if k not in {"step", "loss", "lr"}]
+    numeric_keys = [
+        k for k in METRIC_FIELDS
+        if k not in {"step", "loss", "lr", "best_metric_value", "is_best_eval"}
+        and not k.startswith("eval_")
+    ]
     last_debug_records: List[Dict[str, Any]] = []
     last_row: Dict[str, Any] = {}
 
@@ -581,11 +646,63 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         row = {"step": step, "loss": loss_value, "lr": lr}
         for k, v in agg.items():
             row[k] = v / max(1, valid)
+
+        # Periodic validation.  This is deliberately not the single-sample training loss.
+        # It is a mean over a fixed eval subset, so it is meaningful for best_run.pth and plots.
+        eval_now = eval_every > 0 and (step % eval_every == 0 or step == steps)
+        if eval_now:
+            eval_info_step = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
+            eval_info_step.update({
+                "eval_split": eval_split,
+                "eval_limit": eval_limit,
+                "step": step,
+                "run_id": run_id,
+                "best_metric_name": best_metric_name,
+                "best_mode": best_mode,
+            })
+            row["eval_loss"] = float(eval_info_step.get("eval_loss", float("inf")))
+            row["eval_count"] = int(eval_info_step.get("eval_count", 0))
+            row["eval_rollout_loss"] = float(eval_info_step.get("rollout_loss", 0.0))
+            row["eval_rollout_reward"] = float(eval_info_step.get("rollout_reward", 0.0))
+            row["eval_rollout_reward_std"] = float(eval_info_step.get("rollout_reward_std", 0.0))
+            row["eval_rollout_entropy"] = float(eval_info_step.get("rollout_entropy", 0.0))
+            row["eval_rollout_logprob"] = float(eval_info_step.get("rollout_logprob", 0.0))
+            row["eval_rollout_anchor_loss"] = float(eval_info_step.get("rollout_anchor_loss", 0.0))
+            metric_value = get_metric_value(eval_info_step, best_metric_name, get_metric_value(eval_info_step, "eval_loss", initial_best_value(best_mode)))
+            row["best_metric_value"] = metric_value
+            improved_eval = metric_better(metric_value, best_metric_value, best_mode)
+            row["is_best_eval"] = 1.0 if improved_eval else 0.0
+            append_jsonl(out_dir / "eval_history.jsonl", eval_info_step)
+            if improved_eval:
+                best_metric_value = metric_value
+                best_step = step
+                best_row = dict(row)
+                best_eval_info = dict(eval_info_step)
+                save_checkpoint(
+                    best_path,
+                    model,
+                    ema,
+                    optimizer,
+                    cfg,
+                    step,
+                    {"best_metric_name": best_metric_name, "best_mode": best_mode, "best_metric_value": metric_value, **row},
+                )
+                dump_json(out_dir / "best_eval.json", best_eval_info)
+            print(
+                f"[eval step={step}] {best_metric_name}={metric_value:.6g} mode={best_mode} "
+                f"eval_loss={row['eval_loss']:.6g} evalR={row.get('eval_rollout_reward', 0.0):+.3f} "
+                f"count={row.get('eval_count', 0)} best={'yes' if improved_eval else 'no'}",
+                flush=True,
+            )
+
         last_row = row
         last_debug_records = debug_records or last_debug_records
 
         if step % log_every == 0:
             append_csv(metrics_path, row)
+            eval_msg = ""
+            if row.get("eval_loss", "") != "":
+                eval_msg = f" eval_loss={float(row.get('eval_loss')):.4f}"
             print(
                 f"step={step} loss={row['loss']:.4f} "
                 f"target_logp={row.get('target_logp', 0.0):.4f} "
@@ -593,7 +710,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                 f"Rstd={row.get('rollout_reward_std', 0.0):.3f} "
                 f"entropy={row.get('rollout_entropy', row.get('candidate_entropy', 0.0)):.3f} "
                 f"anchor={row.get('rollout_anchor_loss', 0.0):.4f} "
-                f"targets={row.get('guided_targets', 0.0):.1f}",
+                f"targets={row.get('guided_targets', 0.0):.1f}"
+                f"{eval_msg}",
                 flush=True,
             )
 
@@ -603,20 +721,49 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         if debug_every > 0 and step % debug_every == 0 and last_debug_records:
             print_debug_record(step, last_debug_records[0], max_rows=max_debug_rows)
 
-        if row["loss"] < best_loss:
-            best_loss = row["loss"]
-            best_step = step
-            best_row = dict(row)
-            save_checkpoint(best_path, model, ema, optimizer, cfg, step, row)
         if save_every > 0 and step % save_every == 0:
             save_checkpoint(last_path, model, ema, optimizer, cfg, step, row)
 
     if not last_path.exists():
-        save_checkpoint(last_path, model, ema, optimizer, cfg, steps, last_row or {"loss": best_loss})
-    if not best_path.exists():
-        save_checkpoint(best_path, model, ema, optimizer, cfg, best_step or steps, best_row or last_row or {"loss": best_loss})
+        save_checkpoint(last_path, model, ema, optimizer, cfg, steps, last_row or {"loss": float("inf")})
 
-    # Evaluate the run's own best training checkpoint, then compete for root global best.
+    # If periodic eval was disabled or never produced a valid best, select by one final validation pass.
+    if not best_path.exists():
+        final_eval_for_best = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
+        final_eval_for_best.update({
+            "eval_split": eval_split,
+            "eval_limit": eval_limit,
+            "step": steps,
+            "run_id": run_id,
+            "best_metric_name": best_metric_name,
+            "best_mode": best_mode,
+        })
+        best_metric_value = get_metric_value(
+            final_eval_for_best,
+            best_metric_name,
+            get_metric_value(final_eval_for_best, "eval_loss", initial_best_value(best_mode)),
+        )
+        best_step = steps
+        best_eval_info = dict(final_eval_for_best)
+        best_row = dict(last_row or {})
+        best_row.update({
+            "eval_loss": final_eval_for_best.get("eval_loss"),
+            "eval_count": final_eval_for_best.get("eval_count"),
+            "best_metric_value": best_metric_value,
+            "is_best_eval": 1.0,
+        })
+        save_checkpoint(
+            best_path,
+            model,
+            ema,
+            optimizer,
+            cfg,
+            steps,
+            {"best_metric_name": best_metric_name, "best_mode": best_mode, "best_metric_value": best_metric_value, **best_row},
+        )
+        dump_json(out_dir / "best_eval.json", best_eval_info)
+
+    # Evaluate the run's validation-selected best checkpoint, then compete for root global best.
     try:
         state = torch.load(best_path, map_location=device)
         model.load_state_dict(state.get("model", state), strict=True)
@@ -628,32 +775,56 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
             except Exception:
                 pass
     except Exception as exc:
-        print(f"[warn] failed to reload best checkpoint for eval: {exc}", flush=True)
+        print(f"[warn] failed to reload best checkpoint for final eval: {exc}", flush=True)
 
-    eval_samples, eval_split = load_eval_samples(cfg, tokenizer, samples)
-    eval_limit = int(cfg.get("data", {}).get("eval_limit", 128) or 128)
     eval_info = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
-    eval_info.update({"eval_split": eval_split, "eval_limit": eval_limit, "run_id": run_id, "best_train_step": best_step, "best_train_loss": best_loss})
+    eval_info.update({
+        "eval_split": eval_split,
+        "eval_limit": eval_limit,
+        "run_id": run_id,
+        "best_step": best_step,
+        "best_metric_name": best_metric_name,
+        "best_mode": best_mode,
+        "best_metric_value": best_metric_value,
+    })
     dump_json(out_dir / "eval.json", eval_info)
 
     metrics_json = {
         "run_id": run_id,
         "run_dir": str(out_dir),
-        "best_train_step": best_step,
-        "best_train_loss": best_loss,
+        "best_step": best_step,
+        "best_metric_name": best_metric_name,
+        "best_mode": best_mode,
+        "best_metric_value": best_metric_value,
         "last_train_loss": float(last_row.get("loss", float("inf"))) if last_row else float("inf"),
         "eval_loss": float(eval_info.get("eval_loss", float("inf"))),
         "eval_split": eval_split,
         "eval_count": int(eval_info.get("eval_count", 0)),
         "last_row": last_row,
         "best_row": best_row,
+        "best_eval_metrics": best_eval_info,
         "eval_metrics": eval_info,
     }
     dump_json(out_dir / "metrics.json", metrics_json)
 
-    improved = update_global_best(out_root, out_dir, best_path, eval_info, metrics_json, run_info_path, metrics_path)
+    improved = update_global_best(
+        out_root,
+        out_dir,
+        best_path,
+        eval_info,
+        metrics_json,
+        run_info_path,
+        metrics_path,
+        best_metric_name=best_metric_name,
+        best_mode=best_mode,
+    )
     print(f"Done. Outputs: {out_dir}", flush=True)
-    print(f"Run eval_loss={eval_info.get('eval_loss')} improved_global_best={improved}", flush=True)
+    print(
+        f"Run eval_loss={eval_info.get('eval_loss')} "
+        f"{best_metric_name}={eval_info.get(best_metric_name, best_metric_value)} "
+        f"best_step={best_step} improved_global_best={improved}",
+        flush=True,
+    )
     if improved:
         print(f"Updated root global best files under: {out_root}", flush=True)
     return out_dir

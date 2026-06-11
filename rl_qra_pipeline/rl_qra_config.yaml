@@ -7,8 +7,8 @@ run:
 
 rl:
   # True reverse-generation rollout RL.
-  # The rollout sampler is now aligned with generate_sample_chain and SEDD
-  # tau-leaping: each t step samples every answer position independently.
+  # The rollout sampler is aligned with generate_sample_chain and SEDD tau-leaping:
+  # each fixed t step samples every answer position independently.
   mode: rollout_chain
 
 model:
@@ -23,6 +23,7 @@ data:
   split: train
   eval_split: val
   train_limit: 0
+  # Fallback only. Periodic validation is controlled by training.eval_limit below.
   eval_limit: 64
 
 starts:
@@ -43,14 +44,25 @@ starts:
     output_name: rl_QRA
 
 training:
-  steps: 300
+  # 1500 steps is about 2+ passes over the current S1K_RL train split.
+  steps: 1500
   batch_size: 1
   lr: 5.0e-7
   weight_decay: 0.0
   grad_clip: 0.5
   ema: 0.9999
   log_every: 1
-  save_every: 100
+
+  # Periodic checkpoint for recovery only. best_run.pth is selected by validation.
+  save_every: 500
+
+  # Validation-based checkpoint selection.
+  # eval_limit: all means every validation run uses the full val split.
+  # This is slower, but gives the most representative eval_loss curve and best_run.pth.
+  eval_every: 1
+  eval_limit: all
+  best_metric: eval_loss
+  best_mode: min
 
 # Old/local RRPI fallback; kept so the same train script can still run rrpi mode.
 rrpi:
@@ -80,7 +92,7 @@ rrpi:
 
 rollout:
   # Sample-chain-aligned rollout: for each fixed t transition, every answer
-  # position is sampled from the SEDD transition distribution.  This matches
+  # position is sampled from the SEDD transition distribution. This matches
   # generate_sample_chain.py and the SEDD tau-leaping sampler.
   memory_safe_replay: true
   transition_mode: per_position
@@ -88,14 +100,15 @@ rollout:
   num_rollouts: 1
   mode: sample
 
-  # Fixed reverse-time grid.  This yields 0.9500, 0.9206, ..., 0.0100 for 32 transitions.
+  # Fixed reverse-time grid. This yields 0.9500, 0.9206, ..., 0.0100 for 32 transitions.
   t_start: 0.95
   t_end: 0.01
   schedule: linear
   transition_kind: analytic
 
-  # In this aligned mode step_size is the real delta_t = t_k - t_{k+1}.
-  # This field is kept only as fallback for old code paths.
+  # In aligned per-position rollout, real delta_t is computed from the t grid:
+  # delta_t = t_k - t_{k+1}. This step_size field is kept only as fallback
+  # for old code paths and should not affect aligned rollout.
   step_size: 1.0e-5
 
   # Rollout sampling controls.
@@ -103,7 +116,7 @@ rollout:
   eps: 1.0e-12
   freeze_filled: false
 
-  # Probability-adjustment size.  Small values are intentional; prefer multiple
+  # Probability-adjustment size. Small values are intentional; prefer multiple
   # RL rounds over one aggressive update.
   policy_loss_scale: 0.02
   advantage_clip: 0.25

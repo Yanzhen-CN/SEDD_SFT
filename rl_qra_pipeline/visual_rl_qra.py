@@ -28,6 +28,16 @@ ROLLOUT_METRICS = [
     "rollout_logprob",
     "rollout_anchor_loss",
 ]
+EVAL_METRICS = [
+    "eval_loss",
+    "eval_rollout_loss",
+    "eval_rollout_reward",
+    "eval_rollout_reward_std",
+    "eval_rollout_entropy",
+    "eval_rollout_logprob",
+    "eval_rollout_anchor_loss",
+    "best_metric_value",
+]
 LEGACY_METRICS = [
     "target_logp",
     "model_reward",
@@ -114,7 +124,7 @@ def summarize_metrics(path: Path) -> Dict[str, object]:
         return {"metrics_path": str(path), "rows": 0}
     tail = rows[-min(100, len(rows)) :]
     summary: Dict[str, object] = {"run_dir": str(path.parent), "metrics_path": str(path), "rows": len(rows)}
-    for key in ROLLOUT_METRICS + LEGACY_METRICS:
+    for key in ROLLOUT_METRICS + EVAL_METRICS + LEGACY_METRICS:
         vals = [to_float(row.get(key)) for row in tail]
         vals = [v for v in vals if v is not None]
         if vals:
@@ -125,7 +135,7 @@ def summarize_metrics(path: Path) -> Dict[str, object]:
         try:
             obj = json.loads(eval_json.read_text(encoding="utf-8"))
             if isinstance(obj, dict):
-                for key in ["eval_loss", "eval_count", "eval_split", "rollout_reward", "rollout_entropy"]:
+                for key in ["eval_loss", "eval_count", "eval_split", "rollout_reward", "rollout_entropy", "best_metric_name", "best_metric_value"]:
                     if key in obj:
                         summary[key] = obj[key]
         except Exception:
@@ -214,7 +224,7 @@ def visualize_metrics(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
         rows = read_csv(path)
         run_name = "global_best" if path.name == "best_metrics.csv" else path.parent.name
         summaries.append({"run": run_name, **summarize_metrics(path)})
-        for metric in ROLLOUT_METRICS + LEGACY_METRICS:
+        for metric in ROLLOUT_METRICS + EVAL_METRICS + LEGACY_METRICS:
             plot_metric(rows, metric, out_dir / "training" / run_name / f"{metric}.png", f"{run_name}: {metric}")
     def sort_key(row: Dict[str, object]):
         for key in ("eval_loss", "last100_loss", "final_loss"):
