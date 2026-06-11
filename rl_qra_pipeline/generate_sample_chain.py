@@ -47,6 +47,16 @@ from model.ema import ExponentialMovingAverage  # noqa: E402
 from answer_dataset import AnswerSegmentDataset, ordered_segments  # noqa: E402
 from state_builder import encode_sample, mask_id_from_graph, project_fixed_, transition_probs  # noqa: E402
 
+
+def make_t_grid(t_start: float = 0.95, t_end: float = 0.01, steps: int = 32) -> List[float]:
+    steps = int(steps)
+    t_start = float(t_start)
+    t_end = float(t_end)
+    if steps <= 0:
+        return [t_start]
+    dt = (t_start - t_end) / float(steps)
+    return [max(t_end, t_start - k * dt) for k in range(steps + 1)]
+
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 
 
@@ -333,7 +343,7 @@ def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg
     num_steps = int(args.steps)
     t_start = float(args.t_start)
     t_end = float(args.t_end)
-    dt_step = (t_start - t_end) / max(1, num_steps)
+    t_grid = make_t_grid(t_start=t_start, t_end=t_end, steps=num_steps)
 
     rows: List[Dict[str, Any]] = []
     prev_token_texts: Optional[List[str]] = None
@@ -341,7 +351,7 @@ def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg
 
     with torch.no_grad():
         for step in range(num_steps + 1):
-            t_val = max(t_end, t_start - step * dt_step)
+            t_val = float(t_grid[step])
             curr_ids = [int(x[0, p].item()) for p in answer_pos]
             ans_text, token_texts = visible_answer_tokens(tokenizer, curr_ids, mask_id, vocab_size)
             changed = [i for i, (a, b) in enumerate(zip(prev_ids, curr_ids)) if a != b]
@@ -363,6 +373,8 @@ def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg
             if step == num_steps:
                 break
 
+            t_next = float(t_grid[step + 1])
+            dt_step = max(0.0, float(t_val) - float(t_next))
             t_tensor = torch.tensor([t_val], dtype=torch.float32, device=device)
             probs = transition_probs(
                 model,

@@ -7,15 +7,13 @@ run:
 
 rl:
   # True reverse-generation rollout RL.
-  # The rollout action is a joint (answer_slot, token) decision, and the main
-  # reward is position-type alignment for that slot.
+  # The rollout sampler is now aligned with generate_sample_chain and SEDD
+  # tau-leaping: each t step samples every answer position independently.
   mode: rollout_chain
 
 model:
   pretrained: louaaron/sedd-medium
   tokenizer: gpt2
-  # 1024 is possible on larger cards, but rollout RL is much heavier than SFT
-  # because one sample contains many reverse-time forwards.  Use 768 first; lower to 512 only if a single replay step still OOM.
   max_length: 768
   min_target_tokens: 1
   drop_overlength: true
@@ -33,13 +31,11 @@ starts:
     data_dir: rl_qra_pipeline/data/S1K_RL
     output_dir: rl_qra_pipeline/modelparameter/rl_pretrain
     output_name: rl_pretrain
-
   QA:
     init_checkpoint: rl_qra_pipeline/modelparameter/QA/best.pth
     data_dir: rl_qra_pipeline/data/S1K_RL
     output_dir: rl_qra_pipeline/modelparameter/rl_QA
     output_name: rl_QA
-
   QRA:
     init_checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
     data_dir: rl_qra_pipeline/data/S1K_RL
@@ -47,7 +43,6 @@ starts:
     output_name: rl_QRA
 
 training:
-  # Conservative first run.  Prefer small updates and multiple rounds.
   steps: 300
   batch_size: 1
   lr: 5.0e-7
@@ -84,33 +79,32 @@ rrpi:
   max_debug_rows: 8
 
 rollout:
-  # Real generate-chain RL: answer all-mask -> repeated reverse actions.
-  # Memory-safe replay samples the chain with no_grad, then replays each action
-  # one-by-one with grad.  This prevents storing all rollout-step graphs.
+  # Sample-chain-aligned rollout: for each fixed t transition, every answer
+  # position is sampled from the SEDD transition distribution.  This matches
+  # generate_sample_chain.py and the SEDD tau-leaping sampler.
   memory_safe_replay: true
+  transition_mode: per_position
   steps: 32
   num_rollouts: 1
   mode: sample
 
-  # Reverse time schedule.  Early high t emphasizes position-type alignment;
-  # late low t emphasizes exact correction.
+  # Fixed reverse-time grid.  This yields 0.9500, 0.9206, ..., 0.0100 for 32 transitions.
   t_start: 0.95
   t_end: 0.01
-  step_size: 1.0e-5
+  schedule: linear
   transition_kind: analytic
 
-  # Joint action policy over (answer slot, token).  We restrict candidates to
-  # avoid full-vocab reward hacking, but still include model top-k.
-  action_topk: 16
-  max_candidates_per_position: 24
-  include_gt_candidates: true
-  include_current_candidate: true
-  allow_noop_action: true
-  sample_temperature: 1.20
-  eps: 1.0e-12
+  # In this aligned mode step_size is the real delta_t = t_k - t_{k+1}.
+  # This field is kept only as fallback for old code paths.
+  step_size: 1.0e-5
 
-  # Main knob for probability adjustment size.
-  # First round: 0.02.  Later ablate 0.05 only if chain alignment improves slowly.
+  # Rollout sampling controls.
+  sample_temperature: 1.00
+  eps: 1.0e-12
+  freeze_filled: false
+
+  # Probability-adjustment size.  Small values are intentional; prefer multiple
+  # RL rounds over one aggressive update.
   policy_loss_scale: 0.02
   advantage_clip: 0.25
   reward_clip: 1.00
@@ -121,11 +115,10 @@ rollout:
   entropy_weight: 0.0005
   sft_anchor_scale: 0.005
   anchor_late_power: 1.0
-  freeze_filled: false
 
   debug_every: 20
   debug_records_per_step: 1
-  max_debug_steps: 12
+  max_debug_steps: 32
 
 eval:
   split: test
@@ -133,8 +126,7 @@ eval:
     - S1K_RL
     - QRA
   compare_models:
-    QRA:
+    QRA_base:
       checkpoint: rl_qra_pipeline/modelparameter/QRA/best.pth
     rl_QRA:
       checkpoint: rl_qra_pipeline/modelparameter/rl_QRA/best.pth
-    pretrain:
