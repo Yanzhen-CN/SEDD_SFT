@@ -70,6 +70,19 @@ METRIC_FIELDS = [
     "eval_rollout_entropy",
     "eval_rollout_logprob",
     "eval_rollout_anchor_loss",
+    # Sparse full-validation metrics. These are populated on full_eval steps.
+    "full_eval_loss",
+    "full_eval_count",
+    "full_eval_rollout_loss",
+    "full_eval_rollout_reward",
+    "full_eval_rollout_reward_std",
+    "full_eval_rollout_entropy",
+    "full_eval_rollout_logprob",
+    "full_eval_rollout_anchor_loss",
+    "is_full_eval",
+    # Mini-eval and full-eval checkpoint selection markers.
+    "mini_best_metric_value",
+    "is_best_mini_eval",
     "best_metric_value",
     "is_best_eval",
 ]
@@ -86,11 +99,10 @@ def resolve_repo_path(value: str | Path) -> Path:
 
 
 def is_disabled_checkpoint(value: object) -> bool:
-    """Return True when the selected start should use the HF/pretrained weights directly.
+    """True means initialize directly from SEDD.from_pretrained(...).
 
     This is needed for --start pretrain: other pipelines usually do not have a
-    local pretrain.pth; they initialize from SEDD.from_pretrained(...), which uses
-    the Hugging Face cache/download path.
+    local pretrain.pth; they rely on the Hugging Face cache/download path.
     """
     if value is None:
         return True
@@ -378,6 +390,31 @@ def mean_dict(rows: List[Dict[str, float]]) -> Dict[str, float]:
     return out
 
 
+def add_eval_prefix(row: Dict[str, Any], prefix: str, eval_info: Dict[str, Any]) -> None:
+    """Copy evaluate_loss outputs into a metrics row with either eval_ or full_eval_ prefix."""
+    row[f"{prefix}_loss"] = float(eval_info.get("eval_loss", float("inf")))
+    row[f"{prefix}_count"] = int(eval_info.get("eval_count", 0))
+    row[f"{prefix}_rollout_loss"] = float(eval_info.get("rollout_loss", 0.0))
+    row[f"{prefix}_rollout_reward"] = float(eval_info.get("rollout_reward", 0.0))
+    row[f"{prefix}_rollout_reward_std"] = float(eval_info.get("rollout_reward_std", 0.0))
+    row[f"{prefix}_rollout_entropy"] = float(eval_info.get("rollout_entropy", 0.0))
+    row[f"{prefix}_rollout_logprob"] = float(eval_info.get("rollout_logprob", 0.0))
+    row[f"{prefix}_rollout_anchor_loss"] = float(eval_info.get("rollout_anchor_loss", 0.0))
+
+
+def metric_from_full_eval(eval_info: Dict[str, Any], name: str, mode: str) -> float:
+    """Read best metric from final/full eval info.
+
+    full_eval_loss is stored as eval_loss inside eval.json, so we map it here.
+    """
+    if name == "full_eval_loss":
+        return get_metric_value(eval_info, "full_eval_loss", get_metric_value(eval_info, "eval_loss", initial_best_value(mode)))
+    if name.startswith("full_eval_"):
+        fallback_key = name[len("full_eval_"):]
+        return get_metric_value(eval_info, name, get_metric_value(eval_info, fallback_key, initial_best_value(mode)))
+    return get_metric_value(eval_info, name, get_metric_value(eval_info, "eval_loss", initial_best_value(mode)))
+
+
 def metric_better(new_value: float, best_value: float, mode: str = "min") -> bool:
     """Return whether a validation metric improved.
 
@@ -467,9 +504,9 @@ def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict
     return out
 
 
-def load_eval_samples(cfg: Dict, tokenizer, train_samples: List[Dict]) -> Tuple[List[Dict], str]:
+def load_eval_samples(cfg: Dict, tokenizer, train_samples: List[Dict], requested_split: Optional[str] = None) -> Tuple[List[Dict], str]:
     data_cfg = cfg.get("data", {})
-    requested = data_cfg.get("eval_split", "val")
+    requested = requested_split if requested_split is not None else data_cfg.get("eval_split", "val")
     candidates = []
     if requested:
         candidates.append(str(requested))
@@ -526,7 +563,7 @@ def update_global_best(
             except Exception:
                 current_best = initial_best_value(best_mode)
 
-        new_metric = get_metric_value(eval_info, best_metric_name, get_metric_value(eval_info, "eval_loss", initial_best_value(best_mode)))
+        new_metric = metric_from_full_eval(eval_info, best_metric_name, best_mode)
         if metric_better(new_metric, current_best, best_mode):
             improved = True
             if best_ckpt.exists():
@@ -582,9 +619,11 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         raise RuntimeError("No training samples loaded.")
     sample_iter = cycle_samples(samples, seed)
 
-    # Load validation samples once.  Best checkpoints are selected by mean validation metrics,
-    # never by the single training sample loss from an update step.
-    eval_samples, eval_split = load_eval_samples(cfg, tokenizer, samples)
+    # Load validation samples once.  Mini eval uses a fixed cheap split
+    # (usually val-mini.jsonl); full eval uses the complete validation split.
+    data_cfg = cfg.get("data", {})
+    eval_samples, eval_split = load_eval_samples(cfg, tokenizer, samples, data_cfg.get("eval_split", "val-mini"))
+    full_eval_samples, full_eval_split = load_eval_samples(cfg, tokenizer, samples, data_cfg.get("full_eval_split", "val"))
 
     lr = float(cfg["training"].get("lr", 2e-6))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(cfg["training"].get("weight_decay", 0.0)))
@@ -599,7 +638,13 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         default=int(cfg.get("data", {}).get("eval_limit", 64) or 64),
     )
     eval_limit_for_logs = eval_limit_label(eval_limit)
-    best_metric_name = str(cfg["training"].get("best_metric", "eval_loss"))
+    full_eval_every = int(cfg["training"].get("full_eval_every", 0) or 0)
+    full_eval_limit = parse_eval_limit(
+        cfg["training"].get("full_eval_limit", "all"),
+        default=int(cfg.get("data", {}).get("full_eval_limit", cfg.get("data", {}).get("eval_limit", 64)) or 64),
+    )
+    full_eval_limit_for_logs = eval_limit_label(full_eval_limit)
+    best_metric_name = str(cfg["training"].get("best_metric", "full_eval_loss"))
     best_mode = str(cfg["training"].get("best_mode", "min")).lower()
     rrpi_cfg = cfg.get("rrpi", cfg.get("guided", {}))
     rollout_cfg = cfg.get("rollout", {})
@@ -623,6 +668,9 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "eval_split": eval_split,
         "eval_limit": eval_limit_for_logs,
         "eval_every": eval_every,
+        "full_eval_split": full_eval_split,
+        "full_eval_limit": full_eval_limit_for_logs,
+        "full_eval_every": full_eval_every,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
         "device": str(device),
@@ -640,12 +688,18 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     best_row: Dict[str, Any] = {}
     best_eval_info: Dict[str, Any] = {}
     best_path = out_dir / "best_run.pth"
+    best_mini_path = out_dir / "best_mini_run.pth"
     last_path = out_dir / "last_run.pth"
+    best_mini_metric_value = initial_best_value(best_mode)
+    best_mini_step = 0
 
     numeric_keys = [
         k for k in METRIC_FIELDS
-        if k not in {"step", "loss", "lr", "best_metric_value", "is_best_eval"}
-        and not k.startswith("eval_")
+        if k not in {
+            "step", "loss", "lr", "best_metric_value", "is_best_eval",
+            "mini_best_metric_value", "is_best_mini_eval", "is_full_eval",
+        }
+        and not k.startswith("eval_") and not k.startswith("full_eval_")
     ]
     last_debug_records: List[Dict[str, Any]] = []
     last_row: Dict[str, Any] = {}
@@ -705,12 +759,13 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         for k, v in agg.items():
             row[k] = v / max(1, valid)
 
-        # Periodic validation.  This is deliberately not the single-sample training loss.
-        # It is a mean over a fixed eval subset, so it is meaningful for best_run.pth and plots.
+        # Mini validation: fixed cheap subset, usually val-mini.jsonl.
+        # It is useful for dense curves and for a fallback best_mini checkpoint.
         eval_now = eval_every > 0 and (step % eval_every == 0 or step == steps)
         if eval_now:
             eval_info_step = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
             eval_info_step.update({
+                "eval_kind": "mini",
                 "eval_split": eval_split,
                 "eval_limit": eval_limit_for_logs,
                 "step": step,
@@ -718,24 +773,52 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                 "best_metric_name": best_metric_name,
                 "best_mode": best_mode,
             })
-            row["eval_loss"] = float(eval_info_step.get("eval_loss", float("inf")))
-            row["eval_count"] = int(eval_info_step.get("eval_count", 0))
-            row["eval_rollout_loss"] = float(eval_info_step.get("rollout_loss", 0.0))
-            row["eval_rollout_reward"] = float(eval_info_step.get("rollout_reward", 0.0))
-            row["eval_rollout_reward_std"] = float(eval_info_step.get("rollout_reward_std", 0.0))
-            row["eval_rollout_entropy"] = float(eval_info_step.get("rollout_entropy", 0.0))
-            row["eval_rollout_logprob"] = float(eval_info_step.get("rollout_logprob", 0.0))
-            row["eval_rollout_anchor_loss"] = float(eval_info_step.get("rollout_anchor_loss", 0.0))
-            metric_value = get_metric_value(eval_info_step, best_metric_name, get_metric_value(eval_info_step, "eval_loss", initial_best_value(best_mode)))
+            add_eval_prefix(row, "eval", eval_info_step)
+            mini_metric_value = get_metric_value(eval_info_step, "eval_loss", initial_best_value(best_mode))
+            row["mini_best_metric_value"] = mini_metric_value
+            improved_mini = metric_better(mini_metric_value, best_mini_metric_value, best_mode)
+            row["is_best_mini_eval"] = 1.0 if improved_mini else 0.0
+            append_jsonl(out_dir / "eval_history.jsonl", eval_info_step)
+            if improved_mini:
+                best_mini_metric_value = mini_metric_value
+                best_mini_step = step
+                save_checkpoint(
+                    best_mini_path,
+                    model,
+                    ema,
+                    optimizer,
+                    cfg,
+                    step,
+                    {"best_metric_name": "eval_loss", "best_mode": best_mode, "best_metric_value": mini_metric_value, **row},
+                )
+                dump_json(out_dir / "best_mini_eval.json", eval_info_step)
+
+        # Full validation: complete validation split. This is the official best_run criterion.
+        full_eval_now = full_eval_every > 0 and (step % full_eval_every == 0 or step == steps)
+        row["is_full_eval"] = 1.0 if full_eval_now else 0.0
+        if full_eval_now:
+            full_eval_info_step = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
+            full_eval_info_step.update({
+                "eval_kind": "full",
+                "eval_split": full_eval_split,
+                "eval_limit": full_eval_limit_for_logs,
+                "step": step,
+                "run_id": run_id,
+                "best_metric_name": best_metric_name,
+                "best_mode": best_mode,
+            })
+            full_eval_info_step["full_eval_loss"] = full_eval_info_step.get("eval_loss", float("inf"))
+            add_eval_prefix(row, "full_eval", full_eval_info_step)
+            metric_value = metric_from_full_eval(full_eval_info_step, best_metric_name, best_mode)
             row["best_metric_value"] = metric_value
             improved_eval = metric_better(metric_value, best_metric_value, best_mode)
             row["is_best_eval"] = 1.0 if improved_eval else 0.0
-            append_jsonl(out_dir / "eval_history.jsonl", eval_info_step)
+            append_jsonl(out_dir / "full_eval_history.jsonl", full_eval_info_step)
             if improved_eval:
                 best_metric_value = metric_value
                 best_step = step
                 best_row = dict(row)
-                best_eval_info = dict(eval_info_step)
+                best_eval_info = dict(full_eval_info_step)
                 save_checkpoint(
                     best_path,
                     model,
@@ -746,10 +829,14 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                     {"best_metric_name": best_metric_name, "best_mode": best_mode, "best_metric_value": metric_value, **row},
                 )
                 dump_json(out_dir / "best_eval.json", best_eval_info)
+
+        if eval_now or full_eval_now:
+            eval_msg = f"mini_loss={row.get('eval_loss', float('nan')):.6g}" if row.get("eval_loss", "") != "" else "mini_loss=na"
+            full_msg = f" full_loss={row.get('full_eval_loss', float('nan')):.6g}" if row.get("full_eval_loss", "") != "" else ""
             print(
-                f"[eval step={step}] {best_metric_name}={metric_value:.6g} mode={best_mode} "
-                f"eval_loss={row['eval_loss']:.6g} evalR={row.get('eval_rollout_reward', 0.0):+.3f} "
-                f"count={row.get('eval_count', 0)} best={'yes' if improved_eval else 'no'}",
+                f"[eval step={step}] {eval_msg}{full_msg} "
+                f"mini_count={row.get('eval_count', 0)} full_count={row.get('full_eval_count', 0)} "
+                f"best_metric={best_metric_name} best={row.get('is_best_eval', 0.0)} mini_best={row.get('is_best_mini_eval', 0.0)}",
                 flush=True,
             )
 
@@ -760,7 +847,9 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
             append_csv(metrics_path, row)
             eval_msg = ""
             if row.get("eval_loss", "") != "":
-                eval_msg = f" eval_loss={float(row.get('eval_loss')):.4f}"
+                eval_msg += f" eval_loss={float(row.get('eval_loss')):.4f}"
+            if row.get("full_eval_loss", "") != "":
+                eval_msg += f" full_eval_loss={float(row.get('full_eval_loss')):.4f}"
             print(
                 f"step={step} loss={row['loss']:.4f} "
                 f"target_logp={row.get('target_logp', 0.0):.4f} "
@@ -785,31 +874,25 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     if not last_path.exists():
         save_checkpoint(last_path, model, ema, optimizer, cfg, steps, last_row or {"loss": float("inf")})
 
-    # If periodic eval was disabled or never produced a valid best, select by one final validation pass.
+    # If sparse full eval was disabled or never produced a valid best, select by one final full-validation pass.
     if not best_path.exists():
-        final_eval_for_best = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
+        final_eval_for_best = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
         final_eval_for_best.update({
-            "eval_split": eval_split,
-            "eval_limit": eval_limit_for_logs,
+            "eval_kind": "full_final_fallback",
+            "eval_split": full_eval_split,
+            "eval_limit": full_eval_limit_for_logs,
             "step": steps,
             "run_id": run_id,
             "best_metric_name": best_metric_name,
             "best_mode": best_mode,
         })
-        best_metric_value = get_metric_value(
-            final_eval_for_best,
-            best_metric_name,
-            get_metric_value(final_eval_for_best, "eval_loss", initial_best_value(best_mode)),
-        )
+        final_eval_for_best["full_eval_loss"] = final_eval_for_best.get("eval_loss", float("inf"))
+        best_metric_value = metric_from_full_eval(final_eval_for_best, best_metric_name, best_mode)
         best_step = steps
         best_eval_info = dict(final_eval_for_best)
         best_row = dict(last_row or {})
-        best_row.update({
-            "eval_loss": final_eval_for_best.get("eval_loss"),
-            "eval_count": final_eval_for_best.get("eval_count"),
-            "best_metric_value": best_metric_value,
-            "is_best_eval": 1.0,
-        })
+        add_eval_prefix(best_row, "full_eval", final_eval_for_best)
+        best_row.update({"best_metric_value": best_metric_value, "is_best_eval": 1.0})
         save_checkpoint(
             best_path,
             model,
@@ -835,16 +918,60 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     except Exception as exc:
         print(f"[warn] failed to reload best checkpoint for final eval: {exc}", flush=True)
 
-    eval_info = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
+    eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
     eval_info.update({
-        "eval_split": eval_split,
-        "eval_limit": eval_limit_for_logs,
+        "eval_kind": "full_final_best_run",
+        "eval_split": full_eval_split,
+        "eval_limit": full_eval_limit_for_logs,
         "run_id": run_id,
         "best_step": best_step,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
-        "best_metric_value": best_metric_value,
+        "best_metric_value": metric_from_full_eval(eval_info, best_metric_name, best_mode),
     })
+    eval_info["full_eval_loss"] = eval_info.get("eval_loss", float("inf"))
+    best_metric_value = metric_from_full_eval(eval_info, best_metric_name, best_mode)
+
+    # Cheap safeguard against missing a good step between sparse full evals:
+    # also full-evaluate the best mini-eval checkpoint, then keep it if it wins.
+    if best_mini_path.exists():
+        try:
+            state = torch.load(best_mini_path, map_location=device)
+            model.load_state_dict(state.get("model", state), strict=True)
+            if isinstance(state, dict) and "ema" in state:
+                try:
+                    ema.load_state_dict(state["ema"])
+                    ema.store(model.parameters())
+                    ema.copy_to(model.parameters())
+                except Exception:
+                    pass
+            mini_full_eval = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
+            mini_full_eval.update({
+                "eval_kind": "full_final_best_mini_run",
+                "eval_split": full_eval_split,
+                "eval_limit": full_eval_limit_for_logs,
+                "run_id": run_id,
+                "best_step": best_mini_step,
+                "best_metric_name": best_metric_name,
+                "best_mode": best_mode,
+            })
+            mini_full_eval["full_eval_loss"] = mini_full_eval.get("eval_loss", float("inf"))
+            mini_metric = metric_from_full_eval(mini_full_eval, best_metric_name, best_mode)
+            mini_full_eval["best_metric_value"] = mini_metric
+            dump_json(out_dir / "best_mini_full_eval.json", mini_full_eval)
+            if metric_better(mini_metric, best_metric_value, best_mode):
+                shutil.copy2(best_mini_path, best_path)
+                best_metric_value = mini_metric
+                best_step = best_mini_step
+                eval_info = mini_full_eval
+                best_eval_info = dict(mini_full_eval)
+                dump_json(out_dir / "best_eval.json", best_eval_info)
+                print(f"[final rerank] best_mini_run won on full eval: {best_metric_name}={mini_metric:.6g}", flush=True)
+        except Exception as exc:
+            print(f"[warn] failed to full-evaluate best_mini_run: {exc}", flush=True)
+
+    eval_info["best_step"] = best_step
+    eval_info["best_metric_value"] = best_metric_value
     dump_json(out_dir / "eval.json", eval_info)
 
     metrics_json = {
@@ -856,8 +983,12 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "best_metric_value": best_metric_value,
         "last_train_loss": float(last_row.get("loss", float("inf"))) if last_row else float("inf"),
         "eval_loss": float(eval_info.get("eval_loss", float("inf"))),
-        "eval_split": eval_split,
+        "full_eval_loss": float(eval_info.get("full_eval_loss", eval_info.get("eval_loss", float("inf")))),
+        "eval_split": full_eval_split,
         "eval_count": int(eval_info.get("eval_count", 0)),
+        "mini_eval_split": eval_split,
+        "mini_eval_count": len(eval_samples),
+        "best_mini_step": best_mini_step,
         "last_row": last_row,
         "best_row": best_row,
         "best_eval_metrics": best_eval_info,
@@ -878,8 +1009,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     )
     print(f"Done. Outputs: {out_dir}", flush=True)
     print(
-        f"Run eval_loss={eval_info.get('eval_loss')} "
-        f"{best_metric_name}={eval_info.get(best_metric_name, best_metric_value)} "
+        f"Run full_eval_loss={eval_info.get('full_eval_loss', eval_info.get('eval_loss'))} "
+        f"{best_metric_name}={metric_from_full_eval(eval_info, best_metric_name, best_mode)} "
         f"best_step={best_step} improved_global_best={improved}",
         flush=True,
     )

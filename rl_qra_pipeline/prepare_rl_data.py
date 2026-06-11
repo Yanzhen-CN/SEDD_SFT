@@ -248,6 +248,11 @@ def balanced_brackets(text: str) -> bool:
     return not stack
 
 
+def is_interval_answer(text: str) -> bool:
+    compact = re.sub(r"\s+", "", clean(text))
+    return re.fullmatch(r"[\[\(]" + NUM_PATTERN + r"," + NUM_PATTERN + r"[\]\)]", compact) is not None
+
+
 def pure_symbol(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     if compact in PURE_SYMBOL_SET:
@@ -302,7 +307,7 @@ def validate_answer(raw_answer: str, max_chars: int = 160) -> Tuple[bool, str, s
         return False, "", "pure_symbol", "pure_symbol"
     if "$$" in ans or ans in {"$", "$$"}:
         return False, "", "math_delimiter", "math_delimiter_only"
-    if not balanced_brackets(ans):
+    if not balanced_brackets(ans) and not is_interval_answer(ans):
         return False, "", "unbalanced_brackets", "unbalanced_brackets"
     if len(ans) > max_chars:
         return False, "", "too_long", "too_long"
@@ -326,7 +331,149 @@ def validate_answer(raw_answer: str, max_chars: int = 160) -> Tuple[bool, str, s
     if re.fullmatch(r"\(?[A-Ea-e]\)?", ans):
         ans = ans.strip("()").upper()
 
+
     return True, ans, "kept", "kept"
+
+
+# ----------------------------- answer type / mini validation -----------------------------
+
+MINI_EVAL_TYPE_PRIORITY = [
+    "single_integer",
+    "decimal",
+    "unit_decimal",
+    "interval",
+    "inequality",
+    "equation",
+    "fraction",
+    "symbolic",
+    "boolean",
+    "short_text",
+    "other",
+]
+
+
+def infer_answer_type(answer: Any) -> str:
+    """Infer a compact answer type for stratified mini validation selection.
+
+    This is intentionally heuristic: it is used only to choose a small, fixed
+    val-mini subset with broad answer-form coverage. Full validation still
+    uses the complete val split.
+    """
+    ans = strip_answer_wrappers(clean(answer))
+    compact = re.sub(r"\s+", "", ans)
+    lower = compact.lower()
+    if not compact:
+        return "other"
+    if lower in {"true", "false", "yes", "no"}:
+        return "boolean"
+    if is_interval_answer(compact):
+        return "interval"
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:<=|>=|<|>)" + NUM_PATTERN, compact):
+        return "inequality"
+    if "=" in compact:
+        return "equation"
+    if re.fullmatch(r"[+-]?\d+/[1-9]\d*", compact):
+        return "fraction"
+    if re.fullmatch(r"[-+]?\d+", compact):
+        return "single_integer"
+    if re.fullmatch(r"[-+]?(?:\d+\.\d+|\.\d+)", compact):
+        return "decimal"
+    if re.fullmatch(rf"{NUM_PATTERN}{UNIT_PATTERN}", compact) or re.fullmatch(rf"{NUM_PATTERN}{UNIT_PATTERN.replace('\\\\', '\\\\')}", compact):
+        return "unit_decimal"
+    if re.search(r"\d", compact) and re.search(r"[A-Za-z]", compact):
+        # e.g. 3.2 m, 5kg, 2sqrt(3), x^2+4x+4
+        if re.search(UNIT_PATTERN, compact):
+            return "unit_decimal"
+        return "symbolic"
+    if any(x in compact for x in ["sqrt", "^", "pi", "*", "\\frac"]):
+        return "symbolic"
+    return "short_text"
+
+
+def sample_id(row: Dict[str, Any], fallback: int) -> str:
+    return clean(row.get("id") or row.get("sample_id") or f"row_{fallback:06d}")
+
+
+def select_val_mini(rows: List[Dict[str, Any]], size: int, seed: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Select a fixed, stratified mini-validation subset from val rows.
+
+    The output is deterministic for a given seed and is written as
+    val-mini.jsonl.  Training can then use val-mini for cheap
+    every-step eval while full validation still uses val.jsonl.
+    """
+    size = max(0, int(size))
+    if size <= 0 or not rows:
+        return [], {
+            "strategy": "disabled" if size <= 0 else "empty_val",
+            "requested_size": size,
+            "selected_size": 0,
+            "selected": [],
+            "type_counts": {},
+        }
+
+    rng = random.Random(seed)
+    buckets: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    type_counts: Dict[str, int] = {}
+    for idx, row in enumerate(rows):
+        t = clean(row.get("answer_type")) or infer_answer_type(row.get("answer", row.get("solution", "")))
+        row["answer_type"] = t
+        buckets.setdefault(t, []).append((idx, row))
+        type_counts[t] = type_counts.get(t, 0) + 1
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+
+    selected: List[Tuple[int, Dict[str, Any]]] = []
+    selected_ids: set[str] = set()
+
+    def add_candidate(pair: Tuple[int, Dict[str, Any]]) -> bool:
+        idx, row = pair
+        sid = sample_id(row, idx)
+        if sid in selected_ids:
+            return False
+        selected.append(pair)
+        selected_ids.add(sid)
+        return True
+
+    # First pass: choose at most one sample from each preferred type.
+    for t in MINI_EVAL_TYPE_PRIORITY:
+        if len(selected) >= size:
+            break
+        bucket = buckets.get(t, [])
+        if bucket:
+            add_candidate(bucket[0])
+
+    # Second pass: fill remaining slots from all rows, shuffled deterministically.
+    remaining: List[Tuple[int, Dict[str, Any]]] = []
+    for bucket in buckets.values():
+        remaining.extend(bucket)
+    rng.shuffle(remaining)
+    for pair in remaining:
+        if len(selected) >= size:
+            break
+        add_candidate(pair)
+
+    # Preserve val order in the written mini file for easier inspection.
+    selected = sorted(selected, key=lambda x: x[0])
+    mini_rows = [row for _, row in selected]
+    manifest_rows = []
+    for idx, row in selected:
+        manifest_rows.append({
+            "source_val_index": idx,
+            "id": sample_id(row, idx),
+            "answer_type": row.get("answer_type", infer_answer_type(row.get("answer", row.get("solution", "")))),
+            "answer": row.get("answer", row.get("solution", "")),
+            "source": row.get("source", ""),
+            "question_preview": clean(row.get("question"))[:160],
+        })
+    return mini_rows, {
+        "strategy": "stratified_answer_type",
+        "requested_size": size,
+        "selected_size": len(mini_rows),
+        "type_priority": MINI_EVAL_TYPE_PRIORITY,
+        "type_counts": type_counts,
+        "selected_type_counts": {r["answer_type"]: sum(1 for x in manifest_rows if x["answer_type"] == r["answer_type"]) for r in manifest_rows},
+        "selected": manifest_rows,
+    }
 
 
 # ----------------------------- output row construction -----------------------------
@@ -358,6 +505,7 @@ def make_filtered_qra(row: Dict[str, Any], split: str, idx: int, answer: str, me
     out["source"] = "filtered_qra"
     out["answer"] = answer
     out["solution"] = answer
+    out["answer_type"] = infer_answer_type(answer)
     out["question"] = q
     out["reasoning"] = r
     out["answer_filter_method"] = method
@@ -495,6 +643,7 @@ def make_synthetic_row(split: str, idx: int, q: str, r: str, ans: str, source: s
         "reasoning": r,
         "answer": ans,
         "solution": ans,
+        "answer_type": infer_answer_type(ans),
         "segment_order": QRA_SEGMENT_ORDER,
         "segments": make_segments(q, r, ans),
     }
@@ -630,24 +779,38 @@ def build_dataset(args: argparse.Namespace) -> Dict[str, Any]:
         stats["split_stats"][split]["written"] = len(output_splits[split])
 
     if output_dir.exists() and args.overwrite:
-        for name in ["train.jsonl", "val.jsonl", "valid.jsonl", "validation.jsonl", "test.jsonl", "build_report.json", "build_report_failed.json"]:
+        for name in [
+            "train.jsonl", "val.jsonl", "val.json", "valid.jsonl", "validation.jsonl",
+            "val-mini.jsonl", "validation-mini.jsonl", "val_mini_manifest.json", "validation_mini_manifest.json",
+            "test.jsonl", "build_report.json", "build_report_failed.json"
+        ]:
             path = output_dir / name
             if path.exists():
                 path.unlink()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    val_mini, mini_report = select_val_mini(
+        output_splits["val"],
+        size=int(args.mini_eval_size),
+        seed=int(args.seed) + 404,
+    )
+
     write_jsonl(output_dir / "train.jsonl", output_splits["train"])
     write_jsonl(output_dir / "val.jsonl", output_splits["val"])
-    write_jsonl(output_dir / "validation.jsonl", output_splits["val"])
+    # Do not write a duplicate validation.jsonl by default.  The full validation
+    # split is val.jsonl; the cheap fixed subset is val-mini.jsonl.
+    write_jsonl(output_dir / "val-mini.jsonl", val_mini)
     write_jsonl(output_dir / "test.jsonl", output_splits["test"])
+    write_json(output_dir / "val_mini_manifest.json", mini_report)
 
     final_counts = {split: len(rows) for split, rows in output_splits.items()}
     final_total = sum(final_counts.values())
     synth_total = sum(quotas.values())
     stats["final_split_counts"] = final_counts
+    stats["val_mini"] = mini_report
     stats["synthetic_total"] = synth_total
     stats["synthetic_fraction_final"] = round(synth_total / max(1, final_total), 4)
-    stats["note"] = "S1K_RL = filtered copy of QRA plus synthetic hard short-answer cases. Real QRA samples are not re-split."
+    stats["note"] = "S1K_RL = filtered copy of QRA plus synthetic hard short-answer cases. Real QRA samples are not re-split. Full validation is val.jsonl; fixed mini validation is val-mini.jsonl."
 
     write_json(output_dir / "build_report.json", stats)
     return stats
@@ -664,6 +827,8 @@ def main() -> None:
                         help="Target fraction of synthetic examples in the final dataset. Default 0.35.")
     parser.add_argument("--min-synthetic-eval", type=int, default=5,
                         help="Minimum synthetic examples in val and test. Train minimum is 8x this value.")
+    parser.add_argument("--mini-eval-size", type=int, default=8,
+                        help="Number of stratified validation examples written to val-mini.jsonl. Set 0 to disable.")
     parser.add_argument("--max-answer-chars", type=int, default=160)
     parser.add_argument("--max-drop-examples", type=int, default=30)
     parser.add_argument("--max-kept-examples", type=int, default=20)
@@ -680,6 +845,8 @@ def main() -> None:
         "real_counts_before_synthetic": report["real_counts_before_synthetic"],
         "synthetic_quotas": report["synthetic_quotas"],
         "final_split_counts": report["final_split_counts"],
+        "val_mini_count": report.get("val_mini", {}).get("selected_size", 0),
+        "val_mini_types": report.get("val_mini", {}).get("selected_type_counts", {}),
         "synthetic_fraction_final": report["synthetic_fraction_final"],
         "top_drop_reasons": sorted(report["drop_reasons"].items(), key=lambda x: x[1], reverse=True)[:10],
     }, ensure_ascii=False, indent=2))

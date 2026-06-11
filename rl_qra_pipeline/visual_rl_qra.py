@@ -29,6 +29,7 @@ ROLLOUT_METRICS = [
     "rollout_anchor_loss",
 ]
 EVAL_METRICS = [
+    # Dense mini-eval metrics.
     "eval_loss",
     "eval_rollout_loss",
     "eval_rollout_reward",
@@ -36,7 +37,19 @@ EVAL_METRICS = [
     "eval_rollout_entropy",
     "eval_rollout_logprob",
     "eval_rollout_anchor_loss",
+    "mini_best_metric_value",
+    "is_best_mini_eval",
+    # Sparse full-eval metrics.
+    "full_eval_loss",
+    "full_eval_rollout_loss",
+    "full_eval_rollout_reward",
+    "full_eval_rollout_reward_std",
+    "full_eval_rollout_entropy",
+    "full_eval_rollout_logprob",
+    "full_eval_rollout_anchor_loss",
+    "is_full_eval",
     "best_metric_value",
+    "is_best_eval",
 ]
 LEGACY_METRICS = [
     "target_logp",
@@ -140,7 +153,11 @@ def summarize_metrics(path: Path) -> Dict[str, object]:
         try:
             obj = json.loads(eval_json.read_text(encoding="utf-8"))
             if isinstance(obj, dict):
-                for key in ["eval_loss", "eval_count", "eval_split", "rollout_reward", "rollout_entropy", "best_metric_name", "best_metric_value"]:
+                for key in [
+                    "eval_loss", "full_eval_loss", "eval_count", "eval_split", "eval_limit",
+                    "rollout_reward", "rollout_entropy", "best_step",
+                    "best_metric_name", "best_metric_value",
+                ]:
                     if key in obj:
                         summary[key] = obj[key]
                 break
@@ -244,7 +261,7 @@ def visualize_metrics(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
         for metric in ROLLOUT_METRICS + EVAL_METRICS + LEGACY_METRICS:
             plot_metric(rows, metric, out_dir / "training" / run_name / f"{metric}.png", f"{run_name}: {metric}")
     def sort_key(row: Dict[str, object]):
-        for key in ("eval_loss", "last100_loss", "final_loss"):
+        for key in ("full_eval_loss", "eval_loss", "last100_full_eval_loss", "last100_eval_loss", "last100_loss", "final_loss"):
             val = to_float(row.get(key))
             if val is not None:
                 return val
