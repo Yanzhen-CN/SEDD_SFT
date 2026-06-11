@@ -93,8 +93,9 @@ def _single_token_ids(tokenizer, texts: Sequence[str]) -> List[int]:
 def _candidate_texts_for_type(gt_type: str, target_text: str, cfg: Dict[str, Any]) -> List[str]:
     """Small semantically meaningful candidate action set.
 
-    We include leading-space variants because GPT-2 BPE often encodes short
-    answers as tokens like ' 4' or ' A' depending on the Answer: anchor.
+    RRPI should not use full-vocab negatives as the main training signal.  For
+    short math answers, we enumerate type-aware symbols/units/operators and then
+    let model_topk add any currently high-probability alternatives.
     """
     texts: List[str] = []
     raw = target_text
@@ -106,24 +107,34 @@ def _candidate_texts_for_type(gt_type: str, target_text: str, cfg: Dict[str, Any
             texts.append(item)
             texts.append(" " + item)
 
+    math_ops = ["+", "-", "*", "/", "^", "=", "(", ")", "[", "]", ",", ".", "{", "}"]
+    variables = list("xyztrvmawkLFMAbc")
+    units = ["m", "mm", "cm", "kg", "g", "s", "ms", "N", "J", "W", "V", "A", "Hz", "m/s", "m/s^2"]
+    latex_atoms = [r"\frac", r"\sqrt", r"\pi", r"\omega", r"\sin", r"\cos"]
+
     if gt_type == "single_letter":
         add_variants(_LETTERS + [x.lower() for x in _LETTERS])
     elif gt_type == "single_integer":
         add_variants(_DIGITS + _NUMBER_SYMBOLS)
     elif gt_type == "signed_decimal":
         add_variants(_DIGITS + _NUMBER_SYMBOLS)
+    elif gt_type == "unit_decimal":
+        add_variants(_DIGITS + _NUMBER_SYMBOLS + units)
     elif gt_type == "interval":
         add_variants(_DIGITS + _NUMBER_SYMBOLS + _INTERVAL_SYMBOLS)
+    elif gt_type == "equation":
+        add_variants(_DIGITS + math_ops + variables + units + latex_atoms)
+    elif gt_type == "symbolic_expression":
+        add_variants(_DIGITS + math_ops + variables + units + latex_atoms)
     else:
-        # Short text: keep this conservative and let GT/current/model-topk carry it.
-        add_variants([stripped] if stripped else [])
+        # Short text: keep conservative, but still include basic math/unit chars
+        # because S1F_RL mainly contains compact answer forms.
+        add_variants(([stripped] if stripped else []) + _DIGITS + math_ops + units)
 
-    # Clean-output candidates help positions after the short answer learn to stop.
     if bool(cfg.get("include_clean_candidates", True)):
         texts.extend(_CLEAN_SYMBOLS)
         texts.extend(_BAD_CONTINUATIONS if bool(cfg.get("include_bad_continuations", False)) else [])
 
-    # Preserve the exact target token spelling.
     if raw:
         texts.insert(0, raw)
     if stripped and stripped != raw:
@@ -131,11 +142,10 @@ def _candidate_texts_for_type(gt_type: str, target_text: str, cfg: Dict[str, Any
     if has_leading_space and stripped:
         texts.insert(2, " " + stripped)
 
-    # Deduplicate in order.
     out: List[str] = []
     seen = set()
     for t in texts:
-        if t not in seen:
+        if t and t not in seen:
             out.append(t)
             seen.add(t)
     return out
@@ -342,6 +352,7 @@ def guided_ratio_loss(model, graph, noise, tokenizer, sample: Dict, cfg: Dict, d
     min_gap = float(rrpi_cfg.get("min_reward_gap", 0.0))
     sft_anchor_weight = float(rrpi_cfg.get("sft_anchor_weight", 0.05))
     transition_kind = str(rrpi_cfg.get("transition_kind", "analytic"))
+    transition_train = bool(rrpi_cfg.get("transition_train", True))
     site_weight = float(rrpi_cfg.get("rrpi_weight", 1.0))
     max_debug_candidates = int(rrpi_cfg.get("max_debug_candidates", 10))
 
@@ -358,7 +369,7 @@ def guided_ratio_loss(model, graph, noise, tokenizer, sample: Dict, cfg: Dict, d
     for st in states:
         x = st.x_state.to(device).unsqueeze(0)
         t = torch.tensor([[st.t]], dtype=torch.float32, device=device)
-        probs = transition_probs(model, graph, noise, x, t, st.step_size, transition_kind, train=True)
+        probs = transition_probs(model, graph, noise, x, t, st.step_size, transition_kind, train=transition_train)
         current_answer = normalize_answer(decode_positions(tokenizer, x[0].detach().cpu(), st.answer_positions))
 
         pos_to_answer_index = {p: i for i, p in enumerate(st.answer_positions)}

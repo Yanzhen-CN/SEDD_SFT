@@ -8,12 +8,8 @@ import json
 import os
 import random
 import shutil
+import time
 import sys
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Any
 
@@ -74,44 +70,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def choose_device(cfg: Dict, gpu_override: int | None = None) -> torch.device:
-    """Choose device from CLI first, then config, then default cuda.
-
-    Priority:
-      1) --gpu N from command line
-      2) run.cuda_device in yaml
-      3) top-level cuda_device / gpu in yaml
-      4) cuda if available, else cpu
-
-    Notes:
-      - If you run with CUDA_VISIBLE_DEVICES=2 and --gpu 0, cuda:0 means the
-        first visible GPU, i.e. physical GPU 2.
-      - Set cpu: true or run.cpu: true to force CPU.
-    """
-    run_cfg = cfg.get("run", {}) or {}
-    force_cpu = bool(cfg.get("cpu", False) or run_cfg.get("cpu", False))
-    if force_cpu:
-        return torch.device("cpu")
-
-    if not torch.cuda.is_available():
-        print("[warn] CUDA is not available; using CPU.", flush=True)
-        return torch.device("cpu")
-
-    gpu_value = gpu_override
-    if gpu_value is None:
-        gpu_value = run_cfg.get("cuda_device", cfg.get("cuda_device", cfg.get("gpu", None)))
-
-    if gpu_value is None:
-        return torch.device("cuda")
-
-    if isinstance(gpu_value, str):
-        if gpu_value.strip().lower() in {"", "none", "null", "auto", "cuda"}:
-            return torch.device("cuda")
-        gpu_value = int(gpu_value)
-
-    return torch.device(f"cuda:{int(gpu_value)}")
 
 
 def deep_update(base: Dict, updates: Dict) -> Dict:
@@ -263,234 +221,6 @@ def sync_checkpoint(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def safe_copy(src: Path, dst: Path) -> str:
-    """Copy src to dst if src exists, and return the copied path as string."""
-    if not src.exists():
-        return ""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    return str(dst)
-
-
-def append_run_index(index_path: Path, row: Dict[str, Any]) -> None:
-    """Append one finished run into a root-level index with a simple file lock.
-
-    Multiple training processes may finish at similar times. The fcntl lock avoids
-    interleaved writes on Linux servers. If fcntl is unavailable, it still appends
-    normally.
-    """
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "run_id",
-        "run_name",
-        "start",
-        "device",
-        "steps",
-        "best_loss",
-        "final_loss",
-        "last_target_prob",
-        "last_target_logp",
-        "last_model_reward",
-        "last_best_reward",
-        "last_reward_gap",
-        "run_dir",
-        "root_best_ckpt",
-        "root_last_ckpt",
-        "root_metrics",
-        "root_debug",
-        "root_run_info",
-        "global_best_updated",
-        "global_best_metric",
-        "global_best_metric_name",
-        "global_best_metric_mode",
-        "global_best_summary",
-        "finished_at",
-    ]
-    exists = index_path.exists()
-    with open(index_path, "a", encoding="utf-8", newline="") as f:
-        if fcntl is not None:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not exists:
-                writer.writeheader()
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
-            f.flush()
-            os.fsync(f.fileno())
-        finally:
-            if fcntl is not None:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-
-
-def _atomic_copy(src: Path, dst: Path) -> str:
-    """Copy through a temp file and replace atomically."""
-    if not src.exists():
-        return ""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + f".tmp.{os.getpid()}")
-    shutil.copy2(src, tmp)
-    os.replace(tmp, dst)
-    return str(dst)
-
-
-def _read_json_if_exists(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _metric_is_better(new_value: float, old_value: float | None, mode: str) -> bool:
-    if old_value is None:
-        return True
-    if mode.lower() in {"max", "higher", "higher_is_better"}:
-        return new_value > old_value
-    return new_value < old_value
-
-
-def _safe_float(value: Any, default: float = float("nan")) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
-
-
-def compute_selection_metric(best_loss: float, final_metrics: Dict[str, Any], cfg: Dict) -> Tuple[str, str, float]:
-    """Return (metric_name, mode, metric_value) for global-best comparison.
-
-    Default follows the SFT pipelines: lower best training loss wins.  For RRPI
-    you can override with, for example:
-
-      output:
-        best_metric: last_model_reward
-        best_metric_mode: max
-
-    Supported default names include best_loss, final_loss, and any metric key in
-    final_metrics such as model_reward, reward_gap, target_prob, etc.
-    """
-    output_cfg = cfg.get("output", {}) or {}
-    metric_name = str(output_cfg.get("best_metric", "best_loss"))
-    mode = str(output_cfg.get("best_metric_mode", "min"))
-
-    if metric_name == "best_loss":
-        value = float(best_loss)
-    elif metric_name == "final_loss":
-        value = _safe_float(final_metrics.get("loss"))
-    elif metric_name.startswith("last_"):
-        raw_name = metric_name[len("last_"):]
-        value = _safe_float(final_metrics.get(raw_name))
-    else:
-        value = _safe_float(final_metrics.get(metric_name))
-
-    if not np.isfinite(value):
-        # Fallback to loss so the global-best update never crashes just because
-        # a custom metric was absent from this run.
-        metric_name = "best_loss"
-        mode = "min"
-        value = float(best_loss)
-    return metric_name, mode, value
-
-
-def update_root_best_if_better(
-    *,
-    out_root: Path,
-    run_id: str,
-    run_name: str,
-    start_name: str,
-    run_dir: Path,
-    best_path: Path,
-    last_path: Path,
-    metrics_path: Path,
-    debug_path: Path,
-    run_info_path: Path,
-    best_loss: float,
-    final_metrics: Dict[str, Any],
-    cfg: Dict,
-) -> Dict[str, Any]:
-    """Atomically compare this finished run with the root best and promote if better.
-
-    This matches the usual SFT-pipeline behavior while remaining safe for
-    simultaneous runs: every process trains in its own directory; at the end it
-    grabs a root lock, compares its best metric with the current root best, and
-    only then updates root-level best.pth plus the matching metrics/debug/info.
-    """
-    out_root.mkdir(parents=True, exist_ok=True)
-    lock_path = out_root / ".global_best.lock"
-    summary_path = out_root / "best_summary.json"
-
-    metric_name, metric_mode, metric_value = compute_selection_metric(best_loss, final_metrics, cfg)
-    promoted = False
-    previous_value = None
-    previous_run = ""
-
-    with open(lock_path, "a+", encoding="utf-8") as lock_f:
-        if fcntl is not None:
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-        try:
-            old_summary = _read_json_if_exists(summary_path)
-            previous_run = str(old_summary.get("run_id", ""))
-            old_metric_name = str(old_summary.get("metric_name", metric_name))
-            old_metric_mode = str(old_summary.get("metric_mode", metric_mode))
-            # If user changes best_metric between runs, start a new comparison
-            # under the new metric rather than comparing incompatible numbers.
-            if old_metric_name == metric_name and old_metric_mode == metric_mode:
-                previous_value = old_summary.get("metric_value", None)
-                previous_value = None if previous_value is None else float(previous_value)
-            else:
-                previous_value = None
-
-            if _metric_is_better(metric_value, previous_value, metric_mode):
-                _atomic_copy(best_path, out_root / "best.pth")
-                _atomic_copy(last_path, out_root / "best_run_last.pth")
-                _atomic_copy(metrics_path, out_root / "best_metrics.csv")
-                _atomic_copy(debug_path, out_root / "best_rrpi_debug.jsonl")
-                _atomic_copy(run_info_path, out_root / "best_run_info.json")
-
-                best_summary = {
-                    "run_id": run_id,
-                    "run_name": run_name,
-                    "start": start_name,
-                    "run_dir": str(run_dir),
-                    "metric_name": metric_name,
-                    "metric_mode": metric_mode,
-                    "metric_value": metric_value,
-                    "best_loss": best_loss,
-                    "final_metrics": final_metrics,
-                    "best_ckpt": str(out_root / "best.pth"),
-                    "best_run_last_ckpt": str(out_root / "best_run_last.pth"),
-                    "best_metrics": str(out_root / "best_metrics.csv"),
-                    "best_debug": str(out_root / "best_rrpi_debug.jsonl"),
-                    "best_run_info": str(out_root / "best_run_info.json"),
-                    "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
-                }
-                tmp_summary = summary_path.with_suffix(".json.tmp")
-                tmp_summary.write_text(json.dumps(best_summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                os.replace(tmp_summary, summary_path)
-                promoted = True
-
-            # Also maintain last-finished artifacts as a separate namespace. This
-            # is useful for debugging, but it never decides the global best.
-            _atomic_copy(last_path, out_root / "last_finished.pth")
-            _atomic_copy(metrics_path, out_root / "last_finished_metrics.csv")
-            _atomic_copy(debug_path, out_root / "last_finished_rrpi_debug.jsonl")
-            _atomic_copy(run_info_path, out_root / "last_finished_run_info.json")
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-
-    return {
-        "promoted": promoted,
-        "metric_name": metric_name,
-        "metric_mode": metric_mode,
-        "metric_value": metric_value,
-        "previous_metric_value": previous_value,
-        "previous_run_id": previous_run,
-        "summary_path": str(summary_path),
-    }
-
 def print_debug_record(step: int, record: Dict[str, Any], max_rows: int = 8) -> None:
     print(f"\n[RRPI DEBUG step={step}]", flush=True)
     print(f"sample_id={record.get('sample_id', '')} type={record.get('answer_type', '')} state={record.get('state_kind', '')}", flush=True)
@@ -523,29 +253,180 @@ def print_debug_record(step: int, record: Dict[str, Any], max_rows: int = 8) -> 
     print("", flush=True)
 
 
-def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_override: int | None = None) -> Path:
+
+def choose_device(cfg: Dict, cli_gpu: int | None = None, cli_cpu: bool = False) -> torch.device:
+    if cli_cpu or bool(cfg.get("cpu", False)):
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    if cli_gpu is not None:
+        return torch.device(f"cuda:{int(cli_gpu)}")
+    cfg_gpu = cfg.get("run", {}).get("cuda_device", None)
+    if cfg_gpu is not None:
+        return torch.device(f"cuda:{int(cfg_gpu)}")
+    return torch.device("cuda")
+
+
+def acquire_lock(lock_path: Path, timeout_s: float = 300.0, poll_s: float = 0.25):
+    start = time.time()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"pid={os.getpid()} time={time.time()}\n".encode("utf-8"))
+            os.close(fd)
+            return
+        except FileExistsError:
+            if time.time() - start > timeout_s:
+                raise TimeoutError(f"Timeout waiting for lock: {lock_path}")
+            time.sleep(poll_s)
+
+
+def release_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def mean_dict(rows: List[Dict[str, float]]) -> Dict[str, float]:
+    if not rows:
+        return {}
+    keys = set().union(*(r.keys() for r in rows))
+    out: Dict[str, float] = {}
+    for k in keys:
+        vals = []
+        for r in rows:
+            try:
+                vals.append(float(r[k]))
+            except Exception:
+                pass
+        if vals:
+            out[k] = float(sum(vals) / len(vals))
+    return out
+
+
+def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict, device: torch.device, limit: int = 128) -> Dict[str, Any]:
+    eval_cfg = copy.deepcopy(cfg)
+    eval_cfg.setdefault("rrpi", {})
+    eval_cfg["rrpi"]["transition_train"] = False
+    eval_cfg["rrpi"]["debug_records_per_step"] = 0
+    eval_cfg["rrpi"]["debug_every"] = 0
+    if limit and limit > 0:
+        samples = samples[: min(limit, len(samples))]
+    model.eval()
+    losses: List[float] = []
+    stats_rows: List[Dict[str, float]] = []
+    with torch.no_grad():
+        for sample in samples:
+            try:
+                loss_i, stats_i = guided_ratio_loss(model, graph, noise, tokenizer, sample, eval_cfg, device)
+            except Exception:
+                continue
+            losses.append(float(loss_i.detach().item()))
+            stats_rows.append({k: float(v) for k, v in stats_i.items() if isinstance(v, (int, float))})
+    out = mean_dict(stats_rows)
+    out["eval_loss"] = float(sum(losses) / max(1, len(losses))) if losses else float("inf")
+    out["eval_count"] = int(len(losses))
+    return out
+
+
+def load_eval_samples(cfg: Dict, tokenizer, train_samples: List[Dict]) -> Tuple[List[Dict], str]:
+    data_cfg = cfg.get("data", {})
+    requested = data_cfg.get("eval_split", "val")
+    candidates = []
+    if requested:
+        candidates.append(str(requested))
+    candidates.extend(["val", "valid", "validation", "test"])
+    seen = set()
+    for split in candidates:
+        if split in seen:
+            continue
+        seen.add(split)
+        try:
+            samples = load_samples(cfg, split, tokenizer)
+            if samples:
+                return samples, split
+        except Exception:
+            pass
+    # Fallback keeps the script runnable, but this should be avoided for final reporting.
+    limit = int(data_cfg.get("eval_limit", 128) or 128)
+    return train_samples[: min(limit, len(train_samples))], "train_fallback"
+
+
+def update_global_best(
+    out_root: Path,
+    run_dir: Path,
+    best_ckpt: Path,
+    eval_info: Dict[str, Any],
+    metrics_json: Dict[str, Any],
+    run_info_path: Path,
+    metrics_path: Path,
+) -> bool:
+    """Root stays clean: only global-best files are kept at out_root.
+
+    The individual run keeps all artifacts under out_root/runs/<run_id>/.
+    At the end of a run, compare eval_loss against root best_metrics.json.
+    If better, atomically update the root best files.
+    """
+    out_root.mkdir(parents=True, exist_ok=True)
+    lock = out_root / ".global_best.lock"
+    acquire_lock(lock)
+    improved = False
+    try:
+        current_path = out_root / "best_metrics.json"
+        current_best = float("inf")
+        if current_path.exists():
+            try:
+                current = json.loads(current_path.read_text(encoding="utf-8"))
+                current_best = float(current.get("eval_loss", current.get("best_eval_loss", float("inf"))))
+            except Exception:
+                current_best = float("inf")
+
+        new_loss = float(eval_info.get("eval_loss", float("inf")))
+        if new_loss < current_best:
+            improved = True
+            if best_ckpt.exists():
+                shutil.copy2(best_ckpt, out_root / "best.pth")
+            shutil.copy2(metrics_path, out_root / "best_metrics.csv")
+            dump_json(out_root / "best_eval.json", eval_info)
+            dump_json(out_root / "best_metrics.json", metrics_json)
+            shutil.copy2(run_info_path, out_root / "best_run_info.json")
+
+            log_row = {
+                "time": dt.datetime.now().isoformat(timespec="seconds"),
+                "run_dir": str(run_dir),
+                "old_eval_loss": current_best,
+                "new_eval_loss": new_loss,
+                "improved": True,
+            }
+            append_jsonl(out_root / "improvement_log.jsonl", log_row)
+    finally:
+        release_lock(lock)
+    return improved
+
+
+def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", cli_gpu: int | None = None, cli_cpu: bool = False) -> Path:
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
-    device = choose_device(cfg, gpu_override=gpu_override)
+    device = choose_device(cfg, cli_gpu=cli_gpu, cli_cpu=cli_cpu)
 
     out_root = resolve_repo_path(cfg.get("output", {}).get("dir", f"rl_qra_pipeline/modelparameter/rl_{start_name}"))
     output_name = cfg.get("output", {}).get("name", f"rl_{start_name}")
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # Include pid to avoid collisions when multiple runs start in the same second.
-    run_id = f"{stamp}_{run_name}_pid{os.getpid()}"
-    out_dir = out_root / run_id
+    safe_run = str(run_name).replace("/", "_").replace(" ", "_")
+    run_id = f"{stamp}_{safe_run}_pid{os.getpid()}"
+    # Keep root clean. All per-run artifacts live under runs/<run_id>/.
+    out_dir = out_root / "runs" / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = GPT2TokenizerFast.from_pretrained(cfg["model"].get("tokenizer", "gpt2"))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    run_cfg = cfg.get("run", {}) or {}
-    cfg_gpu = run_cfg.get("cuda_device", cfg.get("cuda_device", cfg.get("gpu", None)))
     print(
-        f"[{start_name}] device={device} "
-        f"cli_gpu={gpu_override} cfg_gpu={cfg_gpu} "
-        f"cuda_visible_devices={__import__('os').environ.get('CUDA_VISIBLE_DEVICES', '')}",
+        f"[{start_name}] device={device} cli_gpu={cli_gpu} cfg_gpu={cfg.get('run', {}).get('cuda_device', None)} "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}",
         flush=True,
     )
     model, graph, noise, ema, loaded_from = load_policy(cfg, device)
@@ -566,38 +447,34 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
     debug_every = int(rrpi_cfg.get("debug_every", 20))
     max_debug_rows = int(rrpi_cfg.get("max_debug_rows", 8))
 
-    dump_json(
-        out_dir / "run_info.json",
-        {
-            "algorithm": "RRPI: Ratio-Reward Policy Improvement",
-            "run_id": run_id,
-            "run_name": run_name,
-            "start": start_name,
-            "output_name": output_name,
-            "output_root": str(out_root),
-            "loaded_from": loaded_from,
-            "num_samples": len(samples),
-            "data_split": split,
-            "device": str(device),
-            "pid": os.getpid(),
-            "config": cfg,
-        },
-    )
+    run_info = {
+        "algorithm": "RRPI: Ratio-Reward Policy Improvement",
+        "start": start_name,
+        "output_name": output_name,
+        "run_id": run_id,
+        "run_dir": str(out_dir),
+        "loaded_from": loaded_from,
+        "num_samples": len(samples),
+        "data_split": split,
+        "device": str(device),
+        "cli_gpu": cli_gpu,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "config": cfg,
+    }
+    run_info_path = out_dir / "run_info.json"
+    dump_json(run_info_path, run_info)
     metrics_path = out_dir / "metrics.csv"
     debug_path = out_dir / "rrpi_debug.jsonl"
-    run_info_path = out_dir / "run_info.json"
-
-    print(f"run_id={run_id}", flush=True)
-    print(f"run_dir={out_dir}", flush=True)
-    print(f"live_metrics={metrics_path}", flush=True)
-    print("[parallel-safe] This run writes checkpoints only inside its own run_dir during training.", flush=True)
 
     best_loss = float("inf")
+    best_step = 0
+    best_row: Dict[str, Any] = {}
     best_path = out_dir / "best_RL_QRA_rrpi.pth"
     last_path = out_dir / "last_RL_QRA_rrpi.pth"
 
     numeric_keys = [k for k in METRIC_FIELDS if k not in {"step", "loss", "lr"}]
     last_debug_records: List[Dict[str, Any]] = []
+    last_row: Dict[str, Any] = {}
 
     for step in range(1, steps + 1):
         model.train(True)
@@ -635,6 +512,7 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
         row = {"step": step, "loss": float(loss.detach().item()), "lr": lr}
         for k, v in agg.items():
             row[k] = v / max(1, valid)
+        last_row = row
         last_debug_records = debug_records or last_debug_records
 
         if step % log_every == 0:
@@ -658,117 +536,70 @@ def train(cfg: Dict, run_name: str = "rrpi", start_name: str = "QRA", gpu_overri
 
         if row["loss"] < best_loss:
             best_loss = row["loss"]
+            best_step = step
+            best_row = dict(row)
             save_checkpoint(best_path, model, ema, optimizer, cfg, step, row)
         if save_every > 0 and step % save_every == 0:
             save_checkpoint(last_path, model, ema, optimizer, cfg, step, row)
 
-    final_metrics = row if "row" in locals() else {"loss": best_loss}
-    save_checkpoint(last_path, model, ema, optimizer, cfg, steps, final_metrics)
+    if not last_path.exists():
+        save_checkpoint(last_path, model, ema, optimizer, cfg, steps, last_row or {"loss": best_loss})
+    if not best_path.exists():
+        save_checkpoint(best_path, model, ema, optimizer, cfg, best_step or steps, best_row or last_row or {"loss": best_loss})
 
-    # Root-level export and global-best promotion.
-    # Each run still keeps its full private run_dir.  In addition, it exports
-    # run-specific artifacts to the root for easy plotting, then atomically
-    # compares against the current root best.  Only a better run updates
-    # root-level best.pth / best_metrics.csv / best_rrpi_debug.jsonl / best_run_info.json.
-    root_best = out_root / f"{run_id}_best.pth"
-    root_last = out_root / f"{run_id}_last.pth"
-    root_metrics = out_root / f"{run_id}_metrics.csv"
-    root_debug = out_root / f"{run_id}_rrpi_debug.jsonl"
-    root_info = out_root / f"{run_id}_run_info.json"
+    # Evaluate the run's own best training checkpoint, then compete for root global best.
+    try:
+        state = torch.load(best_path, map_location=device)
+        model.load_state_dict(state.get("model", state), strict=True)
+        if isinstance(state, dict) and "ema" in state:
+            try:
+                ema.load_state_dict(state["ema"])
+                ema.store(model.parameters())
+                ema.copy_to(model.parameters())
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[warn] failed to reload best checkpoint for eval: {exc}", flush=True)
 
-    root_best_s = safe_copy(best_path, root_best)
-    root_last_s = safe_copy(last_path, root_last)
-    root_metrics_s = safe_copy(metrics_path, root_metrics)
-    root_debug_s = safe_copy(debug_path, root_debug)
-    root_info_s = safe_copy(run_info_path, root_info)
+    eval_samples, eval_split = load_eval_samples(cfg, tokenizer, samples)
+    eval_limit = int(cfg.get("data", {}).get("eval_limit", 128) or 128)
+    eval_info = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
+    eval_info.update({"eval_split": eval_split, "eval_limit": eval_limit, "run_id": run_id, "best_train_step": best_step, "best_train_loss": best_loss})
+    dump_json(out_dir / "eval.json", eval_info)
 
-    best_update = update_root_best_if_better(
-        out_root=out_root,
-        run_id=run_id,
-        run_name=run_name,
-        start_name=start_name,
-        run_dir=out_dir,
-        best_path=best_path,
-        last_path=last_path,
-        metrics_path=metrics_path,
-        debug_path=debug_path,
-        run_info_path=run_info_path,
-        best_loss=best_loss,
-        final_metrics=final_metrics,
-        cfg=cfg,
-    )
+    metrics_json = {
+        "run_id": run_id,
+        "run_dir": str(out_dir),
+        "best_train_step": best_step,
+        "best_train_loss": best_loss,
+        "last_train_loss": float(last_row.get("loss", float("inf"))) if last_row else float("inf"),
+        "eval_loss": float(eval_info.get("eval_loss", float("inf"))),
+        "eval_split": eval_split,
+        "eval_count": int(eval_info.get("eval_count", 0)),
+        "last_row": last_row,
+        "best_row": best_row,
+        "eval_metrics": eval_info,
+    }
+    dump_json(out_dir / "metrics.json", metrics_json)
 
-    append_run_index(
-        out_root / "runs_index.csv",
-        {
-            "run_id": run_id,
-            "run_name": run_name,
-            "start": start_name,
-            "device": str(device),
-            "steps": steps,
-            "best_loss": best_loss,
-            "final_loss": final_metrics.get("loss", ""),
-            "last_target_prob": final_metrics.get("target_prob", ""),
-            "last_target_logp": final_metrics.get("target_logp", ""),
-            "last_model_reward": final_metrics.get("model_reward", ""),
-            "last_best_reward": final_metrics.get("best_reward", ""),
-            "last_reward_gap": final_metrics.get("reward_gap", ""),
-            "run_dir": str(out_dir),
-            "root_best_ckpt": root_best_s,
-            "root_last_ckpt": root_last_s,
-            "root_metrics": root_metrics_s,
-            "root_debug": root_debug_s,
-            "root_run_info": root_info_s,
-            "global_best_updated": str(bool(best_update.get("promoted"))),
-            "global_best_metric": best_update.get("metric_value", ""),
-            "global_best_metric_name": best_update.get("metric_name", ""),
-            "global_best_metric_mode": best_update.get("metric_mode", ""),
-            "global_best_summary": best_update.get("summary_path", ""),
-            "finished_at": dt.datetime.now().isoformat(timespec="seconds"),
-        },
-    )
-
+    improved = update_global_best(out_root, out_dir, best_path, eval_info, metrics_json, run_info_path, metrics_path)
     print(f"Done. Outputs: {out_dir}", flush=True)
-    print(f"Exported run artifacts with prefix: {out_root / run_id}", flush=True)
-    print(f"Run index: {out_root / 'runs_index.csv'}", flush=True)
-    if best_update.get("promoted"):
-        print(
-            f"[GLOBAL BEST UPDATED] {run_id} -> {out_root / 'best.pth'} "
-            f"({best_update.get('metric_name')}={float(best_update.get('metric_value')):.6g}, "
-            f"mode={best_update.get('metric_mode')})",
-            flush=True,
-        )
-        print(f"Best metrics: {out_root / 'best_metrics.csv'}", flush=True)
-        print(f"Best summary: {out_root / 'best_summary.json'}", flush=True)
-    else:
-        print(
-            f"[GLOBAL BEST KEPT] current root best is better. "
-            f"this_run {best_update.get('metric_name')}={float(best_update.get('metric_value')):.6g}; "
-            f"previous={best_update.get('previous_metric_value')} run={best_update.get('previous_run_id')}",
-            flush=True,
-        )
+    print(f"Run eval_loss={eval_info.get('eval_loss')} improved_global_best={improved}", flush=True)
+    if improved:
+        print(f"Updated root global best files under: {out_root}", flush=True)
     return out_dir
-
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
     parser.add_argument("--run-name", type=str, default="rrpi")
     parser.add_argument("--start", type=str, default=None, help="Start key under config.starts, e.g. pretrain, QA, QRA")
-    parser.add_argument("--gpu", type=int, default=None, help="CUDA device index, e.g. --gpu 0. Overrides config run.cuda_device.")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU. Overrides --gpu and config cuda_device.")
+    parser.add_argument("--gpu", type=int, default=None, help="Use cuda:<gpu>. Overrides run.cuda_device in config.")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU.")
     args = parser.parse_args()
-
     raw_cfg = load_config(args.config)
     cfg, start_name = select_start_config(raw_cfg, args.start)
-
-    if args.cpu:
-        cfg["cpu"] = True
-        cfg.setdefault("run", {})["cpu"] = True
-    if args.gpu is not None:
-        cfg.setdefault("run", {})["cuda_device"] = int(args.gpu)
-
-    train(cfg, args.run_name, start_name=start_name, gpu_override=args.gpu)
+    train(cfg, args.run_name, start_name=start_name, cli_gpu=args.gpu, cli_cpu=args.cpu)
 
 
 if __name__ == "__main__":
