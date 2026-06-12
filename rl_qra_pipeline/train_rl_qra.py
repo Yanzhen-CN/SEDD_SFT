@@ -217,7 +217,7 @@ def infer_answer_kind(sample: Dict[str, Any]) -> str:
         return "letter"
     if re.fullmatch(r"[\(\[][+-]?\d+(?:\.\d+)?,[+-]?\d+(?:\.\d+)?[\)\]]", compact):
         return "interval"
-    if re.search(r"(?:<=|>=|<|>|\leq|\geq)", compact):
+    if re.search(r"(?:<=|>=|<|>|\\leq|\\geq)", compact):
         return "inequality"
     if "=" in compact:
         return "equation"
