@@ -8,7 +8,7 @@ Default comparison models are exactly six:
 
 For each start family we compare: starting model, RL loss-best checkpoint,
 and RL reward-best checkpoint.  The reward-best checkpoint is best_reward.pth;
-if it is missing, the script falls back to the newest per-run last.pth and
+if it is missing, the script falls back to the newest per-run last_run.pth and
 records that fallback in model_plan.json/run.log.
 
 Default output:
@@ -83,7 +83,7 @@ def repo_path(path: str | Path) -> Path:
 
 def dump_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
 def set_seed(seed: int) -> None:
@@ -169,7 +169,7 @@ def start_output_dir(cfg: Dict[str, Any], start_name: str) -> Path:
     return repo_path(start_cfg.get("output_dir", f"rl_qra_pipeline/modelparameter/rl_{start_name}"))
 
 
-def latest_run_checkpoint(run_root: Path, filename: str = "last.pth") -> Optional[Path]:
+def latest_run_checkpoint(run_root: Path, filename: str = "last_run.pth") -> Optional[Path]:
     """Return the newest per-run checkpoint under rl_<start>/<run_id>/filename.
 
     Root best.pth is intentionally not considered here.  This is for comparing
@@ -185,12 +185,6 @@ def latest_run_checkpoint(run_root: Path, filename: str = "last.pth") -> Optiona
         ckpt = p / filename
         if ckpt.exists():
             candidates.append(ckpt)
-            continue
-        # Backward compatibility for older run directories. New runs write last.pth.
-        if filename == "last.pth":
-            legacy = p / "last_run.pth"
-            if legacy.exists():
-                candidates.append(legacy)
     if not candidates:
         return None
     return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
@@ -211,7 +205,7 @@ def model_pretrained_name(cfg: Dict[str, Any], start_name: str = "pretrain") -> 
 
 
 def reward_checkpoint_or_fallback(root: Path) -> Tuple[Optional[Path], str, Optional[str]]:
-    """Return root best_reward.pth, or newest run last.pth as fallback.
+    """Return root best_reward.pth, or newest run last_run.pth as fallback.
 
     The fallback is only for old runs before reward-best recovery existed.
     A warning string is returned so model_plan.json/run.log makes this explicit.
@@ -219,10 +213,10 @@ def reward_checkpoint_or_fallback(root: Path) -> Tuple[Optional[Path], str, Opti
     ckpt = root / "best_reward.pth"
     if ckpt.exists():
         return ckpt, "rl_root_best_reward", None
-    fallback = latest_run_checkpoint(root, "last.pth")
+    fallback = latest_run_checkpoint(root, "last_run.pth")
     if fallback is not None:
-        return fallback, "latest_run_last_fallback_missing_best_reward", f"missing {ckpt}; fallback to newest run {fallback.name}"
-    return None, "missing", f"missing {ckpt} and no */last.pth under {root}"
+        return fallback, "latest_run_last_fallback_missing_best_reward", f"missing {ckpt}; fallback to newest run last_run.pth"
+    return None, "missing", f"missing {ckpt} and no */last_run.pth under {root}"
 
 
 def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
