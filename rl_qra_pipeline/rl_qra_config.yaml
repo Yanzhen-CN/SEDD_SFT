@@ -59,7 +59,7 @@ training:
   # Split samples_per_update into smaller groups for memory/control flow.
   # With rollout.memory_safe_replay=true, gradients are normalized by samples_per_update
   # so changing 1 -> 8/16/32 does not implicitly multiply the learning rate.
-  micro_batch_size: 1
+  micro_batch_size: 8
   lr: 2.0e-7
   weight_decay: 0.0
   grad_clip: 0.5
