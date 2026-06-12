@@ -465,7 +465,7 @@ def visualize_test_results(test_result_dir: Path, out_dir: Path) -> Dict[str, ob
         return summary
     plot_test_bar(rows, "test_loss", out_dir / "test_loss_compare.png", "Test set loss comparison", "test loss", higher_better=False)
     plot_test_bar(rows, "test_rollout_reward", out_dir / "test_reward_compare.png", "Test set rollout reward comparison", "test rollout reward", higher_better=True)
-    plot_test_loss_reward_pair(rows, out_dir / "test_loss_reward_compare.png")
+    plot_test_loss_reward_pair(rows, out_dir / "test_all_compare.png")
     write_summary([{k: v for k, v in r.items()} for r in rows], out_dir / "test_summary.csv")
     (out_dir / "test_summary.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     # compact winners
