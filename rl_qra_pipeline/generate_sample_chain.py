@@ -69,32 +69,31 @@ DEFAULT_MODELS = [
 ]
 
 # Fixed diagnostic samples requested for chain comparison.
-# These ids are looked up from S1K_RL/<split>.jsonl and kept in this exact order:
-# first the original/QRA examples, then the harder synthetic S1K_RL examples.
-FIXED_SAMPLE_SPECS = {
-    "QRA": [
-        {"id": "s1k_157", "answer": "(3,4]", "kind": "interval"},
-        {"id": "s1k_26", "answer": "90.39", "kind": "decimal"},
-        {"id": "s1k_499", "answer": "2.5", "kind": "decimal"},
-        {"id": "s1k_50", "answer": "112", "kind": "integer"},
-        {"id": "s1k_66", "answer": "182", "kind": "integer"},
-        {"id": "s1k_195", "answer": "A", "kind": "letter"},
-        {"id": "s1k_330", "answer": "B", "kind": "letter"},
-        {"id": "s1k_256", "answer": r"\( \boxed{ x_{100} > 0.99 } \)", "kind": "short_text"},
-    ],
-    "S1K_RL": [
-        {"id": "s1f_rl_synthetic_interval_test_000011", "answer": "(-9,-7)", "kind": "interval"},
-        {"id": "s1f_rl_synthetic_interval_test_000018", "answer": "(1,10)", "kind": "interval"},
-        {"id": "s1f_rl_synthetic_equation_test_000014", "answer": "x=2", "kind": "equation"},
-        {"id": "s1f_rl_synthetic_equation_test_000019", "answer": "y=2x+1", "kind": "equation"},
-        {"id": "s1f_rl_synthetic_unit_decimal_test_000028", "answer": "7.45 W", "kind": "unit_decimal"},
-        {"id": "s1f_rl_synthetic_unit_decimal_test_000001", "answer": "4.12 J", "kind": "unit_decimal"},
-        {"id": "s1f_rl_synthetic_inequality_test_000002", "answer": "y<-7", "kind": "symbolic"},
-        {"id": "s1f_rl_synthetic_inequality_test_000025", "answer": "x<-4", "kind": "symbolic"},
-    ],
-}
-FIXED_SAMPLE_GROUP_ORDER = ("QRA", "S1K_RL")
-FIXED_SAMPLE_IDS = [item["id"] for group in FIXED_SAMPLE_GROUP_ORDER for item in FIXED_SAMPLE_SPECS[group]]
+#
+# The main chain demo should stay small and readable: exactly eight samples,
+# ordered from easier structured answers to harder symbolic/inequality answers.
+# These ids are looked up from S1K_RL/<split>.jsonl and kept in this exact order.
+FIXED_SAMPLE_SPECS = [
+    {"group": "S1K_RL", "id": "s1f_rl_synthetic_interval_test_000011", "answer": "(-9,-7)", "kind": "interval"},
+    {"group": "QRA", "id": "s1k_26", "answer": "90.39", "kind": "decimal"},
+    {"group": "QRA", "id": "s1k_50", "answer": "112", "kind": "integer"},
+    {"group": "QRA", "id": "s1k_195", "answer": "A", "kind": "letter"},
+    {"group": "S1K_RL", "id": "s1f_rl_synthetic_symbolic_test_000017", "answer": "4/8", "kind": "symbolic"},
+    {"group": "S1K_RL", "id": "s1f_rl_synthetic_unit_decimal_test_000028", "answer": "7.45 W", "kind": "unit_decimal"},
+    {"group": "S1K_RL", "id": "s1f_rl_synthetic_equation_test_000019", "answer": "y=2x+1", "kind": "equation"},
+    {"group": "S1K_RL", "id": "s1f_rl_synthetic_inequality_test_000002", "answer": "y<-7", "kind": "inequality"},
+]
+FIXED_SAMPLE_ORDER_DESCRIPTION = [
+    "interval",
+    "decimal",
+    "integer",
+    "letter",
+    "symbolic",
+    "unit_decimal",
+    "equation",
+    "inequality",
+]
+FIXED_SAMPLE_IDS = [item["id"] for item in FIXED_SAMPLE_SPECS]
 
 MODEL_DISPLAY_NAMES = {
     "pretrain_start": "pretrain",
@@ -649,7 +648,7 @@ def pick_balanced_origin_synthetic_samples(
 
 
 def pick_fixed_reference_samples(samples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Pick the fixed 16 diagnostic samples in the user-specified order."""
+    """Pick the fixed eight diagnostic samples in the user-specified difficulty order."""
     by_id = {str(s.get("id", "")): s for s in samples}
     chosen: List[Dict[str, Any]] = []
     missing: List[str] = []
@@ -1122,12 +1121,12 @@ def main() -> None:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--start", default="QRA", help="Start key only used to choose data_dir; default QRA/S1K_RL.")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--num-samples", type=int, default=0, help="If >0, use old total diverse sampling. Default 0 means use --num-origin-samples + --num-synthetic-samples.")
+    parser.add_argument("--num-samples", type=int, default=0, help="If >0, use old total diverse sampling. Default 0 means use the fixed eight reference samples.")
     parser.add_argument("--num-origin-samples", type=int, default=8, help="Default diagnostic origin/real sample count.")
     parser.add_argument("--num-synthetic-samples", type=int, default=8, help="Default diagnostic synthetic sample count.")
     parser.add_argument("--samples-per-type", type=int, default=2)
     parser.add_argument("--no-fixed-reference-samples", action="store_true",
-                        help="Disable the fixed 16 reference samples and use the old diverse/balanced sampler.")
+                        help="Disable the fixed eight reference samples and use the old diverse/balanced sampler.")
     parser.add_argument("--sample-id", action="append", default=[], help="Specific sample id. Can be repeated.")
     parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six: pretrain_start,pretrain_loss_best,pretrain_reward_best,QRA_start,QRA_loss_best,QRA_reward_best")
     parser.add_argument("--checkpoint", default=None, help="Trace one specific checkpoint only.")
@@ -1164,7 +1163,7 @@ def main() -> None:
         sample_selection_mode = "manual_sample_id"
     elif not bool(args.no_fixed_reference_samples) and int(args.num_samples) <= 0:
         chosen, missing_fixed = pick_fixed_reference_samples(samples)
-        sample_selection_mode = "fixed_reference_16"
+        sample_selection_mode = "fixed_reference_8_ordered_by_kind"
     else:
         chosen = pick_balanced_origin_synthetic_samples(
             samples, args.sample_id, int(args.num_samples), int(args.num_origin_samples),
@@ -1199,7 +1198,7 @@ def main() -> None:
         dump_json(out_dir / "model_plan.json", model_specs)
         dump_json(out_dir / "sample_plan.json", {
             "selection": sample_selection_mode,
-            "fixed_sample_group_order": list(FIXED_SAMPLE_GROUP_ORDER),
+            "fixed_sample_order_description": FIXED_SAMPLE_ORDER_DESCRIPTION,
             "fixed_samples": FIXED_SAMPLE_SPECS,
             "selected_ids": [str(s.get("id", "")) for s in chosen],
             "missing_fixed_ids": missing_fixed,
