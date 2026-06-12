@@ -2,14 +2,17 @@ from __future__ import annotations
 
 """Compact visualizer for RL-QRA.
 
-It produces two kinds of plots:
+Outputs:
 1. Training curves from modelparameter/rl_<start>/<run_id>/metrics.csv
-   - one loss plot and one reward plot per run/global best
+   - per-group loss curves
+   - per-group reward curves
+   - per-group combined loss/reward overlay with twin y-axes
 2. Test comparison plots from modelparameter/test_result/test_rl_qra.csv
-   - one bar chart for test loss and one bar chart for test rollout reward
+   - test loss bar chart with pretrain/QRA start baselines
+   - test reward bar chart with pretrain/QRA start baselines
 
-The goal is to match the answer-pipeline style: a small set of directly useful
-figures rather than one figure per metric.
+The combined plots are meant to make the reward/loss tradeoff visible while
+keeping the original separate figures for easier reading.
 """
 
 import argparse
@@ -37,11 +40,15 @@ SUMMARY_KEYS = LOSS_SERIES + REWARD_SERIES + [
     "best_metric_value", "is_best_eval", "is_best_reward_eval",
 ]
 
+PRETRAIN_BASELINE_NAMES = {"pretrain", "pretrain_start", "start_pretrain"}
+QRA_BASELINE_NAMES = {"qra", "qra_start", "start_qra", "QRA"}
+
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    # utf-8-sig handles files written for Excel compatibility.
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
 
 
@@ -56,6 +63,17 @@ def to_float(value: object) -> Optional[float]:
 
 def safe_name(text: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in str(text))[:160] or "run"
+
+
+def model_family(model_name: str) -> str:
+    s = str(model_name or "").lower()
+    if "qra" in s:
+        return "QRA"
+    if "pretrain" in s:
+        return "pretrain"
+    if "qa" in s:
+        return "QA"
+    return "other"
 
 
 def collect_metric_files(run_root: Path) -> List[Tuple[str, Path]]:
@@ -81,33 +99,114 @@ def collect_metric_files(run_root: Path) -> List[Tuple[str, Path]]:
     return out
 
 
-def plot_series(rows: List[Dict[str, str]], series_names: List[str], out_path: Path, title: str, ylabel: str) -> bool:
-    plotted = False
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(9, 5))
-    for metric in series_names:
-        xs: List[float] = []
-        ys: List[float] = []
+def choose_metric_series(rows: List[Dict[str, str]], preferred: Sequence[str]) -> Tuple[str, List[Tuple[float, float]]]:
+    """Return the first available metric series from a preference list."""
+    for metric in preferred:
+        pts: List[Tuple[float, float]] = []
         for i, row in enumerate(rows):
             y = to_float(row.get(metric))
             if y is None:
                 continue
             x = to_float(row.get("step"))
-            xs.append(float(i if x is None else x))
-            ys.append(y)
-        if ys:
-            plt.plot(xs, ys, linewidth=1.2, label=metric)
-            plotted = True
+            pts.append((float(i if x is None else x), y))
+        if pts:
+            return metric, pts
+    return "", []
+
+
+def plot_group_overlay(
+    metric_files: List[Tuple[str, Path]],
+    preferred: Sequence[str],
+    out_path: Path,
+    title: str,
+    ylabel: str,
+) -> bool:
+    """One compact curve plot per RL group for one metric family."""
+    plotted = False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(9, 5))
+    for run_name, path in metric_files:
+        rows = read_csv(path)
+        metric, pts = choose_metric_series(rows, preferred)
+        if not pts:
+            continue
+        pts = sorted(pts, key=lambda x: x[0])
+        label = run_name if metric == preferred[0] else f"{run_name} ({metric})"
+        plt.plot([x for x, _ in pts], [y for _, y in pts], linewidth=1.2, label=label)
+        plotted = True
     if not plotted:
         plt.close()
         return False
     plt.xlabel("step")
     plt.ylabel(ylabel)
     plt.title(title)
-    plt.legend(fontsize=8)
+    plt.legend(fontsize=7)
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
     plt.close()
+    return True
+
+
+def plot_group_loss_reward_overlay(
+    metric_files: List[Tuple[str, Path]],
+    loss_preferred: Sequence[str],
+    reward_preferred: Sequence[str],
+    out_path: Path,
+    title: str,
+) -> bool:
+    """Plot loss and reward in one figure with twin y-axes.
+
+    Loss is plotted on the left axis, reward on the right axis.  This is the
+    compact tradeoff plot requested for comparing whether reward increases while
+    validation loss stays stable.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax_loss = plt.subplots(figsize=(10, 5.4))
+    ax_reward = ax_loss.twinx()
+    plotted = False
+
+    for run_name, path in metric_files:
+        rows = read_csv(path)
+        loss_metric, loss_pts = choose_metric_series(rows, loss_preferred)
+        reward_metric, reward_pts = choose_metric_series(rows, reward_preferred)
+        if loss_pts:
+            loss_pts = sorted(loss_pts, key=lambda x: x[0])
+            ax_loss.plot(
+                [x for x, _ in loss_pts],
+                [y for _, y in loss_pts],
+                linewidth=1.2,
+                linestyle="-",
+                label=f"loss:{run_name}" if loss_metric == loss_preferred[0] else f"loss:{run_name} ({loss_metric})",
+            )
+            plotted = True
+        if reward_pts:
+            reward_pts = sorted(reward_pts, key=lambda x: x[0])
+            ax_reward.plot(
+                [x for x, _ in reward_pts],
+                [y for _, y in reward_pts],
+                linewidth=1.2,
+                linestyle="--",
+                label=f"reward:{run_name}" if reward_metric == reward_preferred[0] else f"reward:{run_name} ({reward_metric})",
+            )
+            plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return False
+
+    ax_loss.set_xlabel("step")
+    ax_loss.set_ylabel("loss")
+    ax_reward.set_ylabel("reward")
+    ax_loss.set_title(title)
+
+    handles1, labels1 = ax_loss.get_legend_handles_labels()
+    handles2, labels2 = ax_reward.get_legend_handles_labels()
+    if handles1 or handles2:
+        ax_loss.legend(handles1 + handles2, labels1 + labels2, fontsize=7, loc="best")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
     return True
 
 
@@ -159,7 +258,7 @@ def write_summary(rows: List[Dict[str, object]], path: Path) -> None:
         for k in row.keys():
             if k not in fields:
                 fields.append(k)
-    with open(path, "w", encoding="utf-8", newline="") as f:
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
@@ -167,60 +266,6 @@ def write_summary(rows: List[Dict[str, object]], path: Path) -> None:
 
 def group_name_from_root(run_root: Path) -> str:
     return safe_name(run_root.name or "rl_group")
-
-
-def choose_metric_series(rows: List[Dict[str, str]], preferred: Sequence[str]) -> Tuple[str, List[Tuple[float, float]]]:
-    """Return the first available metric series from a preference list."""
-    for metric in preferred:
-        pts: List[Tuple[float, float]] = []
-        for i, row in enumerate(rows):
-            y = to_float(row.get(metric))
-            if y is None:
-                continue
-            x = to_float(row.get("step"))
-            pts.append((float(i if x is None else x), y))
-        if pts:
-            return metric, pts
-    return "", []
-
-
-def plot_group_overlay(
-    metric_files: List[Tuple[str, Path]],
-    preferred: Sequence[str],
-    out_path: Path,
-    title: str,
-    ylabel: str,
-) -> bool:
-    """One compact curve plot per RL group.
-
-    Each line is one run/global-best file.  For each file we prefer full-eval
-    metrics, then mini-eval metrics, then train metrics.  This keeps the figure
-    answer-pipeline-like: one loss curve image and one reward curve image per
-    RL family, rather than many files per metric.
-    """
-    plotted = False
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(9, 5))
-    for run_name, path in metric_files:
-        rows = read_csv(path)
-        metric, pts = choose_metric_series(rows, preferred)
-        if not pts:
-            continue
-        pts = sorted(pts, key=lambda x: x[0])
-        label = run_name if metric == preferred[0] else f"{run_name} ({metric})"
-        plt.plot([x for x, _ in pts], [y for _, y in pts], linewidth=1.2, label=label)
-        plotted = True
-    if not plotted:
-        plt.close()
-        return False
-    plt.xlabel("step")
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.legend(fontsize=7)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=180)
-    plt.close()
-    return True
 
 
 def visualize_training(run_roots: Sequence[Path], out_dir: Path) -> List[Dict[str, object]]:
@@ -250,11 +295,16 @@ def visualize_training(run_roots: Sequence[Path], out_dir: Path) -> List[Dict[st
             f"{group}: rollout reward curves",
             "reward",
         )
+        plot_group_loss_reward_overlay(
+            metric_files,
+            loss_preferred,
+            reward_preferred,
+            out_dir / f"{group}_loss_reward_overlay.png",
+            f"{group}: loss/reward overlay",
+        )
 
     def sort_key(row: Dict[str, object]):
-        for k in ("group", "full_eval_loss", "last100_full_eval_loss", "eval_loss", "last100_eval_loss", "final_loss"):
-            if k == "group":
-                continue
+        for k in ("full_eval_loss", "last100_full_eval_loss", "eval_loss", "last100_eval_loss", "final_loss"):
             v = to_float(row.get(k))
             if v is not None:
                 return (str(row.get("group", "")), v)
@@ -264,6 +314,23 @@ def visualize_training(run_roots: Sequence[Path], out_dir: Path) -> List[Dict[st
     write_summary(summaries, out_dir / "training_summary.csv")
     (out_dir / "training_summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
     return summaries
+
+
+def find_baseline_values(rows: List[Dict[str, str]], metric: str) -> Dict[str, float]:
+    baselines: Dict[str, float] = {}
+    for r in rows:
+        if str(r.get("status", "ok")) not in {"", "ok"}:
+            continue
+        model_raw = str(r.get("model", ""))
+        model = model_raw.lower()
+        v = to_float(r.get(metric))
+        if v is None:
+            continue
+        if model in PRETRAIN_BASELINE_NAMES or model_raw in PRETRAIN_BASELINE_NAMES:
+            baselines.setdefault("pretrain start", v)
+        if model in {x.lower() for x in QRA_BASELINE_NAMES} or model_raw in QRA_BASELINE_NAMES:
+            baselines.setdefault("QRA start", v)
+    return baselines
 
 
 def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title: str, ylabel: str, higher_better: bool) -> bool:
@@ -277,17 +344,87 @@ def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title
         pairs.append((str(r.get("model", "model")), v))
     if not pairs:
         return False
+
     labels = [p[0] for p in pairs]
     values = [p[1] for p in pairs]
+    bar_colors = []
+    for label in labels:
+        family = model_family(label)
+        if family == "QRA":
+            bar_colors.append("tab:blue")
+        elif family == "pretrain":
+            bar_colors.append("tab:orange")
+        else:
+            bar_colors.append("0.65")
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(10, 5))
-    plt.bar(labels, values)
+    plt.figure(figsize=(10.5, 5.2))
+    plt.bar(labels, values, color=bar_colors, alpha=0.82)
+
+    baseline_values = find_baseline_values(rows, metric)
+    baseline_style = {
+        "pretrain start": ("tab:orange", "--"),
+        "QRA start": ("tab:blue", "-.")
+    }
+    for name, value in baseline_values.items():
+        color, linestyle = baseline_style.get(name, ("0.3", ":"))
+        plt.axhline(value, color=color, linestyle=linestyle, linewidth=1.4, label=f"{name}: {value:.4g}")
+
     plt.xticks(rotation=25, ha="right")
     plt.ylabel(ylabel)
-    plt.title(title)
+    direction = "higher is better" if higher_better else "lower is better"
+    plt.title(f"{title} ({direction})")
+    if baseline_values:
+        plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
     plt.close()
+    return True
+
+
+def plot_test_loss_reward_pair(rows: List[Dict[str, str]], out_path: Path) -> bool:
+    valid = [r for r in rows if str(r.get("status", "ok")) in {"", "ok"}]
+    pairs = []
+    for r in valid:
+        loss = to_float(r.get("test_loss"))
+        reward = to_float(r.get("test_rollout_reward"))
+        if loss is None and reward is None:
+            continue
+        pairs.append((str(r.get("model", "model")), loss, reward))
+    if not pairs:
+        return False
+
+    labels = [p[0] for p in pairs]
+    xs = list(range(len(labels)))
+    width = 0.38
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax_loss = plt.subplots(figsize=(11, 5.4))
+    ax_reward = ax_loss.twinx()
+
+    loss_vals = [0.0 if p[1] is None else p[1] for p in pairs]
+    reward_vals = [0.0 if p[2] is None else p[2] for p in pairs]
+    ax_loss.bar([x - width / 2 for x in xs], loss_vals, width=width, color="tab:red", alpha=0.70, label="test_loss")
+    ax_reward.bar([x + width / 2 for x in xs], reward_vals, width=width, color="tab:green", alpha=0.55, label="test_rollout_reward")
+
+    for metric, axis, style_map in [
+        ("test_loss", ax_loss, {"pretrain start": ("tab:orange", "--"), "QRA start": ("tab:blue", "-.")}),
+        ("test_rollout_reward", ax_reward, {"pretrain start": ("tab:orange", ":"), "QRA start": ("tab:blue", ":")}),
+    ]:
+        for name, value in find_baseline_values(rows, metric).items():
+            color, linestyle = style_map.get(name, ("0.3", ":"))
+            axis.axhline(value, color=color, linestyle=linestyle, linewidth=1.1, label=f"{name} {metric}: {value:.4g}")
+
+    ax_loss.set_xticks(xs)
+    ax_loss.set_xticklabels(labels, rotation=25, ha="right")
+    ax_loss.set_ylabel("test loss")
+    ax_reward.set_ylabel("test rollout reward")
+    ax_loss.set_title("Test loss and reward comparison")
+    h1, l1 = ax_loss.get_legend_handles_labels()
+    h2, l2 = ax_reward.get_legend_handles_labels()
+    ax_loss.legend(h1 + h2, l1 + l2, fontsize=7, loc="best")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
     return True
 
 
@@ -307,6 +444,7 @@ def visualize_test_results(test_result_dir: Path, out_dir: Path) -> Dict[str, ob
         return summary
     plot_test_bar(rows, "test_loss", out_dir / "test_loss_compare.png", "Test set loss comparison", "test loss", higher_better=False)
     plot_test_bar(rows, "test_rollout_reward", out_dir / "test_reward_compare.png", "Test set rollout reward comparison", "test rollout reward", higher_better=True)
+    plot_test_loss_reward_pair(rows, out_dir / "test_loss_reward_compare.png")
     write_summary([{k: v for k, v in r.items()} for r in rows], out_dir / "test_summary.csv")
     (out_dir / "test_summary.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     # compact winners
@@ -348,10 +486,13 @@ def main() -> None:
         "plots": [
             "rl_pretrain_loss.png",
             "rl_pretrain_reward.png",
+            "rl_pretrain_loss_reward_overlay.png",
             "rl_QRA_loss.png",
             "rl_QRA_reward.png",
+            "rl_QRA_loss_reward_overlay.png",
             "test_loss_compare.png",
             "test_reward_compare.png",
+            "test_loss_reward_compare.png",
         ],
     }
     (out_dir / "visual_summary.json").write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
