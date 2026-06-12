@@ -13,7 +13,7 @@ records that fallback in model_plan.json/run.log.
 
 Default output:
     experiment/sample_chain/<timestamp>_<run_name>/
-        chain.csv                         # compact wide format: all samples / all models / all steps
+        chain.csv                         # all samples / all models / all steps
         chains/<sample_id>_chain.csv       # one CSV per sample, all models in that sample
         run.log                           # terminal-style comparison log
         sample_report.txt                 # question/reasoning/GT + final answer of every model
@@ -68,7 +68,35 @@ DEFAULT_MODELS = [
     "QRA_reward_best",
 ]
 
-DISPLAY_MODEL_NAMES = {
+# Fixed diagnostic samples requested for chain comparison.
+# These ids are looked up from S1K_RL/<split>.jsonl and kept in this exact order:
+# first the original/QRA examples, then the harder synthetic S1K_RL examples.
+FIXED_SAMPLE_SPECS = {
+    "QRA": [
+        {"id": "s1k_157", "answer": "(3,4]", "kind": "interval"},
+        {"id": "s1k_26", "answer": "90.39", "kind": "decimal"},
+        {"id": "s1k_499", "answer": "2.5", "kind": "decimal"},
+        {"id": "s1k_50", "answer": "112", "kind": "integer"},
+        {"id": "s1k_66", "answer": "182", "kind": "integer"},
+        {"id": "s1k_195", "answer": "A", "kind": "letter"},
+        {"id": "s1k_330", "answer": "B", "kind": "letter"},
+        {"id": "s1k_256", "answer": r"\( \boxed{ x_{100} > 0.99 } \)", "kind": "short_text"},
+    ],
+    "S1K_RL": [
+        {"id": "s1f_rl_synthetic_interval_test_000011", "answer": "(-9,-7)", "kind": "interval"},
+        {"id": "s1f_rl_synthetic_interval_test_000018", "answer": "(1,10)", "kind": "interval"},
+        {"id": "s1f_rl_synthetic_equation_test_000014", "answer": "x=2", "kind": "equation"},
+        {"id": "s1f_rl_synthetic_equation_test_000019", "answer": "y=2x+1", "kind": "equation"},
+        {"id": "s1f_rl_synthetic_unit_decimal_test_000028", "answer": "7.45 W", "kind": "unit_decimal"},
+        {"id": "s1f_rl_synthetic_unit_decimal_test_000001", "answer": "4.12 J", "kind": "unit_decimal"},
+        {"id": "s1f_rl_synthetic_inequality_test_000002", "answer": "y<-7", "kind": "symbolic"},
+        {"id": "s1f_rl_synthetic_inequality_test_000025", "answer": "x<-4", "kind": "symbolic"},
+    ],
+}
+FIXED_SAMPLE_GROUP_ORDER = ("QRA", "S1K_RL")
+FIXED_SAMPLE_IDS = [item["id"] for group in FIXED_SAMPLE_GROUP_ORDER for item in FIXED_SAMPLE_SPECS[group]]
+
+MODEL_DISPLAY_NAMES = {
     "pretrain_start": "pretrain",
     "pretrain_loss_best": "rl_pretrain_bestloss",
     "pretrain_reward_best": "rl_pretrain_bestreward",
@@ -76,27 +104,6 @@ DISPLAY_MODEL_NAMES = {
     "QRA_loss_best": "rl_QRA_bestloss",
     "QRA_reward_best": "rl_QRA_bestreward",
 }
-
-DEFAULT_REFERENCE_SAMPLE_IDS = [
-    # Synthetic hard cases from S1K_RL/test.jsonl
-    "s1f_rl_synthetic_interval_test_000011",
-    "s1f_rl_synthetic_interval_test_000018",
-    "s1f_rl_synthetic_equation_test_000014",
-    "s1f_rl_synthetic_equation_test_000019",
-    "s1f_rl_synthetic_unit_decimal_test_000028",
-    "s1f_rl_synthetic_unit_decimal_test_000001",
-    "s1f_rl_synthetic_inequality_test_000002",
-    "s1f_rl_synthetic_inequality_test_000025",
-    # Real/origin QRA cases copied into S1K_RL/test.jsonl
-    "s1k_157",
-    "s1k_26",
-    "s1k_499",
-    "s1k_50",
-    "s1k_66",
-    "s1k_195",
-    "s1k_330",
-    "s1k_256",
-]
 
 
 # ----------------------------- basic utilities -----------------------------
@@ -285,7 +292,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
         # ----- pretrain family: start / loss-best / reward-best -----
         if name_l in {"pretrain", "pretrain_start", "start_pretrain"}:
             specs.append({
-                "name": "pretrain_start",
+                "name": "pretrain",
                 "checkpoint": None,
                 "pretrained": model_pretrained_name(cfg, "pretrain"),
                 "source": "start_pretrained_or_cache",
@@ -296,7 +303,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
             ckpt = start_output_dir(cfg, "pretrain") / "best.pth"
             if ckpt.exists():
                 specs.append({
-                    "name": "pretrain_loss_best",
+                    "name": "rl_pretrain_bestloss",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "pretrain"),
                     "source": "rl_root_loss_best",
@@ -310,7 +317,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
             ckpt, source, warning = reward_checkpoint_or_fallback(root)
             if ckpt is not None:
                 specs.append({
-                    "name": "pretrain_reward_best",
+                    "name": "rl_pretrain_bestreward",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "pretrain"),
                     "source": source,
@@ -323,7 +330,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
             ckpt = init_checkpoint_path(cfg, "QRA")
             if ckpt is not None:
                 specs.append({
-                    "name": "QRA_start",
+                    "name": "QRA",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": "start_init_checkpoint",
@@ -336,7 +343,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
             ckpt = start_output_dir(cfg, "QRA") / "best.pth"
             if ckpt.exists():
                 specs.append({
-                    "name": "QRA_loss_best",
+                    "name": "rl_QRA_bestloss",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": "rl_root_loss_best",
@@ -350,7 +357,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
             ckpt, source, warning = reward_checkpoint_or_fallback(root)
             if ckpt is not None:
                 specs.append({
-                    "name": "QRA_reward_best",
+                    "name": "rl_QRA_bestreward",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": source,
@@ -542,15 +549,6 @@ def source_group(sample: Dict[str, Any]) -> str:
     return "synthetic" if is_synthetic_sample(sample) else "origin"
 
 
-def display_dataset(sample: Dict[str, Any]) -> str:
-    """Dataset label used in chain.csv.
-
-    Synthetic hard cases are labeled S1K_RL, while original filtered S1K/QRA
-    cases are labeled QRA, matching the diagnostic sample list.
-    """
-    return "S1K_RL" if is_synthetic_sample(sample) else "QRA"
-
-
 def pick_diverse_from_pool(pool: List[Dict[str, Any]], limit: int, per_type: int, seed: int) -> List[Dict[str, Any]]:
     if limit <= 0 or not pool:
         return []
@@ -639,36 +637,23 @@ def pick_balanced_origin_synthetic_samples(
     return chosen
 
 
-def pick_fixed_reference_samples(
-    samples: List[Dict[str, Any]],
-    reference_ids: Sequence[str],
-    seed: int,
-) -> List[Dict[str, Any]]:
-    """Pick the fixed diagnostic samples used for chain comparison.
 
-    The list is ordered as 8 synthetic S1K_RL cases followed by 8 real QRA
-    cases.  Missing ids are reported and the remaining slots are backfilled
-    deterministically, so the script still runs on older data files.
-    """
+def pick_fixed_reference_samples(samples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Pick the fixed 16 diagnostic samples in the user-specified order."""
     by_id = {str(s.get("id", "")): s for s in samples}
     chosen: List[Dict[str, Any]] = []
-    seen = set()
     missing: List[str] = []
-    for sid in reference_ids:
-        sample = by_id.get(str(sid))
+    for sid in FIXED_SAMPLE_IDS:
+        sample = by_id.get(sid)
         if sample is None:
-            missing.append(str(sid))
+            missing.append(sid)
             continue
         chosen.append(sample)
-        seen.add(str(sid))
-    if missing:
-        print(f"[warn] fixed reference sample ids missing: {missing}", flush=True)
-    target = len(reference_ids)
-    if len(chosen) < target:
-        remaining = [s for s in samples if str(s.get("id", id(s))) not in seen]
-        chosen.extend(pick_diverse_from_pool(remaining, target - len(chosen), per_type=2, seed=seed + 101))
-    return chosen[:target]
+    return chosen, missing
 
+
+def model_display_name(name: str) -> str:
+    return MODEL_DISPLAY_NAMES.get(str(name), safe_name(str(name), str(name)))
 
 # ------------------------------- model load --------------------------------
 
@@ -976,18 +961,13 @@ def build_wide_chain_rows(
 ) -> List[Dict[str, Any]]:
     """Build compact reference-style chain rows.
 
-    One row is one (sample, denoising step).  The columns intentionally match
-    the simple diagnostic format:
-
-        dataset,sample_id,gt_answer,answer_kind,step,t,
-        pretrain,rl_pretrain_bestloss,rl_pretrain_bestreward,
-        QRA,rl_QRA_bestloss,rl_QRA_bestreward
-
-    Model changes can be read directly by comparing consecutive rows.
+    One row is one (sample, denoising step). Columns are intentionally compact:
+      dataset,sample_id,gt_answer,answer_kind,step,t,<six model answer columns>
+    This matches the reference chain CSV format used for presentation.
     """
     rows: List[Dict[str, Any]] = []
-    for sample in sample_order:
-        sid = str(sample.get("id", ""))
+    for sample_i, sample in enumerate(sample_order, start=1):
+        sid = str(sample.get("id", f"sample_{sample_i}"))
         gt = extract_gt_answer(sample)
         sample_results = results_by_sample.get(sid, {})
         max_step = 0
@@ -1007,7 +987,7 @@ def build_wide_chain_rows(
                     t_val = f"{float(tr.get('t', 0.0)):.4f}"
                     break
             row: Dict[str, Any] = {
-                "dataset": display_dataset(sample),
+                "dataset": "S1K_RL" if is_synthetic_sample(sample) else "QRA",
                 "sample_id": sid,
                 "gt_answer": gt,
                 "answer_kind": answer_kind(gt),
@@ -1022,8 +1002,7 @@ def build_wide_chain_rows(
 
 
 def wide_chain_fields(model_names: List[str]) -> List[str]:
-    return ["dataset", "sample_id", "gt_answer", "answer_kind", "step", "t", *model_names]
-
+    return ["dataset", "sample_id", "gt_answer", "answer_kind", "step", "t"] + list(model_names)
 
 def final_answer(result: Dict[str, Any]) -> str:
     trace = result.get("trace") or []
@@ -1130,8 +1109,9 @@ def main() -> None:
     parser.add_argument("--num-origin-samples", type=int, default=8, help="Default diagnostic origin/real sample count.")
     parser.add_argument("--num-synthetic-samples", type=int, default=8, help="Default diagnostic synthetic sample count.")
     parser.add_argument("--samples-per-type", type=int, default=2)
+    parser.add_argument("--no-fixed-reference-samples", action="store_true",
+                        help="Disable the fixed 16 reference samples and use the old diverse/balanced sampler.")
     parser.add_argument("--sample-id", action="append", default=[], help="Specific sample id. Can be repeated.")
-    parser.add_argument("--no-fixed-reference-samples", action="store_true", help="Disable the built-in fixed 16-sample diagnostic list and use balanced sampling instead.")
     parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six: pretrain_start,pretrain_loss_best,pretrain_reward_best,QRA_start,QRA_loss_best,QRA_reward_best")
     parser.add_argument("--checkpoint", default=None, help="Trace one specific checkpoint only.")
     parser.add_argument("--checkpoint-name", default=None)
@@ -1144,7 +1124,7 @@ def main() -> None:
     parser.add_argument("--t-start", type=float, default=0.95)
     parser.add_argument("--t-end", type=float, default=0.01)
     parser.add_argument("--transition-kind", default="analytic", choices=["analytic", "denoise"])
-    parser.add_argument("--mode", default="sample", choices=["sample", "greedy"], help="Default sample matches stochastic SEDD reverse chains. Greedy often stays at mask/no-op until late steps.")
+    parser.add_argument("--mode", default="sample", choices=["sample", "greedy"], help="Default sample matches training rollout better than greedy.")
     parser.add_argument("--freeze-filled", action="store_true", help="Diagnostic monotonic-fill mode; not true SEDD reverse chain.")
     args = parser.parse_args()
 
@@ -1158,18 +1138,25 @@ def main() -> None:
     tokenizer.pad_token = tokenizer.eos_token
 
     samples = load_samples(cfg, start_name, args.split, tokenizer)
-    if (not args.sample_id) and int(args.num_samples) <= 0 and (not args.no_fixed_reference_samples):
-        chosen = pick_fixed_reference_samples(samples, DEFAULT_REFERENCE_SAMPLE_IDS, int(args.seed))
+    if args.sample_id:
+        chosen = pick_balanced_origin_synthetic_samples(
+            samples, args.sample_id, int(args.num_samples), int(args.num_origin_samples),
+            int(args.num_synthetic_samples), int(args.samples_per_type), int(args.seed),
+        )
+        missing_fixed: List[str] = []
+        sample_selection_mode = "manual_sample_id"
+    elif not bool(args.no_fixed_reference_samples) and int(args.num_samples) <= 0:
+        chosen, missing_fixed = pick_fixed_reference_samples(samples)
+        sample_selection_mode = "fixed_reference_16"
     else:
         chosen = pick_balanced_origin_synthetic_samples(
-            samples,
-            args.sample_id,
-            int(args.num_samples),
-            int(args.num_origin_samples),
-            int(args.num_synthetic_samples),
-            int(args.samples_per_type),
-            int(args.seed),
+            samples, args.sample_id, int(args.num_samples), int(args.num_origin_samples),
+            int(args.num_synthetic_samples), int(args.samples_per_type), int(args.seed),
         )
+        missing_fixed = []
+        sample_selection_mode = "balanced_diverse"
+    if missing_fixed:
+        print(f"[warn] fixed reference samples missing from {data_dir}/{args.split}.jsonl: {missing_fixed}", flush=True)
     if not chosen:
         raise RuntimeError("No samples selected for tracing.")
 
@@ -1182,20 +1169,24 @@ def main() -> None:
     logger = TeeLogger(out_dir / "run.log")
     try:
         model_specs = resolve_model_plan(args, cfg)
-        for spec in model_specs:
-            internal = str(spec.get("name", ""))
-            spec["internal_name"] = internal
-            spec["name"] = DISPLAY_MODEL_NAMES.get(internal, internal)
         model_names = [str(s["name"]) for s in model_specs]
 
         logger.print(f"[chain] device={device}")
         selected_counts = Counter(source_group(s) for s in chosen)
         logger.print(f"[chain] data={data_dir}/{args.split}.jsonl loaded={len(samples)} selected={len(chosen)} origin={selected_counts.get('origin',0)} synthetic={selected_counts.get('synthetic',0)}")
+        logger.print(f"[chain] sample_selection={sample_selection_mode}")
         logger.print(f"[chain] models={model_names}")
         for spec in model_specs:
             logger.print(f"[chain] model_source {spec.get('name')}: {spec.get('source')} | {spec.get('checkpoint') or spec.get('pretrained')}")
         logger.print(f"[chain] out={out_dir}")
         dump_json(out_dir / "model_plan.json", model_specs)
+        dump_json(out_dir / "sample_plan.json", {
+            "selection": sample_selection_mode,
+            "fixed_sample_group_order": list(FIXED_SAMPLE_GROUP_ORDER),
+            "fixed_samples": FIXED_SAMPLE_SPECS,
+            "selected_ids": [str(s.get("id", "")) for s in chosen],
+            "missing_fixed_ids": missing_fixed,
+        })
         logger.print(f"[chain] mode={args.mode} steps={args.steps} t={args.t_start}->{args.t_end} freeze_filled={bool(args.freeze_filled)}")
 
         all_rows: List[Dict[str, Any]] = []
