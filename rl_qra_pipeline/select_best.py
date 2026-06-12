@@ -4,7 +4,6 @@ import argparse
 import csv
 import datetime as dt
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -18,11 +17,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 for p in (REPO_DIR, REPO_DIR / "sft_answer_pipeline", REPO_DIR / "sft_rl_pipeline", SCRIPT_DIR):
     p_str = str(p)
-    if p_str not in sys.path:
+    if p.exists() and p_str not in sys.path:
         sys.path.insert(0, p_str)
 
-# Reuse the exact training/eval implementation so this script evaluates candidates
-# with the same rollout objective used during RL training.
+# Reuse the exact train/eval implementation so the selection pass measures the
+# same rollout objective as training.
 from train_rl_qra import (  # noqa: E402
     load_config,
     select_start_config,
@@ -43,23 +42,6 @@ from model.ema import ExponentialMovingAverage  # noqa: E402
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 
 
-def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    fields: List[str] = []
-    for row in rows:
-        for key in row.keys():
-            if key not in fields:
-                fields.append(key)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fields})
-
-
 def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
@@ -67,34 +49,26 @@ def append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
 
 
 def maybe_disable_missing_pretrain_checkpoint(cfg: Dict[str, Any], start_name: str) -> Dict[str, Any]:
-    """Allow --start pretrain to use SEDD.from_pretrained/cache without a local .pth.
-
-    Older configs may still contain starts.pretrain.init_checkpoint pointing to a
-    nonexistent pretrain.pth.  That should not block baseline/pretrain RL eval.
-    """
     ckpt_value = str(cfg.get("model", {}).get("init_checkpoint", "") or "").strip()
-    if not ckpt_value:
-        return cfg
-    if str(start_name).lower() == "pretrain":
+    if str(start_name).lower() == "pretrain" and ckpt_value:
         ckpt_path = resolve_repo_path(ckpt_value)
         if not ckpt_path.exists() or ckpt_value.lower() in {"pretrained", "hf", "cache", "none", "null"}:
             cfg.setdefault("model", {})["init_checkpoint"] = ""
-            print(f"[info] --start pretrain uses pretrained/cache weights; ignored missing init_checkpoint={ckpt_value!r}", flush=True)
+            print(f"[info] --start pretrain uses pretrained/cache weights; ignored init_checkpoint={ckpt_value!r}", flush=True)
     return cfg
 
 
 def default_full_eval_split(cfg: Dict[str, Any]) -> str:
     data_cfg = cfg.get("data", {})
     if data_cfg.get("full_eval_split"):
-        return str(data_cfg.get("full_eval_split"))
-    eval_split = str(data_cfg.get("eval_split", "val") or "val")
-    # If training uses val-mini for mini eval, the full selection pass should use val.
-    if eval_split.lower() in {"val-mini", "val_mini", "validation-mini", "validation_mini"}:
+        return str(data_cfg["full_eval_split"])
+    split = str(data_cfg.get("eval_split", "val") or "val")
+    if split.lower() in {"val-mini", "val_mini", "validation-mini", "validation_mini"}:
         return "val"
-    return eval_split
+    return split
 
 
-def load_eval_samples_for_split(cfg: Dict[str, Any], tokenizer, split: str):
+def load_eval_samples_for_split(cfg: Dict[str, Any], tokenizer, split: str) -> List[Dict[str, Any]]:
     samples = load_samples(cfg, split, tokenizer)
     if not samples:
         raise RuntimeError(f"No eval samples loaded for split={split!r}.")
@@ -118,59 +92,109 @@ def load_state_into_model(model, checkpoint_path: Path, device: torch.device, em
     return {"model": state}
 
 
-def find_candidate_checkpoints(run_root: Path, include_last: bool = False, include_mini: bool = True) -> List[Dict[str, Any]]:
-    """Find per-run checkpoints under the new flat layout and old runs/ layout.
+def run_dirs(run_root: Path) -> List[Path]:
+    roots = [run_root]
+    legacy = run_root / "runs"
+    if legacy.exists():
+        roots.append(legacy)
+    dirs: List[Path] = []
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for d in sorted([p for p in root.iterdir() if p.is_dir()]):
+            if d.name.startswith("."):
+                continue
+            rp = d.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            dirs.append(d)
+    return dirs
 
-    New layout:
-      rl_QRA/<run_id>/best_run.pth
-    Old layout:
-      rl_QRA/runs/<run_id>/best_run.pth
-    """
+
+def candidate_record(run_dir: Path, ckpt: Path, kind: str, source: str = "") -> Dict[str, Any]:
+    return {
+        "checkpoint": ckpt,
+        "checkpoint_name": ckpt.name,
+        "candidate_kind": kind,
+        "candidate_source": source or kind,
+        "run_dir": run_dir,
+        "run_id": run_dir.name,
+        "metrics_json": run_dir / "metrics.json",
+        "metrics_csv": run_dir / "metrics.csv",
+        "run_info_json": run_dir / "run_info.json",
+    }
+
+
+def find_loss_candidates(run_root: Path, include_last: bool = False, include_mini: bool = True) -> List[Dict[str, Any]]:
     names = ["best_run.pth"]
     if include_mini:
         names.append("best_mini_run.pth")
     if include_last:
         names.append("last_run.pth")
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for d in run_dirs(run_root):
+        for name in names:
+            ckpt = d / name
+            if ckpt.exists() and ckpt.resolve() not in seen:
+                seen.add(ckpt.resolve())
+                out.append(candidate_record(d, ckpt, "loss_candidate"))
+    return out
 
-    candidates: List[Dict[str, Any]] = []
-    seen: set[Path] = set()
-    search_roots = [run_root]
-    old_runs_root = run_root / "runs"
-    if old_runs_root.exists():
-        search_roots.append(old_runs_root)
 
-    for root in search_roots:
-        if not root.exists():
+def find_reward_candidates(run_root: Path, recover_missing: bool = True) -> List[Dict[str, Any]]:
+    """One reward candidate per run: best_reward_run.pth if present, else last_run.pth.
+
+    Recovery rule for old runs:
+      - if <run>/best_reward_run.pth exists, use it;
+      - otherwise, if <run>/last_run.pth exists, copy it to
+        <run>/best_reward_run.pth and use that copy.
+
+    This physically backfills per-run best_reward_run.pth, so future generate /
+    select passes do not need to guess from last_run.pth again. Root best.pth is
+    still chosen only from loss candidates; this reward path only competes for
+    root best_reward.pth.
+    """
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for d in run_dirs(run_root):
+        preferred = d / "best_reward_run.pth"
+        fallback = d / "last_run.pth"
+        recovered = False
+        if preferred.exists():
+            ckpt = preferred
+            source = "best_reward_run"
+        elif fallback.exists():
+            if recover_missing:
+                try:
+                    shutil.copy2(fallback, preferred)
+                    ckpt = preferred
+                    source = "recovered_from_last_run"
+                    recovered = True
+                    print(f"[recover] wrote {preferred} from {fallback}", flush=True)
+                except Exception as exc:
+                    print(f"[warn] failed to recover {preferred} from {fallback}: {exc}", flush=True)
+                    ckpt = fallback
+                    source = "last_run_fallback_no_best_reward"
+            else:
+                ckpt = fallback
+                source = "last_run_fallback_no_best_reward"
+        else:
             continue
-        for run_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
-            # Skip helper dirs that are not training runs.
-            if run_dir.name.startswith("."):
-                continue
-            for name in names:
-                ckpt = run_dir / name
-                if not ckpt.exists():
-                    continue
-                rp = ckpt.resolve()
-                if rp in seen:
-                    continue
-                seen.add(rp)
-                candidates.append({
-                    "checkpoint": ckpt,
-                    "checkpoint_name": name,
-                    "run_dir": run_dir,
-                    "run_id": run_dir.name,
-                    "metrics_json": run_dir / "metrics.json",
-                    "eval_json": run_dir / "eval.json",
-                    "best_eval_json": run_dir / "best_eval.json",
-                    "metrics_csv": run_dir / "metrics.csv",
-                    "run_info_json": run_dir / "run_info.json",
-                })
-    return candidates
+        rp = ckpt.resolve()
+        if rp in seen:
+            continue
+        seen.add(rp)
+        rec = candidate_record(d, ckpt, "reward_candidate", source=source)
+        rec["recovered_best_reward_run"] = bool(recovered)
+        rec["fallback_last_run"] = str(fallback) if source != "best_reward_run" else ""
+        out.append(rec)
+    return out
 
 
 def metric_from_eval(eval_info: Dict[str, Any], name: str, mode: str) -> float:
-    # Script evaluates full split and stores standard eval_loss.  If the config's
-    # best_metric is full_eval_loss, map it to eval_loss for this selection pass.
     if name == "full_eval_loss":
         return get_metric_value(eval_info, "eval_loss", initial_best_value(mode))
     if name.startswith("full_eval_"):
@@ -180,8 +204,7 @@ def metric_from_eval(eval_info: Dict[str, Any], name: str, mode: str) -> float:
 
 def delta(new: Any, old: Any) -> Optional[float]:
     try:
-        new_f = float(new)
-        old_f = float(old)
+        new_f, old_f = float(new), float(old)
         if not np.isfinite(new_f) or not np.isfinite(old_f):
             return None
         return new_f - old_f
@@ -191,186 +214,186 @@ def delta(new: Any, old: Any) -> Optional[float]:
 
 def relative_loss_improvement(before: Any, after: Any) -> Optional[float]:
     try:
-        before_f = float(before)
-        after_f = float(after)
+        before_f, after_f = float(before), float(after)
         if not np.isfinite(before_f) or not np.isfinite(after_f) or abs(before_f) < 1e-12:
             return None
-        # Positive means loss decreased.
         return (before_f - after_f) / abs(before_f)
     except Exception:
         return None
 
 
-def add_before_after_fields(row: Dict[str, Any], baseline: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    """Attach before/after metrics showing RL effect against the start checkpoint."""
-    keys = [
-        ("eval_loss", "loss"),
-        ("rollout_loss", "rollout_loss"),
-        ("rollout_reward", "rollout_reward"),
-        ("rollout_reward_std", "rollout_reward_std"),
-        ("rollout_entropy", "rollout_entropy"),
-        ("rollout_logprob", "rollout_logprob"),
-        ("rollout_anchor_loss", "rollout_anchor_loss"),
-    ]
-    for key, short in keys:
-        before = baseline.get(key)
-        after = row.get(key)
-        row[f"{prefix}before_{short}"] = before
-        row[f"{prefix}after_{short}"] = after
-        row[f"{prefix}delta_{short}"] = delta(after, before)
-    row[f"{prefix}relative_loss_improvement"] = relative_loss_improvement(baseline.get("eval_loss"), row.get("eval_loss"))
+def before_after_summary(baseline: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "before_loss": baseline.get("eval_loss"),
+        "after_loss": after.get("eval_loss"),
+        "delta_loss": delta(after.get("eval_loss"), baseline.get("eval_loss")),
+        "relative_loss_improvement": relative_loss_improvement(baseline.get("eval_loss"), after.get("eval_loss")),
+        "before_rollout_reward": baseline.get("rollout_reward"),
+        "after_rollout_reward": after.get("rollout_reward"),
+        "delta_rollout_reward": delta(after.get("rollout_reward"), baseline.get("rollout_reward")),
+        "before_rollout_loss": baseline.get("rollout_loss"),
+        "after_rollout_loss": after.get("rollout_loss"),
+        "delta_rollout_loss": delta(after.get("rollout_loss"), baseline.get("rollout_loss")),
+        "before_entropy": baseline.get("rollout_entropy"),
+        "after_entropy": after.get("rollout_entropy"),
+        "delta_entropy": delta(after.get("rollout_entropy"), baseline.get("rollout_entropy")),
+        "before_anchor_loss": baseline.get("rollout_anchor_loss"),
+        "after_anchor_loss": after.get("rollout_anchor_loss"),
+        "delta_anchor_loss": delta(after.get("rollout_anchor_loss"), baseline.get("rollout_anchor_loss")),
+    }
+
+
+def eval_candidate(model, graph, noise, tokenizer, cand: Dict[str, Any], cfg: Dict[str, Any], device: torch.device, samples: List[Dict[str, Any]], limit, ema_decay: float, use_ema: bool) -> Dict[str, Any]:
+    ckpt = Path(cand["checkpoint"])
+    load_state_into_model(model, ckpt, device, ema_decay=ema_decay, use_ema=use_ema)
+    info = evaluate_loss(model, graph, noise, tokenizer, samples, cfg, device, limit=limit)
+    row = {
+        "run_id": cand.get("run_id"),
+        "run_dir": str(cand.get("run_dir", "")),
+        "checkpoint": str(ckpt),
+        "checkpoint_name": cand.get("checkpoint_name"),
+        "candidate_kind": cand.get("candidate_kind"),
+        "candidate_source": cand.get("candidate_source"),
+        "metrics_csv": str(cand.get("metrics_csv", "")),
+        "metrics_json": str(cand.get("metrics_json", "")),
+        "run_info_json": str(cand.get("run_info_json", "")),
+        "eval_loss": info.get("eval_loss"),
+        "eval_count": info.get("eval_count"),
+        "rollout_loss": info.get("rollout_loss"),
+        "rollout_reward": info.get("rollout_reward"),
+        "rollout_reward_std": info.get("rollout_reward_std"),
+        "rollout_entropy": info.get("rollout_entropy"),
+        "rollout_logprob": info.get("rollout_logprob"),
+        "rollout_anchor_loss": info.get("rollout_anchor_loss"),
+        "eval_metrics": info,
+    }
     return row
 
 
-def copy_best_outputs(
+def copy_root_outputs(
     out_root: Path,
-    best: Dict[str, Any],
+    loss_best: Dict[str, Any],
+    reward_best: Optional[Dict[str, Any]],
     baseline_eval: Dict[str, Any],
-    all_rows: List[Dict[str, Any]],
     cfg: Dict[str, Any],
     start_name: str,
     eval_split: str,
     eval_limit_label_value: str | int,
     best_metric_name: str,
     best_mode: str,
+    reward_metric_name: str,
+    reward_mode: str,
 ) -> None:
-    """Write the same compact root layout as the other RL/SFT pipelines.
-
-    Root directory output is intentionally limited to best.pth plus five files:
-      - best_metrics.csv
-      - best_metrics.json
-      - best_eval.json
-      - best_run_info.json
-      - improvement_log.jsonl
-
-    Per-run details remain inside each run directory.  Candidate-level selection
-    details are summarized inside best_eval.json / best_metrics.json instead of
-    creating extra root report files.
-    """
     out_root.mkdir(parents=True, exist_ok=True)
-
-    # Remove verbose report files produced by older versions of this helper.
-    # Keep root aligned with the compact layout used by the other pipelines.
-    for extra_name in ["best_selection_report.csv", "best_selection_report.json"]:
+    # Clean old verbose files and old naming.
+    for extra in ["best_selection_report.csv", "best_selection_report.json", "best_last.pth"]:
         try:
-            (out_root / extra_name).unlink()
+            (out_root / extra).unlink()
         except FileNotFoundError:
             pass
 
-    ckpt = Path(best["checkpoint"])
-    shutil.copy2(ckpt, out_root / "best.pth")
-
-    # Keep the conventional root metrics.csv copy from the selected run.  This is
-    # useful for visual_rl_qra.py and matches the existing best_metrics.csv pattern.
-    if Path(best.get("metrics_csv", "")).exists():
-        shutil.copy2(Path(best["metrics_csv"]), out_root / "best_metrics.csv")
+    shutil.copy2(Path(loss_best["checkpoint"]), out_root / "best.pth")
+    if Path(loss_best.get("metrics_csv", "")).exists():
+        shutil.copy2(Path(loss_best["metrics_csv"]), out_root / "best_metrics.csv")
     else:
-        write_csv(out_root / "best_metrics.csv", [best])
-
-    if Path(best.get("run_info_json", "")).exists():
-        shutil.copy2(Path(best["run_info_json"]), out_root / "best_run_info.json")
+        # Keep filename convention even if no per-run metrics.csv was found.
+        with open(out_root / "best_metrics.csv", "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(loss_best.keys()))
+            writer.writeheader(); writer.writerow(loss_best)
+    if Path(loss_best.get("run_info_json", "")).exists():
+        shutil.copy2(Path(loss_best["run_info_json"]), out_root / "best_run_info.json")
     else:
-        dump_json(out_root / "best_run_info.json", {"run_dir": best.get("run_dir"), "run_id": best.get("run_id")})
+        dump_json(out_root / "best_run_info.json", {"start": start_name, "run_dir": loss_best.get("run_dir")})
 
-    before_after = {
-        "before_loss": baseline_eval.get("eval_loss"),
-        "after_loss": best.get("eval_loss"),
-        "delta_loss": delta(best.get("eval_loss"), baseline_eval.get("eval_loss")),
-        "relative_loss_improvement": relative_loss_improvement(baseline_eval.get("eval_loss"), best.get("eval_loss")),
-        "before_rollout_reward": baseline_eval.get("rollout_reward"),
-        "after_rollout_reward": best.get("rollout_reward"),
-        "delta_rollout_reward": delta(best.get("rollout_reward"), baseline_eval.get("rollout_reward")),
-        "before_entropy": baseline_eval.get("rollout_entropy"),
-        "after_entropy": best.get("rollout_entropy"),
-        "delta_entropy": delta(best.get("rollout_entropy"), baseline_eval.get("rollout_entropy")),
-        "before_anchor_loss": baseline_eval.get("rollout_anchor_loss"),
-        "after_anchor_loss": best.get("rollout_anchor_loss"),
-        "delta_anchor_loss": delta(best.get("rollout_anchor_loss"), baseline_eval.get("rollout_anchor_loss")),
-    }
-    top_candidates = []
-    for row in all_rows[: min(10, len(all_rows))]:
-        top_candidates.append({
-            "rank_metric": row.get("rank_metric"),
-            "metric_value": row.get("metric_value"),
-            "eval_loss": row.get("eval_loss"),
-            "rollout_reward": row.get("rollout_reward"),
-            "run_id": row.get("run_id"),
-            "checkpoint_name": row.get("checkpoint_name"),
-            "checkpoint": row.get("checkpoint"),
-            "delta_loss": row.get("delta_loss"),
-            "relative_loss_improvement": row.get("relative_loss_improvement"),
-            "error": row.get("error", ""),
-        })
+    loss_eval = dict(loss_best.get("eval_metrics", {}))
+    loss_eval.update({
+        "selected_kind": "loss_best",
+        "root_checkpoint": str(out_root / "best.pth"),
+        "checkpoint": loss_best.get("checkpoint"),
+        "checkpoint_name": loss_best.get("checkpoint_name"),
+        "run_id": loss_best.get("run_id"),
+        "run_dir": loss_best.get("run_dir"),
+        "best_metric_name": best_metric_name,
+        "best_mode": best_mode,
+        "best_metric_value": loss_best.get("metric_value"),
+        "eval_split": eval_split,
+        "eval_limit": eval_limit_label_value,
+        "before_after": before_after_summary(baseline_eval, loss_best),
+    })
 
-    best_eval = {
+    metrics_obj: Dict[str, Any] = {
         "time": dt.datetime.now().isoformat(timespec="seconds"),
-        "selected_by_script": True,
-        "algorithm": cfg.get("rl", {}).get("mode", ""),
         "start": start_name,
-        "eval_split": eval_split,
-        "eval_limit": eval_limit_label_value,
+        "best_checkpoint": str(out_root / "best.pth"),
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
-        "best_metric_value": best.get("metric_value"),
-        "checkpoint": str(ckpt),
-        "checkpoint_name": best.get("checkpoint_name"),
-        "run_dir": str(best.get("run_dir", "")),
-        "run_id": best.get("run_id"),
+        "best_metric_value": loss_best.get("metric_value"),
+        "eval_loss": loss_best.get("eval_loss"),
+        "eval_count": loss_best.get("eval_count"),
+        "eval_split": eval_split,
+        "eval_limit": eval_limit_label_value,
+        "loss_best": loss_eval,
+        "loss_best_before_after": loss_eval["before_after"],
         "baseline_eval_metrics": baseline_eval,
-        "selected_eval_metrics": {k: best.get(k) for k in best.keys() if k.startswith("eval_") or k.startswith("rollout_")},
-        "before_after": before_after,
-        "num_candidates": len(all_rows),
-        "top_candidates": top_candidates,
+        "config": cfg,
     }
-    dump_json(out_root / "best_eval.json", best_eval)
 
-    dump_json(out_root / "best_metrics.json", {
-        "time": best_eval["time"],
-        "selected_by_script": True,
-        "start": start_name,
-        "run_id": best.get("run_id"),
-        "run_dir": str(best.get("run_dir", "")),
-        "checkpoint": str(ckpt),
-        "checkpoint_name": best.get("checkpoint_name"),
-        "best_metric_name": best_metric_name,
-        "best_mode": best_mode,
-        "best_metric_value": best.get("metric_value"),
-        "eval_loss": best.get("eval_loss"),
-        "eval_count": best.get("eval_count"),
-        "eval_split": eval_split,
-        "eval_limit": eval_limit_label_value,
-        "baseline_eval_loss": baseline_eval.get("eval_loss"),
-        "before_after": before_after,
-        "num_candidates": len(all_rows),
-        "top_candidates": top_candidates,
-    })
+    if reward_best is not None:
+        shutil.copy2(Path(reward_best["checkpoint"]), out_root / "best_reward.pth")
+        reward_eval = dict(reward_best.get("eval_metrics", {}))
+        reward_payload = {
+            "selected_kind": "reward_best",
+            "root_checkpoint": str(out_root / "best_reward.pth"),
+            "checkpoint": reward_best.get("checkpoint"),
+            "checkpoint_name": reward_best.get("checkpoint_name"),
+            "candidate_source": reward_best.get("candidate_source"),
+            "run_id": reward_best.get("run_id"),
+            "run_dir": reward_best.get("run_dir"),
+            "best_metric_name": reward_metric_name,
+            "best_mode": reward_mode,
+            "best_metric_value": reward_best.get("reward_metric_value"),
+            "eval_loss": reward_best.get("eval_loss"),
+            "eval_count": reward_best.get("eval_count"),
+            "rollout_reward": reward_best.get("rollout_reward"),
+            "rollout_loss": reward_best.get("rollout_loss"),
+            "rollout_entropy": reward_best.get("rollout_entropy"),
+            "rollout_anchor_loss": reward_best.get("rollout_anchor_loss"),
+            "eval_metrics": reward_eval,
+            "before_after": before_after_summary(baseline_eval, reward_best),
+        }
+        metrics_obj["best_reward_checkpoint"] = str(out_root / "best_reward.pth")
+        metrics_obj["reward_best"] = reward_payload
+        loss_eval["reward_best"] = reward_payload
 
+    dump_json(out_root / "best_eval.json", loss_eval)
+    dump_json(out_root / "best_metrics.json", metrics_obj)
     append_jsonl(out_root / "improvement_log.jsonl", {
-        "time": best_eval["time"],
-        "selected_by_script": True,
-        "run_dir": str(best.get("run_dir", "")),
-        "checkpoint": str(ckpt),
-        "best_metric_name": best_metric_name,
-        "best_mode": best_mode,
-        "new_best_metric": best.get("metric_value"),
-        "new_eval_loss": best.get("eval_loss"),
-        "baseline_eval_loss": baseline_eval.get("eval_loss"),
-        "delta_loss": before_after["delta_loss"],
-        "relative_loss_improvement": before_after["relative_loss_improvement"],
+        "time": metrics_obj["time"],
+        "selected_kind": "select_best_rebuild",
+        "start": start_name,
+        "loss_best_checkpoint": loss_best.get("checkpoint"),
+        "loss_best_metric": loss_best.get("metric_value"),
+        "reward_best_checkpoint": reward_best.get("checkpoint") if reward_best else "",
+        "reward_best_metric": reward_best.get("reward_metric_value") if reward_best else "",
+        "eval_split": eval_split,
     })
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate all RL run checkpoints and rebuild root best.pth / reports.")
+    parser = argparse.ArgumentParser(description="Rebuild root best.pth and best_reward.pth from per-run RL checkpoints.")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG))
-    parser.add_argument("--start", type=str, default=None, help="Start key under config.starts, e.g. pretrain, QA, QRA.")
-    parser.add_argument("--run-root", type=str, default="", help="Override output root, e.g. rl_qra_pipeline/modelparameter/rl_QRA.")
-    parser.add_argument("--split", type=str, default="", help="Eval split. Default: data.full_eval_split or val.")
-    parser.add_argument("--limit", type=str, default="", help="Eval limit: all, full, -1, or an integer. Default: training.full_eval_limit/all.")
-    parser.add_argument("--best-metric", type=str, default="", help="Metric used to select best. Default: training.best_metric/full_eval_loss.")
-    parser.add_argument("--best-mode", type=str, default="", choices=["min", "max"], help="min for loss, max for reward.")
-    parser.add_argument("--include-last", action="store_true", help="Also evaluate last_run.pth from each run.")
-    parser.add_argument("--no-mini", action="store_true", help="Do not evaluate best_mini_run.pth candidates.")
-    parser.add_argument("--no-ema", action="store_true", help="Evaluate raw model weights instead of EMA weights saved in checkpoints.")
+    parser.add_argument("--start", type=str, default=None, help="Start key: pretrain, QA, QRA")
+    parser.add_argument("--run-root", type=str, default="", help="Override root directory, e.g. rl_qra_pipeline/modelparameter/rl_QRA")
+    parser.add_argument("--split", type=str, default="", help="Full-eval split. Default: data.full_eval_split or val.")
+    parser.add_argument("--limit", type=str, default="", help="all/full/-1 or integer. Default: training.full_eval_limit/all.")
+    parser.add_argument("--best-metric", type=str, default="", help="Metric for root best.pth. Default training.best_metric/full_eval_loss.")
+    parser.add_argument("--best-mode", type=str, default="", choices=["min", "max"])
+    parser.add_argument("--best-reward-metric", type=str, default="", help="Metric for root best_reward.pth. Default training.best_reward_metric/full_eval_rollout_reward.")
+    parser.add_argument("--best-reward-mode", type=str, default="", choices=["min", "max"])
+    parser.add_argument("--include-last-for-loss", action="store_true", help="Also allow last_run.pth to compete for conservative best.pth. Default false.")
+    parser.add_argument("--no-mini", action="store_true", help="Do not include best_mini_run.pth for conservative best.pth.")
+    parser.add_argument("--no-ema", action="store_true", help="Evaluate raw model weights instead of EMA weights in checkpoint.")
+    parser.add_argument("--no-recover-best-reward", action="store_true", help="Do not backfill per-run best_reward_run.pth from last_run.pth.")
     parser.add_argument("--gpu", type=int, default=None)
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
@@ -389,123 +412,122 @@ def main() -> None:
     eval_limit_for_logs = eval_limit_label(eval_limit)
     best_metric_name = args.best_metric or str(cfg.get("training", {}).get("best_metric", "full_eval_loss"))
     best_mode = args.best_mode or str(cfg.get("training", {}).get("best_mode", "min")).lower()
+    reward_metric_name = args.best_reward_metric or str(cfg.get("training", {}).get("best_reward_metric", cfg.get("training", {}).get("reward_best_metric", "full_eval_rollout_reward")))
+    reward_mode = args.best_reward_mode or str(cfg.get("training", {}).get("best_reward_mode", cfg.get("training", {}).get("reward_best_mode", "max"))).lower()
 
     tokenizer = GPT2TokenizerFast.from_pretrained(cfg["model"].get("tokenizer", "gpt2"))
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"[select-best] start={start_name} device={device} run_root={out_root}", flush=True)
-    print(f"[select-best] eval_split={eval_split} eval_limit={eval_limit_for_logs} metric={best_metric_name} mode={best_mode}", flush=True)
-
+    print(f"[select-best] start={start_name} device={device} root={out_root}", flush=True)
+    print(f"[select-best] eval_split={eval_split} limit={eval_limit_for_logs} best={best_metric_name}/{best_mode} reward={reward_metric_name}/{reward_mode}", flush=True)
     model, graph, noise, ema, loaded_from = load_policy(cfg, device)
     eval_samples = load_eval_samples_for_split(cfg, tokenizer, eval_split)
 
-    # Baseline before-RL eval: the selected start checkpoint/cache.
     baseline_eval = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
-    baseline_eval.update({
-        "eval_split": eval_split,
-        "eval_limit": eval_limit_for_logs,
-        "loaded_from": loaded_from,
-        "start": start_name,
-    })
-    print(
-        f"[baseline] eval_loss={baseline_eval.get('eval_loss')} "
-        f"R={baseline_eval.get('rollout_reward', 0.0):+.4f} count={baseline_eval.get('eval_count')}",
-        flush=True,
-    )
+    baseline_eval.update({"eval_split": eval_split, "eval_limit": eval_limit_for_logs, "loaded_from": loaded_from, "start": start_name})
+    print(f"[baseline] eval_loss={baseline_eval.get('eval_loss')} R={baseline_eval.get('rollout_reward', 0.0):+.4f} count={baseline_eval.get('eval_count')}", flush=True)
 
-    candidates = find_candidate_checkpoints(out_root, include_last=args.include_last, include_mini=not args.no_mini)
-    if not candidates:
-        raise RuntimeError(f"No candidate checkpoints found under {out_root}. Expected <run_id>/best_run.pth.")
-
-    rows: List[Dict[str, Any]] = []
-    best_row: Optional[Dict[str, Any]] = None
-    best_value = initial_best_value(best_mode)
     ema_decay = float(cfg.get("training", {}).get("ema", 0.9999))
+    eval_cache: Dict[str, Dict[str, Any]] = {}
 
-    for i, cand in enumerate(candidates, start=1):
-        ckpt = Path(cand["checkpoint"])
-        print(f"[{i}/{len(candidates)}] eval {ckpt}", flush=True)
-        try:
-            load_state_into_model(model, ckpt, device, ema_decay=ema_decay, use_ema=not args.no_ema)
-            eval_info = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
-        except Exception as exc:
-            row = {
-                "run_id": cand.get("run_id"),
-                "run_dir": str(cand.get("run_dir", "")),
-                "checkpoint": str(ckpt),
-                "checkpoint_name": cand.get("checkpoint_name"),
-                "error": str(exc),
-            }
-            rows.append(row)
-            print(f"[warn] failed: {exc}", flush=True)
-            continue
-
-        metric_value = metric_from_eval(eval_info, best_metric_name, best_mode)
-        row: Dict[str, Any] = {
-            "rank_metric": metric_value,
-            "metric_value": metric_value,
-            "best_metric_name": best_metric_name,
-            "best_mode": best_mode,
-            "run_id": cand.get("run_id"),
-            "run_dir": str(cand.get("run_dir", "")),
-            "checkpoint": str(ckpt),
-            "checkpoint_name": cand.get("checkpoint_name"),
-            "eval_split": eval_split,
-            "eval_limit": eval_limit_for_logs,
-            "eval_loss": eval_info.get("eval_loss"),
-            "eval_count": eval_info.get("eval_count"),
-            "rollout_loss": eval_info.get("rollout_loss"),
-            "rollout_reward": eval_info.get("rollout_reward"),
-            "rollout_reward_std": eval_info.get("rollout_reward_std"),
-            "rollout_entropy": eval_info.get("rollout_entropy"),
-            "rollout_logprob": eval_info.get("rollout_logprob"),
-            "rollout_anchor_loss": eval_info.get("rollout_anchor_loss"),
-            "metrics_json": str(cand.get("metrics_json", "")),
-            "metrics_csv": str(cand.get("metrics_csv", "")),
-            "run_info_json": str(cand.get("run_info_json", "")),
-        }
-        add_before_after_fields(row, baseline_eval)
-        rows.append(row)
-
-        improved = metric_better(metric_value, best_value, best_mode)
-        print(
-            f"    {best_metric_name}={metric_value:.6g} eval_loss={float(eval_info.get('eval_loss', float('inf'))):.6g} "
-            f"R={float(eval_info.get('rollout_reward', 0.0)):+.4f} improved={'yes' if improved else 'no'}",
-            flush=True,
-        )
-        if improved:
-            best_value = metric_value
-            best_row = row
-
-    # Sort for readable report.
-    reverse = best_mode == "max"
-    rows_sorted = sorted(rows, key=lambda r: float(r.get("rank_metric", initial_best_value("max" if reverse else "min"))) if r.get("rank_metric", "") != "" else (float("-inf") if reverse else float("inf")), reverse=reverse)
-
-    if best_row is None:
-        for extra_name in ["best_selection_report.csv", "best_selection_report.json"]:
+    def evaluate(cand: Dict[str, Any]) -> Dict[str, Any]:
+        key = str(Path(cand["checkpoint"]).resolve())
+        if key not in eval_cache:
+            print(f"[eval] {cand['candidate_kind']} {cand['checkpoint']} source={cand.get('candidate_source')}", flush=True)
             try:
-                (out_root / extra_name).unlink()
-            except FileNotFoundError:
-                pass
-        raise RuntimeError("No candidate evaluated successfully. No root report was written to keep the compact root layout.")
+                row = eval_candidate(model, graph, noise, tokenizer, cand, cfg, device, eval_samples, eval_limit, ema_decay, use_ema=not args.no_ema)
+            except Exception as exc:
+                row = {"checkpoint": str(cand.get("checkpoint")), "candidate_kind": cand.get("candidate_kind"), "error": str(exc)}
+                print(f"[warn] failed {cand.get('checkpoint')}: {exc}", flush=True)
+            eval_cache[key] = row
+        return eval_cache[key]
 
-    copy_best_outputs(
+    loss_candidates = find_loss_candidates(out_root, include_last=args.include_last_for_loss, include_mini=not args.no_mini)
+    if not loss_candidates:
+        raise RuntimeError(f"No loss candidates found under {out_root}; expected <run_id>/best_run.pth.")
+    reward_candidates = find_reward_candidates(out_root, recover_missing=not args.no_recover_best_reward)
+    if not reward_candidates:
+        print(f"[warn] No reward candidates found under {out_root}; expected <run_id>/best_reward_run.pth or last_run.pth.", flush=True)
+
+    loss_best: Optional[Dict[str, Any]] = None
+    loss_best_value = initial_best_value(best_mode)
+    for cand in loss_candidates:
+        row = evaluate(cand)
+        if row.get("error"):
+            continue
+        metric_value = metric_from_eval(row, best_metric_name, best_mode)
+        row["metric_value"] = metric_value
+        if metric_better(metric_value, loss_best_value, best_mode):
+            loss_best_value = metric_value
+            loss_best = row
+        print(f"    loss-candidate {Path(row['checkpoint']).name}: {best_metric_name}={metric_value:.6g} loss={float(row.get('eval_loss', float('inf'))):.6g} R={float(row.get('rollout_reward', 0.0)):+.4f}", flush=True)
+
+    reward_best: Optional[Dict[str, Any]] = None
+    reward_best_value = initial_best_value(reward_mode)
+    for cand in reward_candidates:
+        row = evaluate(cand)
+        if row.get("error"):
+            continue
+        metric_value = metric_from_eval(row, reward_metric_name, reward_mode)
+        row["reward_metric_value"] = metric_value
+        # Backfill/update the per-run reward-best report too.  This is under the
+        # run directory, not the root output directory.
+        try:
+            run_dir = Path(str(row.get("run_dir", "")))
+            if run_dir.exists():
+                dump_json(run_dir / "best_reward_eval.json", {
+                    "selected_kind": "per_run_reward_candidate",
+                    "checkpoint": row.get("checkpoint"),
+                    "checkpoint_name": row.get("checkpoint_name"),
+                    "candidate_source": row.get("candidate_source"),
+                    "recovered_best_reward_run": bool(cand.get("recovered_best_reward_run", False)),
+                    "best_metric_name": reward_metric_name,
+                    "best_mode": reward_mode,
+                    "best_metric_value": metric_value,
+                    "eval_split": eval_split,
+                    "eval_limit": eval_limit_for_logs,
+                    "eval_loss": row.get("eval_loss"),
+                    "eval_count": row.get("eval_count"),
+                    "rollout_reward": row.get("rollout_reward"),
+                    "rollout_loss": row.get("rollout_loss"),
+                    "rollout_entropy": row.get("rollout_entropy"),
+                    "rollout_anchor_loss": row.get("rollout_anchor_loss"),
+                    "eval_metrics": row.get("eval_metrics", {}),
+                    "before_after": before_after_summary(baseline_eval, row),
+                })
+        except Exception as exc:
+            print(f"[warn] failed to write per-run best_reward_eval.json for {row.get('run_dir')}: {exc}", flush=True)
+        if metric_better(metric_value, reward_best_value, reward_mode):
+            reward_best_value = metric_value
+            reward_best = row
+        print(f"    reward-candidate {Path(row['checkpoint']).name}: {reward_metric_name}={metric_value:.6g} loss={float(row.get('eval_loss', float('inf'))):.6g} R={float(row.get('rollout_reward', 0.0)):+.4f} source={row.get('candidate_source')}", flush=True)
+
+    if loss_best is None:
+        raise RuntimeError("No loss candidate evaluated successfully.")
+
+    copy_root_outputs(
         out_root=out_root,
-        best=best_row,
+        loss_best=loss_best,
+        reward_best=reward_best,
         baseline_eval=baseline_eval,
-        all_rows=rows_sorted,
         cfg=cfg,
         start_name=start_name,
         eval_split=eval_split,
         eval_limit_label_value=eval_limit_for_logs,
         best_metric_name=best_metric_name,
         best_mode=best_mode,
+        reward_metric_name=reward_metric_name,
+        reward_mode=reward_mode,
     )
-    print("\nSelected best checkpoint:", flush=True)
-    print(f"  {best_row['checkpoint']}", flush=True)
-    print(f"  {best_metric_name}={best_row.get('metric_value')}", flush=True)
-    print(f"  baseline_loss={baseline_eval.get('eval_loss')} after_loss={best_row.get('eval_loss')} delta={best_row.get('delta_loss')}", flush=True)
+
+    print("\nSelected conservative best.pth:", flush=True)
+    print(f"  {loss_best['checkpoint']}", flush=True)
+    print(f"  {best_metric_name}={loss_best.get('metric_value')} eval_loss={loss_best.get('eval_loss')} R={loss_best.get('rollout_reward')}", flush=True)
+    if reward_best is not None:
+        print("Selected reward best_reward.pth:", flush=True)
+        print(f"  {reward_best['checkpoint']}", flush=True)
+        print(f"  {reward_metric_name}={reward_best.get('reward_metric_value')} eval_loss={reward_best.get('eval_loss')} R={reward_best.get('rollout_reward')} source={reward_best.get('candidate_source')}", flush=True)
     print(f"Wrote root best files under: {out_root}", flush=True)
 
 

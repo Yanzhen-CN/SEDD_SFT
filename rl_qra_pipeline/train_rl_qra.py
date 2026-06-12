@@ -85,6 +85,9 @@ METRIC_FIELDS = [
     "is_best_mini_eval",
     "best_metric_value",
     "is_best_eval",
+    # Reward-oriented checkpoint selection, used for root best_reward.pth.
+    "reward_best_metric_value",
+    "is_best_reward_eval",
 ]
 
 
@@ -527,6 +530,57 @@ def load_eval_samples(cfg: Dict, tokenizer, train_samples: List[Dict], requested
     return train_samples[: min(limit, len(train_samples))], "train_fallback"
 
 
+
+
+def safe_delta(new: Any, old: Any) -> Optional[float]:
+    try:
+        new_f = float(new)
+        old_f = float(old)
+        if not np.isfinite(new_f) or not np.isfinite(old_f):
+            return None
+        return new_f - old_f
+    except Exception:
+        return None
+
+
+def relative_loss_improvement(before: Any, after: Any) -> Optional[float]:
+    try:
+        before_f = float(before)
+        after_f = float(after)
+        if not np.isfinite(before_f) or not np.isfinite(after_f) or abs(before_f) < 1e-12:
+            return None
+        # Positive means the evaluated loss decreased after RL.
+        return (before_f - after_f) / abs(before_f)
+    except Exception:
+        return None
+
+
+def before_after_summary(baseline_eval: Dict[str, Any], after_eval: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact RL-effect summary for json reports.
+
+    Loss is still the rollout composite eval loss. Reward is the rollout reward
+    used by the RL objective; for this project it is often more aligned with
+    format/type/slot quality than pure loss.
+    """
+    return {
+        "before_loss": baseline_eval.get("eval_loss"),
+        "after_loss": after_eval.get("eval_loss"),
+        "delta_loss": safe_delta(after_eval.get("eval_loss"), baseline_eval.get("eval_loss")),
+        "relative_loss_improvement": relative_loss_improvement(baseline_eval.get("eval_loss"), after_eval.get("eval_loss")),
+        "before_rollout_loss": baseline_eval.get("rollout_loss"),
+        "after_rollout_loss": after_eval.get("rollout_loss"),
+        "delta_rollout_loss": safe_delta(after_eval.get("rollout_loss"), baseline_eval.get("rollout_loss")),
+        "before_rollout_reward": baseline_eval.get("rollout_reward"),
+        "after_rollout_reward": after_eval.get("rollout_reward"),
+        "delta_rollout_reward": safe_delta(after_eval.get("rollout_reward"), baseline_eval.get("rollout_reward")),
+        "before_entropy": baseline_eval.get("rollout_entropy"),
+        "after_entropy": after_eval.get("rollout_entropy"),
+        "delta_entropy": safe_delta(after_eval.get("rollout_entropy"), baseline_eval.get("rollout_entropy")),
+        "before_anchor_loss": baseline_eval.get("rollout_anchor_loss"),
+        "after_anchor_loss": after_eval.get("rollout_anchor_loss"),
+        "delta_anchor_loss": safe_delta(after_eval.get("rollout_anchor_loss"), baseline_eval.get("rollout_anchor_loss")),
+    }
+
 def update_global_best(
     out_root: Path,
     run_dir: Path,
@@ -589,6 +643,102 @@ def update_global_best(
     return improved
 
 
+
+def update_global_reward_best(
+    out_root: Path,
+    run_dir: Path,
+    reward_ckpt: Path,
+    reward_eval_info: Dict[str, Any],
+    metrics_json: Dict[str, Any],
+    run_info_path: Path,
+    reward_metric_name: str = "full_eval_rollout_reward",
+    reward_mode: str = "max",
+) -> bool:
+    """Update root best_reward.pth using an RL/reward-oriented metric.
+
+    best.pth remains the conservative validation-loss best.  best_reward.pth is
+    the reward-oriented checkpoint for generation comparison.  To keep root
+    layout compact, no separate best_reward_*.json files are created; metadata is
+    merged into best_metrics.json and best_eval.json under the key reward_best.
+    """
+    out_root.mkdir(parents=True, exist_ok=True)
+    lock = out_root / ".global_best.lock"
+    acquire_lock(lock)
+    improved = False
+    try:
+        metrics_path = out_root / "best_metrics.json"
+        eval_path = out_root / "best_eval.json"
+        current_metrics: Dict[str, Any] = {}
+        current_eval: Dict[str, Any] = {}
+        if metrics_path.exists():
+            try:
+                current_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            except Exception:
+                current_metrics = {}
+        if eval_path.exists():
+            try:
+                current_eval = json.loads(eval_path.read_text(encoding="utf-8"))
+            except Exception:
+                current_eval = {}
+
+        current_reward = current_metrics.get("reward_best", {}) if isinstance(current_metrics.get("reward_best"), dict) else {}
+        current_best = get_metric_value(current_reward, "best_metric_value", initial_best_value(reward_mode))
+        new_metric = metric_from_full_eval(reward_eval_info, reward_metric_name, reward_mode)
+
+        if metric_better(new_metric, current_best, reward_mode):
+            improved = True
+            if reward_ckpt.exists():
+                shutil.copy2(reward_ckpt, out_root / "best_reward.pth")
+            reward_payload = {
+                "time": dt.datetime.now().isoformat(timespec="seconds"),
+                "selected_kind": "reward_best",
+                "run_dir": str(run_dir),
+                "checkpoint": str(reward_ckpt),
+                "checkpoint_name": reward_ckpt.name,
+                "best_metric_name": reward_metric_name,
+                "best_mode": reward_mode,
+                "best_metric_value": new_metric,
+                "eval_loss": reward_eval_info.get("eval_loss"),
+                "full_eval_loss": reward_eval_info.get("full_eval_loss", reward_eval_info.get("eval_loss")),
+                "eval_count": reward_eval_info.get("eval_count"),
+                "rollout_reward": reward_eval_info.get("rollout_reward"),
+                "rollout_loss": reward_eval_info.get("rollout_loss"),
+                "rollout_entropy": reward_eval_info.get("rollout_entropy"),
+                "rollout_anchor_loss": reward_eval_info.get("rollout_anchor_loss"),
+                "eval_metrics": reward_eval_info,
+                "before_after": metrics_json.get("reward_best", {}).get("before_after", {}),
+            }
+            current_metrics.setdefault("time", reward_payload["time"])
+            current_metrics["reward_best"] = reward_payload
+            current_metrics["best_reward_checkpoint"] = str(out_root / "best_reward.pth")
+            dump_json(metrics_path, current_metrics)
+
+            if not current_eval:
+                current_eval = {"time": reward_payload["time"]}
+            current_eval["reward_best"] = reward_payload
+            current_eval["best_reward_checkpoint"] = str(out_root / "best_reward.pth")
+            dump_json(eval_path, current_eval)
+
+            if run_info_path.exists() and not (out_root / "best_run_info.json").exists():
+                shutil.copy2(run_info_path, out_root / "best_run_info.json")
+
+            append_jsonl(out_root / "improvement_log.jsonl", {
+                "time": reward_payload["time"],
+                "selected_kind": "reward_best",
+                "run_dir": str(run_dir),
+                "checkpoint": str(reward_ckpt),
+                "best_metric_name": reward_metric_name,
+                "best_mode": reward_mode,
+                "old_best_metric": current_best,
+                "new_best_metric": new_metric,
+                "new_eval_loss": reward_eval_info.get("eval_loss"),
+                "new_rollout_reward": reward_eval_info.get("rollout_reward"),
+                "improved": True,
+            })
+    finally:
+        release_lock(lock)
+    return improved
+
 def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA", cli_gpu: int | None = None, cli_cpu: bool = False) -> Path:
     seed = int(cfg.get("seed", 42))
     set_seed(seed)
@@ -646,6 +796,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     full_eval_limit_for_logs = eval_limit_label(full_eval_limit)
     best_metric_name = str(cfg["training"].get("best_metric", "full_eval_loss"))
     best_mode = str(cfg["training"].get("best_mode", "min")).lower()
+    reward_best_metric_name = str(cfg["training"].get("best_reward_metric", cfg["training"].get("reward_best_metric", "full_eval_rollout_reward")))
+    reward_best_mode = str(cfg["training"].get("best_reward_mode", cfg["training"].get("reward_best_mode", "max"))).lower()
     rrpi_cfg = cfg.get("rrpi", cfg.get("guided", {}))
     rollout_cfg = cfg.get("rollout", {})
     mode_for_debug = str(cfg.get("rl", {}).get("mode", rrpi_cfg.get("mode", "rrpi")))
@@ -655,6 +807,19 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     else:
         debug_every = int(rrpi_cfg.get("debug_every", 20))
         max_debug_rows = int(rrpi_cfg.get("max_debug_rows", 8))
+
+    # One baseline full validation before RL. This gives json reports an explicit
+    # before/after comparison instead of only absolute after-RL numbers.
+    baseline_eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
+    baseline_eval_info.update({
+        "eval_kind": "full_baseline_before_rl",
+        "eval_split": full_eval_split,
+        "eval_limit": full_eval_limit_for_logs,
+        "run_id": run_id,
+        "start": start_name,
+        "loaded_from": loaded_from,
+    })
+    baseline_eval_info["full_eval_loss"] = baseline_eval_info.get("eval_loss", float("inf"))
 
     run_info = {
         "algorithm": str(cfg.get("rl", {}).get("mode", "rrpi")),
@@ -673,6 +838,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "full_eval_every": full_eval_every,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
+        "reward_best_metric_name": reward_best_metric_name,
+        "reward_best_mode": reward_best_mode,
         "device": str(device),
         "cli_gpu": cli_gpu,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
@@ -680,6 +847,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     }
     run_info_path = out_dir / "run_info.json"
     dump_json(run_info_path, run_info)
+    dump_json(out_dir / "baseline_eval.json", baseline_eval_info)
     metrics_path = out_dir / "metrics.csv"
     debug_path = out_dir / "rollout_debug.jsonl"
 
@@ -689,15 +857,21 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     best_eval_info: Dict[str, Any] = {}
     best_path = out_dir / "best_run.pth"
     best_mini_path = out_dir / "best_mini_run.pth"
+    best_reward_path = out_dir / "best_reward_run.pth"
     last_path = out_dir / "last_run.pth"
     best_mini_metric_value = initial_best_value(best_mode)
     best_mini_step = 0
+    best_reward_metric_value = initial_best_value(reward_best_mode)
+    best_reward_step = 0
+    best_reward_eval_info: Dict[str, Any] = {}
+    best_reward_row: Dict[str, Any] = {}
 
     numeric_keys = [
         k for k in METRIC_FIELDS
         if k not in {
             "step", "loss", "lr", "best_metric_value", "is_best_eval",
             "mini_best_metric_value", "is_best_mini_eval", "is_full_eval",
+            "reward_best_metric_value", "is_best_reward_eval",
         }
         and not k.startswith("eval_") and not k.startswith("full_eval_")
     ]
@@ -830,13 +1004,41 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                 )
                 dump_json(out_dir / "best_eval.json", best_eval_info)
 
+            reward_metric_value = metric_from_full_eval(full_eval_info_step, reward_best_metric_name, reward_best_mode)
+            row["reward_best_metric_value"] = reward_metric_value
+            improved_reward_eval = metric_better(reward_metric_value, best_reward_metric_value, reward_best_mode)
+            row["is_best_reward_eval"] = 1.0 if improved_reward_eval else 0.0
+            if improved_reward_eval:
+                best_reward_metric_value = reward_metric_value
+                best_reward_step = step
+                best_reward_row = dict(row)
+                best_reward_eval_info = dict(full_eval_info_step)
+                best_reward_eval_info.update({
+                    "best_metric_name": reward_best_metric_name,
+                    "best_mode": reward_best_mode,
+                    "best_metric_value": reward_metric_value,
+                    "best_step": best_reward_step,
+                })
+                save_checkpoint(
+                    best_reward_path,
+                    model,
+                    ema,
+                    optimizer,
+                    cfg,
+                    step,
+                    {"best_metric_name": reward_best_metric_name, "best_mode": reward_best_mode, "best_metric_value": reward_metric_value, **row},
+                )
+                dump_json(out_dir / "best_reward_eval.json", best_reward_eval_info)
+
         if eval_now or full_eval_now:
             eval_msg = f"mini_loss={row.get('eval_loss', float('nan')):.6g}" if row.get("eval_loss", "") != "" else "mini_loss=na"
             full_msg = f" full_loss={row.get('full_eval_loss', float('nan')):.6g}" if row.get("full_eval_loss", "") != "" else ""
             print(
                 f"[eval step={step}] {eval_msg}{full_msg} "
                 f"mini_count={row.get('eval_count', 0)} full_count={row.get('full_eval_count', 0)} "
-                f"best_metric={best_metric_name} best={row.get('is_best_eval', 0.0)} mini_best={row.get('is_best_mini_eval', 0.0)}",
+                f"best_metric={best_metric_name} best={row.get('is_best_eval', 0.0)} "
+                f"reward_metric={reward_best_metric_name} reward_best={row.get('is_best_reward_eval', 0.0)} "
+                f"mini_best={row.get('is_best_mini_eval', 0.0)}",
                 flush=True,
             )
 
@@ -904,6 +1106,34 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         )
         dump_json(out_dir / "best_eval.json", best_eval_info)
 
+    if not best_reward_path.exists():
+        # If sparse full eval never ran, the final model is also the reward-best candidate.
+        final_reward_eval = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
+        final_reward_eval.update({
+            "eval_kind": "full_final_reward_fallback",
+            "eval_split": full_eval_split,
+            "eval_limit": full_eval_limit_for_logs,
+            "step": steps,
+            "run_id": run_id,
+            "best_metric_name": reward_best_metric_name,
+            "best_mode": reward_best_mode,
+        })
+        final_reward_eval["full_eval_loss"] = final_reward_eval.get("eval_loss", float("inf"))
+        best_reward_metric_value = metric_from_full_eval(final_reward_eval, reward_best_metric_name, reward_best_mode)
+        best_reward_step = steps
+        best_reward_eval_info = dict(final_reward_eval)
+        best_reward_eval_info["best_metric_value"] = best_reward_metric_value
+        save_checkpoint(
+            best_reward_path,
+            model,
+            ema,
+            optimizer,
+            cfg,
+            steps,
+            {"best_metric_name": reward_best_metric_name, "best_mode": reward_best_mode, "best_metric_value": best_reward_metric_value, **(last_row or {})},
+        )
+        dump_json(out_dir / "best_reward_eval.json", best_reward_eval_info)
+
     # Evaluate the run's validation-selected best checkpoint, then compete for root global best.
     try:
         state = torch.load(best_path, map_location=device)
@@ -927,6 +1157,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "best_step": best_step,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
+        "reward_best_metric_name": reward_best_metric_name,
+        "reward_best_mode": reward_best_mode,
         "best_metric_value": metric_from_full_eval(eval_info, best_metric_name, best_mode),
     })
     eval_info["full_eval_loss"] = eval_info.get("eval_loss", float("inf"))
@@ -974,12 +1206,45 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     eval_info["best_metric_value"] = best_metric_value
     dump_json(out_dir / "eval.json", eval_info)
 
+    # Final full-eval of the reward-selected checkpoint.  This is the per-run
+    # source for root best_reward.pth.
+    reward_eval_info = dict(best_reward_eval_info or {})
+    if best_reward_path.exists():
+        try:
+            state = torch.load(best_reward_path, map_location=device)
+            model.load_state_dict(state.get("model", state), strict=True)
+            if isinstance(state, dict) and "ema" in state:
+                try:
+                    ema.load_state_dict(state["ema"])
+                    ema.store(model.parameters())
+                    ema.copy_to(model.parameters())
+                except Exception:
+                    pass
+            reward_eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
+            reward_eval_info.update({
+                "eval_kind": "full_final_best_reward_run",
+                "eval_split": full_eval_split,
+                "eval_limit": full_eval_limit_for_logs,
+                "run_id": run_id,
+                "best_step": best_reward_step,
+                "best_metric_name": reward_best_metric_name,
+                "best_mode": reward_best_mode,
+            })
+            reward_eval_info["full_eval_loss"] = reward_eval_info.get("eval_loss", float("inf"))
+            best_reward_metric_value = metric_from_full_eval(reward_eval_info, reward_best_metric_name, reward_best_mode)
+            reward_eval_info["best_metric_value"] = best_reward_metric_value
+            dump_json(out_dir / "best_reward_eval.json", reward_eval_info)
+        except Exception as exc:
+            print(f"[warn] failed to reload/evaluate best_reward_run: {exc}", flush=True)
+
     metrics_json = {
         "run_id": run_id,
         "run_dir": str(out_dir),
         "best_step": best_step,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
+        "reward_best_metric_name": reward_best_metric_name,
+        "reward_best_mode": reward_best_mode,
         "best_metric_value": best_metric_value,
         "last_train_loss": float(last_row.get("loss", float("inf"))) if last_row else float("inf"),
         "eval_loss": float(eval_info.get("eval_loss", float("inf"))),
@@ -993,6 +1258,18 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "best_row": best_row,
         "best_eval_metrics": best_eval_info,
         "eval_metrics": eval_info,
+        "baseline_eval_metrics": baseline_eval_info,
+        "loss_best_before_after": before_after_summary(baseline_eval_info, eval_info),
+        "reward_best": {
+            "best_step": best_reward_step,
+            "best_metric_name": reward_best_metric_name,
+            "best_mode": reward_best_mode,
+            "best_metric_value": best_reward_metric_value,
+            "checkpoint": str(best_reward_path),
+            "eval_metrics": reward_eval_info,
+            "before_after": before_after_summary(baseline_eval_info, reward_eval_info),
+            "best_row": best_reward_row,
+        },
     }
     dump_json(out_dir / "metrics.json", metrics_json)
 
@@ -1007,6 +1284,16 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         best_metric_name=best_metric_name,
         best_mode=best_mode,
     )
+    improved_reward = update_global_reward_best(
+        out_root,
+        out_dir,
+        best_reward_path,
+        reward_eval_info,
+        metrics_json,
+        run_info_path,
+        reward_metric_name=reward_best_metric_name,
+        reward_mode=reward_best_mode,
+    )
     print(f"Done. Outputs: {out_dir}", flush=True)
     print(
         f"Run full_eval_loss={eval_info.get('full_eval_loss', eval_info.get('eval_loss'))} "
@@ -1014,8 +1301,15 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         f"best_step={best_step} improved_global_best={improved}",
         flush=True,
     )
+    print(
+        f"Run reward_best {reward_best_metric_name}={metric_from_full_eval(reward_eval_info, reward_best_metric_name, reward_best_mode)} "
+        f"best_reward_step={best_reward_step} improved_root_best_reward={improved_reward}",
+        flush=True,
+    )
     if improved:
         print(f"Updated root global best files under: {out_root}", flush=True)
+    if improved_reward:
+        print(f"Updated root reward-best checkpoint: {out_root / 'best_reward.pth'}", flush=True)
     return out_dir
 
 def main():

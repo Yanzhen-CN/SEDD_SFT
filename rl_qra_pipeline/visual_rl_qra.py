@@ -3,10 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import re
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 
@@ -16,47 +14,11 @@ REPO_DIR = SCRIPT_DIR.parent
 DEFAULT_RUN_ROOT = SCRIPT_DIR / "modelparameter" / "rl_QRA"
 DEFAULT_OUT_DIR = SCRIPT_DIR / "visual" / "rl_QRA"
 
-
-ROLLOUT_METRICS = [
-    "loss",
-    "rollout_loss",
-    "rollout_reward",
-    "rollout_reward_min",
-    "rollout_reward_max",
-    "rollout_reward_std",
-    "rollout_entropy",
-    "rollout_logprob",
-    "rollout_anchor_loss",
-]
-EVAL_METRICS = [
-    # Dense mini-eval metrics.
-    "eval_loss",
-    "eval_rollout_loss",
-    "eval_rollout_reward",
-    "eval_rollout_reward_std",
-    "eval_rollout_entropy",
-    "eval_rollout_logprob",
-    "eval_rollout_anchor_loss",
-    "mini_best_metric_value",
-    "is_best_mini_eval",
-    # Sparse full-eval metrics.
-    "full_eval_loss",
-    "full_eval_rollout_loss",
-    "full_eval_rollout_reward",
-    "full_eval_rollout_reward_std",
-    "full_eval_rollout_entropy",
-    "full_eval_rollout_logprob",
-    "full_eval_rollout_anchor_loss",
-    "is_full_eval",
-    "best_metric_value",
-    "is_best_eval",
-]
-LEGACY_METRICS = [
-    "target_logp",
-    "model_reward",
-    "best_reward",
-    "reward_gap",
-    "candidate_entropy",
+LOSS_SERIES = ["loss", "eval_loss", "full_eval_loss"]
+REWARD_SERIES = ["rollout_reward", "eval_rollout_reward", "full_eval_rollout_reward", "reward_best_metric_value"]
+SUMMARY_KEYS = LOSS_SERIES + REWARD_SERIES + [
+    "rollout_anchor_loss", "eval_rollout_anchor_loss", "full_eval_rollout_anchor_loss",
+    "best_metric_value", "is_best_eval", "is_best_reward_eval",
 ]
 
 
@@ -76,239 +38,150 @@ def to_float(value: object) -> Optional[float]:
         return None
 
 
-def norm_answer(text: str) -> str:
-    s = str(text or "")
-    s = s.replace("[MASK]", "□")
-    s = s.replace("\\mathrm{~m}", "m").replace("\\mathrm{m}", "m")
-    s = s.replace("\\left", "").replace("\\right", "")
-    s = re.sub(r"\s+", "", s)
-    if len(s) > 1 and s[-1] in ".;":
-        s = s[:-1]
-    return s
-
-
-def plot_metric(rows: List[Dict[str, str]], metric: str, out_path: Path, title: str) -> bool:
-    xs: List[float] = []
-    ys: List[float] = []
-    for i, row in enumerate(rows):
-        y = to_float(row.get(metric))
-        if y is None:
+def collect_metric_files(run_root: Path) -> List[Tuple[str, Path]]:
+    files: List[Tuple[str, Path]] = []
+    # Root global-best curve copied from the selected run.
+    best = run_root / "best_metrics.csv"
+    if best.exists():
+        files.append(("global_best", best))
+    if run_root.exists():
+        for p in sorted(run_root.glob("*/metrics.csv")):
+            files.append((p.parent.name, p))
+        legacy = run_root / "runs"
+        if legacy.exists():
+            for p in sorted(legacy.glob("*/metrics.csv")):
+                files.append((p.parent.name, p))
+    seen = set()
+    out: List[Tuple[str, Path]] = []
+    for name, path in files:
+        rp = path.resolve()
+        if rp in seen:
             continue
-        x = to_float(row.get("step"))
-        xs.append(float(i if x is None else x))
-        ys.append(y)
-    if not ys:
-        return False
+        seen.add(rp)
+        out.append((name, path))
+    return out
+
+
+def plot_series(rows: List[Dict[str, str]], series_names: List[str], out_path: Path, title: str, ylabel: str) -> bool:
+    plotted = False
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(9, 5))
-    plt.plot(xs, ys, linewidth=1.2)
+    for metric in series_names:
+        xs: List[float] = []
+        ys: List[float] = []
+        for i, row in enumerate(rows):
+            y = to_float(row.get(metric))
+            if y is None:
+                continue
+            x = to_float(row.get("step"))
+            xs.append(float(i if x is None else x))
+            ys.append(y)
+        if ys:
+            plt.plot(xs, ys, linewidth=1.2, label=metric)
+            plotted = True
+    if not plotted:
+        plt.close()
+        return False
     plt.xlabel("step")
-    plt.ylabel(metric)
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=180)
-    plt.close()
-    return True
-
-
-def plot_multi_series(series: Dict[str, List[Tuple[float, float]]], out_path: Path, title: str, ylabel: str) -> bool:
-    series = {k: v for k, v in series.items() if v}
-    if not series:
-        return False
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(9, 5))
-    for label, pts in series.items():
-        pts = sorted(pts, key=lambda x: x[0])
-        plt.plot([x for x, _ in pts], [y for _, y in pts], linewidth=1.2, label=label)
-    plt.xlabel("generation step")
     plt.ylabel(ylabel)
     plt.title(title)
-    if len(series) <= 12:
-        plt.legend(fontsize=8)
+    plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
     plt.close()
     return True
 
 
-def summarize_metrics(path: Path) -> Dict[str, object]:
+def summarize_metric_file(run_name: str, path: Path) -> Dict[str, object]:
     rows = read_csv(path)
+    summary: Dict[str, object] = {"run": run_name, "metrics_path": str(path), "rows": len(rows), "run_dir": str(path.parent)}
     if not rows:
-        return {"metrics_path": str(path), "rows": 0}
-    tail = rows[-min(100, len(rows)) :]
-    summary: Dict[str, object] = {"run_dir": str(path.parent), "metrics_path": str(path), "rows": len(rows)}
-    for key in ROLLOUT_METRICS + EVAL_METRICS + LEGACY_METRICS:
-        vals = [to_float(row.get(key)) for row in tail]
+        return summary
+    tail = rows[-min(100, len(rows)):]
+    for key in SUMMARY_KEYS:
+        vals = [to_float(r.get(key)) for r in tail]
         vals = [v for v in vals if v is not None]
         if vals:
             summary[f"last100_{key}"] = sum(vals) / len(vals)
             summary[f"final_{key}"] = vals[-1]
-    eval_candidates = [path.parent / "eval.json"]
-    # For root/global-best metrics.csv, the final eval file is named best_eval.json.
+    # Add compact final json info if present.
+    json_candidates = []
     if path.name == "best_metrics.csv":
-        eval_candidates.insert(0, path.parent / "best_eval.json")
-    for eval_json in eval_candidates:
-        if not eval_json.exists():
+        json_candidates += [path.parent / "best_metrics.json", path.parent / "best_eval.json"]
+    json_candidates += [path.parent / "metrics.json", path.parent / "eval.json"]
+    for jp in json_candidates:
+        if not jp.exists():
             continue
         try:
-            obj = json.loads(eval_json.read_text(encoding="utf-8"))
-            if isinstance(obj, dict):
-                for key in [
-                    "eval_loss", "full_eval_loss", "eval_count", "eval_split", "eval_limit",
-                    "rollout_reward", "rollout_entropy", "best_step",
-                    "best_metric_name", "best_metric_value",
-                ]:
-                    if key in obj:
-                        summary[key] = obj[key]
-                break
+            obj = json.loads(jp.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            continue
+        if not isinstance(obj, dict):
+            continue
+        for key in ["eval_loss", "full_eval_loss", "eval_count", "eval_split", "best_metric_name", "best_metric_value"]:
+            if key in obj:
+                summary[key] = obj[key]
+        rb = obj.get("reward_best")
+        if isinstance(rb, dict):
+            summary["reward_best_metric_name"] = rb.get("best_metric_name")
+            summary["reward_best_metric_value"] = rb.get("best_metric_value")
+            summary["reward_best_eval_loss"] = rb.get("eval_loss")
+            summary["reward_best_rollout_reward"] = rb.get("rollout_reward")
+        break
     return summary
 
 
-def write_table(rows: List[Dict[str, object]], path: Path) -> None:
+def write_summary(rows: List[Dict[str, object]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    keys: List[str] = []
+    fields: List[str] = []
     for row in rows:
-        for key in row.keys():
-            if key not in keys:
-                keys.append(key)
+        for k in row.keys():
+            if k not in fields:
+                fields.append(k)
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def collect_metric_files(run_root: Path) -> List[Path]:
-    """Collect root global-best metrics and one-level per-run metrics.
-
-    Current training layout is:
-        run_root/
-          best_metrics.csv
-          <run_id>/metrics.csv
-
-    Older versions used run_root/runs/<run_id>/metrics.csv.  We keep a
-    compatibility fallback but do not require the extra runs/ directory.
-    """
-    files: List[Path] = []
-    best = run_root / "best_metrics.csv"
-    if best.exists():
-        files.append(best)
-    if run_root.exists():
-        files.extend(sorted(run_root.glob("*/metrics.csv")))
-        legacy_runs = run_root / "runs"
-        if legacy_runs.exists():
-            files.extend(sorted(legacy_runs.glob("*/metrics.csv")))
-    seen = set()
-    out = []
-    for p in files:
-        rp = p.resolve()
-        if rp not in seen:
-            out.append(p)
-            seen.add(rp)
-    return out
-
-
-def newest_sample_chain_dir(root: Path) -> Optional[Path]:
-    if not root.exists():
-        return None
-    candidates = [p for p in root.iterdir() if p.is_dir() and (p / "detail.csv").exists()]
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
-
-
-def read_chain_detail(chain_dir: Path) -> List[Dict[str, str]]:
-    return read_csv(chain_dir / "detail.csv")
-
-
-def aggregate_chain(rows: List[Dict[str, str]]) -> Tuple[Dict[str, List[Tuple[float, float]]], Dict[str, List[Tuple[float, float]]]]:
-    mask_values: Dict[Tuple[str, str, int], List[float]] = defaultdict(list)
-    exact_values: Dict[Tuple[str, str, int], List[float]] = defaultdict(list)
-    for row in rows:
-        dataset = row.get("dataset", "")
-        model = row.get("model", "")
-        step = to_float(row.get("step"))
-        if step is None:
-            continue
-        key = (dataset, model, int(step))
-        m = to_float(row.get("mask_count"))
-        if m is not None:
-            mask_values[key].append(m)
-        ans = norm_answer(row.get("answer", ""))
-        gt = norm_answer(row.get("gt_answer", ""))
-        if gt:
-            exact_values[key].append(1.0 if ans == gt else 0.0)
-    mask_series: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-    exact_series: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-    for (dataset, model, step), vals in mask_values.items():
-        mask_series[f"{dataset}/{model}"].append((float(step), sum(vals) / len(vals)))
-    for (dataset, model, step), vals in exact_values.items():
-        exact_series[f"{dataset}/{model}"].append((float(step), sum(vals) / len(vals)))
-    return dict(mask_series), dict(exact_series)
-
-
-def visualize_metrics(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
-    metric_files = collect_metric_files(run_root)
+def visualize(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
+    out_dir.mkdir(parents=True, exist_ok=True)
     summaries: List[Dict[str, object]] = []
-    for path in metric_files:
-        rows = read_csv(path)
-        run_name = "global_best" if path.name == "best_metrics.csv" else path.parent.name
-        summaries.append({"run": run_name, **summarize_metrics(path)})
-        for metric in ROLLOUT_METRICS + EVAL_METRICS + LEGACY_METRICS:
-            plot_metric(rows, metric, out_dir / "training" / run_name / f"{metric}.png", f"{run_name}: {metric}")
+    for run_name, metrics_path in collect_metric_files(run_root):
+        rows = read_csv(metrics_path)
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in run_name)[:160]
+        summaries.append(summarize_metric_file(run_name, metrics_path))
+        plot_series(rows, LOSS_SERIES, out_dir / f"{safe}_loss.png", f"{run_name}: loss curves", "loss")
+        plot_series(rows, REWARD_SERIES, out_dir / f"{safe}_reward.png", f"{run_name}: reward curves", "reward")
     def sort_key(row: Dict[str, object]):
-        for key in ("full_eval_loss", "eval_loss", "last100_full_eval_loss", "last100_eval_loss", "last100_loss", "final_loss"):
-            val = to_float(row.get(key))
-            if val is not None:
-                return val
+        for k in ("full_eval_loss", "last100_full_eval_loss", "eval_loss", "last100_eval_loss", "final_loss"):
+            v = to_float(row.get(k))
+            if v is not None:
+                return v
         return float("inf")
     summaries.sort(key=sort_key)
-    write_table(summaries, out_dir / "training_summary.csv")
+    write_summary(summaries, out_dir / "training_summary.csv")
     (out_dir / "training_summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "visual_summary.json").write_text(json.dumps({
+        "run_root": str(run_root),
+        "out_dir": str(out_dir),
+        "num_metric_runs": len(summaries),
+        "plots": "one *_loss.png and one *_reward.png per run/global_best",
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     return summaries
 
 
-def visualize_chain(chain_dir: Optional[Path], out_dir: Path) -> Dict[str, object]:
-    if chain_dir is None or not chain_dir.exists():
-        return {"chain_dir": str(chain_dir) if chain_dir else "", "rows": 0}
-    rows = read_chain_detail(chain_dir)
-    mask_series, exact_series = aggregate_chain(rows)
-    chain_out = out_dir / "sample_chain"
-    plot_multi_series(mask_series, chain_out / "mean_mask_count.png", "Sample chain: mean remaining mask count", "mean mask count")
-    plot_multi_series(exact_series, chain_out / "exact_rate_by_step.png", "Sample chain: exact answer rate by step", "exact rate")
-    summary = {"chain_dir": str(chain_dir), "rows": len(rows), "series": sorted(set(mask_series) | set(exact_series))}
-    (chain_out / "chain_visual_summary.json").parent.mkdir(parents=True, exist_ok=True)
-    (chain_out / "chain_visual_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return summary
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Visualize S1K rollout slot-alignment RL training metrics and sample-chain diagnostics.")
+    parser = argparse.ArgumentParser(description="Compact RL visualizer: only loss and reward curves.")
     parser.add_argument("--run-root", default=str(DEFAULT_RUN_ROOT), help="Usually rl_qra_pipeline/modelparameter/rl_QRA")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
-    parser.add_argument("--chain-dir", default="", help="Optional experiment/sample_chain/<run> directory. Default: latest under experiment/sample_chain.")
-    parser.add_argument("--no-chain", action="store_true")
     args = parser.parse_args()
-    run_root = Path(args.run_root)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    summaries = visualize_metrics(run_root, out_dir)
-    chain_summary = {"skipped": True}
-    if not args.no_chain:
-        chain_dir = Path(args.chain_dir) if args.chain_dir else newest_sample_chain_dir(REPO_DIR / "experiment" / "sample_chain")
-        chain_summary = visualize_chain(chain_dir, out_dir)
-
-    final = {"run_root": str(run_root), "out_dir": str(out_dir), "num_metric_runs": len(summaries), "chain": chain_summary}
-    (out_dir / "visual_summary.json").write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Wrote visuals to: {out_dir}")
-    print(f"Training runs visualized: {len(summaries)}")
-    if not args.no_chain:
-        print(f"Chain visualized: {chain_summary.get('chain_dir', '')}")
+    summaries = visualize(Path(args.run_root), Path(args.out_dir))
+    print(f"Wrote compact visuals to: {args.out_dir}")
+    print(f"Runs visualized: {len(summaries)}")
 
 
 if __name__ == "__main__":

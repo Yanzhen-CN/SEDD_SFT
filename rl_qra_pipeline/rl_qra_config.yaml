@@ -73,8 +73,15 @@ training:
   # full-evaluated once as a cheap safeguard against missing an in-between step.
   full_eval_every: 10
   full_eval_limit: all
+
+  # Conservative checkpoint: best.pth is chosen by full validation loss.
   best_metric: full_eval_loss
   best_mode: min
+
+  # RL/reward-oriented checkpoint: best_reward.pth is chosen by full validation
+  # rollout reward, which better reflects slot/type/format alignment.
+  best_reward_metric: full_eval_rollout_reward
+  best_reward_mode: max
 
 # Old/local RRPI fallback; kept so the same train script can still run rrpi mode.
 rrpi:

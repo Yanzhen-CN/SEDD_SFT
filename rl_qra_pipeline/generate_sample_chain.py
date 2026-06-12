@@ -1,33 +1,39 @@
 from __future__ import annotations
 
-"""Generate answer recovery chains for all eval models in rl_qra_config.yaml.
+"""Compare SEDD/QRA/RL answer-mask recovery chains.
 
-This is a diagnostic experiment script. It does NOT train and does NOT score.
-It only records how the answer segment changes during an answer-mask reverse chain.
+Default comparison models are exactly six:
+    pretrain_start, pretrain_loss_best, pretrain_reward_best,
+    QRA_start, QRA_loss_best, QRA_reward_best
+
+For each start family we compare: starting model, RL loss-best checkpoint,
+and RL reward-best checkpoint.  The reward-best checkpoint is best_reward.pth;
+if it is missing, the script falls back to the newest per-run last_run.pth and
+records that fallback in model_plan.json/run.log.
 
 Default output:
     experiment/sample_chain/<timestamp>_<run_name>/
-        chain.csv       # aligned by dataset/sample/step, one column pair per model
-        detail.csv      # long-form per dataset/sample/model/step
-        chain.md        # compact vertical view
-        summary.json
+        chain.csv                         # all samples / all models / all steps
+        chains/<sample_id>_chain.csv       # one CSV per sample, all models in that sample
+        run.log                           # terminal-style comparison log
+        sample_report.txt                 # question/reasoning/GT + final answer of every model
 
-By default the script reads config.eval.compare_models, or top-level
-compare_models, and falls back to {<start>_base, rl_<start>}. It also reads
-config.eval.datasets and config.eval.split, matching the eval script behavior.
+This script fixes question/reasoning/prompt positions and starts the answer segment as [MASK]
+(or □ in the visible output). It is a diagnostic chain generator for QRA-style answers.
 """
 
 import argparse
 import csv
 import datetime as dt
 import gc
+import hashlib
 import json
 import random
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import yaml
@@ -45,20 +51,25 @@ import noise_lib  # noqa: E402
 from model import SEDD  # noqa: E402
 from model.ema import ExponentialMovingAverage  # noqa: E402
 from answer_dataset import AnswerSegmentDataset, ordered_segments  # noqa: E402
-from state_builder import encode_sample, mask_id_from_graph, project_fixed_, transition_probs  # noqa: E402
-
-
-def make_t_grid(t_start: float = 0.95, t_end: float = 0.01, steps: int = 32) -> List[float]:
-    steps = int(steps)
-    t_start = float(t_start)
-    t_end = float(t_end)
-    if steps <= 0:
-        return [t_start]
-    dt = (t_start - t_end) / float(steps)
-    return [max(t_end, t_start - k * dt) for k in range(steps + 1)]
+from state_builder import (  # noqa: E402
+    encode_sample,
+    mask_id_from_graph,
+    project_fixed_,
+    transition_probs,
+)
 
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
+DEFAULT_MODELS = [
+    "pretrain_start",
+    "pretrain_loss_best",
+    "pretrain_reward_best",
+    "QRA_start",
+    "QRA_loss_best",
+    "QRA_reward_best",
+]
 
+
+# ----------------------------- basic utilities -----------------------------
 
 def load_config(path: str | Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
@@ -82,6 +93,11 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def stable_int(text: str, mod: int = 10_000_000) -> int:
+    h = hashlib.md5(text.encode("utf-8")).hexdigest()
+    return int(h[:12], 16) % mod
+
+
 def choose_device(args: argparse.Namespace, cfg: Dict[str, Any]) -> torch.device:
     if args.cpu or bool(cfg.get("cpu", False)) or not torch.cuda.is_available():
         return torch.device("cpu")
@@ -93,15 +109,45 @@ def choose_device(args: argparse.Namespace, cfg: Dict[str, Any]) -> torch.device
     return torch.device(f"cuda:{int(cfg_gpu)}")
 
 
-def split_cli_values(values):
-    out = []
-    for value in values or []:
-        for part in str(value).split(","):
-            part = part.strip()
-            if part:
-                out.append(part)
-    return out
+def normalize_text(x: str) -> str:
+    x = str(x or "")
+    x = x.replace("\\mathrm{~m}", " m")
+    x = x.replace("\\mathrm{m}", "m")
+    x = x.replace("\\left", "").replace("\\right", "")
+    x = re.sub(r"\s+", "", x)
+    if len(x) > 1 and x[-1] in ".;":
+        x = x[:-1]
+    return x.strip()
 
+
+def safe_name(text: str, fallback: str) -> str:
+    s = str(text or fallback)
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+    return s[:120] or fallback
+
+
+def short(s: str, n: int = 240) -> str:
+    s = str(s or "")
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+class TeeLogger:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(path, "w", encoding="utf-8")
+
+    def print(self, *args, **kwargs) -> None:
+        text = " ".join(str(a) for a in args)
+        print(text, **kwargs)
+        self.f.write(text + ("\n" if not text.endswith("\n") else ""))
+        self.f.flush()
+
+    def close(self) -> None:
+        self.f.close()
+
+
+# ---------------------------- config resolution ----------------------------
 
 def selected_start_name(cfg: Dict[str, Any], cli_start: Optional[str]) -> str:
     return str(cli_start or (cfg.get("run") or {}).get("selected") or cfg.get("selected") or "QRA")
@@ -111,85 +157,224 @@ def selected_start_cfg(cfg: Dict[str, Any], start_name: str) -> Dict[str, Any]:
     return ((cfg.get("starts") or {}).get(start_name) or {})
 
 
-def resolve_base_data_dir(cfg: Dict[str, Any], start_name: str) -> Path:
+def resolve_data_dir(cfg: Dict[str, Any], start_name: str) -> Path:
     data_cfg = cfg.get("data") or {}
     start_cfg = selected_start_cfg(cfg, start_name)
     data_dir = data_cfg.get("data_dir") or start_cfg.get("data_dir") or "rl_qra_pipeline/data/S1K_RL"
     return repo_path(data_dir)
 
 
-def resolve_dataset_path(cfg: Dict[str, Any], start_name: str, dataset_name: str, split: str) -> Path:
-    base = resolve_base_data_dir(cfg, start_name)
-    if dataset_name in {".", "current", base.name}:
-        return base / f"{split}.jsonl"
-    return base.parent / dataset_name / f"{split}.jsonl"
-
-
-def default_compare_models(cfg: Dict[str, Any], start_name: str) -> Dict[str, Dict[str, str]]:
+def start_output_dir(cfg: Dict[str, Any], start_name: str) -> Path:
     start_cfg = selected_start_cfg(cfg, start_name)
-    output_dir = start_cfg.get("output_dir", f"rl_qra_pipeline/modelparameter/rl_{start_name}")
-    compare: Dict[str, Dict[str, str]] = {}
-    init_ckpt = start_cfg.get("init_checkpoint") or f"rl_qra_pipeline/modelparameter/{start_name}/best.pth"
-    compare[f"{start_name}_base"] = {"checkpoint": str(init_ckpt)}
-    compare[f"rl_{start_name}"] = {"checkpoint": str(Path(output_dir) / "best.pth")}
-    return compare
+    return repo_path(start_cfg.get("output_dir", f"rl_qra_pipeline/modelparameter/rl_{start_name}"))
 
 
-def resolve_compare_models(args: argparse.Namespace, cfg: Dict[str, Any], start_name: str) -> Dict[str, Dict[str, str]]:
-    # Match eval config first: eval.compare_models is the intended location.
-    eval_cfg = cfg.get("eval") or {}
-    compare = eval_cfg.get("compare_models") or cfg.get("compare_models") or default_compare_models(cfg, start_name)
-    if not isinstance(compare, dict) or not compare:
-        compare = default_compare_models(cfg, start_name)
+def latest_run_checkpoint(run_root: Path, filename: str = "last_run.pth") -> Optional[Path]:
+    """Return the newest per-run checkpoint under rl_<start>/<run_id>/filename.
 
-    out: Dict[str, Dict[str, str]] = {}
-    for name, spec in compare.items():
-        cli_models = set(split_cli_values(args.models))
-        if cli_models and str(name) not in cli_models:
+    Root best.pth is intentionally not considered here.  This is for comparing
+    the validation-selected best checkpoint against the latest training-state
+    checkpoint from individual runs.
+    """
+    if not run_root.exists():
+        return None
+    candidates: List[Path] = []
+    for p in run_root.iterdir():
+        if not p.is_dir():
             continue
-        if isinstance(spec, dict):
-            ckpt = spec.get("checkpoint") or spec.get("path") or spec.get("ckpt")
+        ckpt = p / filename
+        if ckpt.exists():
+            candidates.append(ckpt)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+
+def init_checkpoint_path(cfg: Dict[str, Any], start_name: str) -> Optional[Path]:
+    start_cfg = selected_start_cfg(cfg, start_name)
+    value = start_cfg.get("init_checkpoint", "")
+    if value is None or str(value).strip().lower() in {"", "none", "null", "pretrained", "hf", "cache"}:
+        return None
+    path = repo_path(value)
+    return path if path.exists() else None
+
+
+def model_pretrained_name(cfg: Dict[str, Any], start_name: str = "pretrain") -> str:
+    start_cfg = selected_start_cfg(cfg, start_name)
+    return str(start_cfg.get("pretrained") or (cfg.get("model") or {}).get("pretrained") or "louaaron/sedd-medium")
+
+
+def reward_checkpoint_or_fallback(root: Path) -> Tuple[Optional[Path], str, Optional[str]]:
+    """Return root best_reward.pth, or newest run last_run.pth as fallback.
+
+    The fallback is only for old runs before reward-best recovery existed.
+    A warning string is returned so model_plan.json/run.log makes this explicit.
+    """
+    ckpt = root / "best_reward.pth"
+    if ckpt.exists():
+        return ckpt, "rl_root_best_reward", None
+    fallback = latest_run_checkpoint(root, "last_run.pth")
+    if fallback is not None:
+        return fallback, "latest_run_last_fallback_missing_best_reward", f"missing {ckpt}; fallback to newest run last_run.pth"
+    return None, "missing", f"missing {ckpt} and no */last_run.pth under {root}"
+
+
+def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return model specs with fields: name, checkpoint, pretrained, source.
+
+    The default comparison is exactly six models:
+      pretrain_start        = pretrained/cache SEDD start
+      pretrain_loss_best    = rl_pretrain/best.pth
+      pretrain_reward_best  = rl_pretrain/best_reward.pth
+      QRA_start             = starts.QRA.init_checkpoint
+      QRA_loss_best         = rl_QRA/best.pth
+      QRA_reward_best       = rl_QRA/best_reward.pth
+    """
+    if args.checkpoint:
+        return [{
+            "name": args.checkpoint_name or "model",
+            "checkpoint": repo_path(args.checkpoint),
+            "pretrained": model_pretrained_name(cfg, "pretrain"),
+            "source": "manual_checkpoint",
+        }]
+
+    requested = [x.strip() for x in str(args.models).split(",") if x.strip()]
+    specs: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    for raw_name in requested:
+        name = raw_name.strip()
+        name_l = name.lower()
+
+        # ----- pretrain family: start / loss-best / reward-best -----
+        if name_l in {"pretrain", "pretrain_start", "start_pretrain"}:
+            specs.append({
+                "name": "pretrain_start",
+                "checkpoint": None,
+                "pretrained": model_pretrained_name(cfg, "pretrain"),
+                "source": "start_pretrained_or_cache",
+            })
+            continue
+
+        if name_l in {"pretrain_loss_best", "pretrain_best", "rl_pretrain", "rl_pretrain_best"}:
+            ckpt = start_output_dir(cfg, "pretrain") / "best.pth"
+            if ckpt.exists():
+                specs.append({
+                    "name": "pretrain_loss_best",
+                    "checkpoint": ckpt,
+                    "pretrained": model_pretrained_name(cfg, "pretrain"),
+                    "source": "rl_root_loss_best",
+                })
+            else:
+                warnings.append(f"skip pretrain_loss_best: missing {ckpt}")
+            continue
+
+        if name_l in {"pretrain_reward_best", "pretrain_best_reward", "rl_pretrain_reward", "rl_pretrain_last"}:
+            root = start_output_dir(cfg, "pretrain")
+            ckpt, source, warning = reward_checkpoint_or_fallback(root)
+            if ckpt is not None:
+                specs.append({
+                    "name": "pretrain_reward_best",
+                    "checkpoint": ckpt,
+                    "pretrained": model_pretrained_name(cfg, "pretrain"),
+                    "source": source,
+                })
+            warnings.append(f"pretrain_reward_best: {warning}" if warning else "")
+            continue
+
+        # ----- QRA family: start / loss-best / reward-best -----
+        if name_l in {"qra", "qra_start", "start_qra"}:
+            ckpt = init_checkpoint_path(cfg, "QRA")
+            if ckpt is not None:
+                specs.append({
+                    "name": "QRA_start",
+                    "checkpoint": ckpt,
+                    "pretrained": model_pretrained_name(cfg, "QRA"),
+                    "source": "start_init_checkpoint",
+                })
+            else:
+                warnings.append("skip QRA_start: starts.QRA.init_checkpoint missing or not found")
+            continue
+
+        if name_l in {"qra_loss_best", "qra_best", "rl_qra", "rl_qra_best"}:
+            ckpt = start_output_dir(cfg, "QRA") / "best.pth"
+            if ckpt.exists():
+                specs.append({
+                    "name": "QRA_loss_best",
+                    "checkpoint": ckpt,
+                    "pretrained": model_pretrained_name(cfg, "QRA"),
+                    "source": "rl_root_loss_best",
+                })
+            else:
+                warnings.append(f"skip QRA_loss_best: missing {ckpt}")
+            continue
+
+        if name_l in {"qra_reward_best", "qra_best_reward", "rl_qra_reward", "rl_qra_last"}:
+            root = start_output_dir(cfg, "QRA")
+            ckpt, source, warning = reward_checkpoint_or_fallback(root)
+            if ckpt is not None:
+                specs.append({
+                    "name": "QRA_reward_best",
+                    "checkpoint": ckpt,
+                    "pretrained": model_pretrained_name(cfg, "QRA"),
+                    "source": source,
+                })
+            warnings.append(f"QRA_reward_best: {warning}" if warning else "")
+            continue
+
+        # ----- optional QA aliases kept for manual calls -----
+        if name_l in {"qa", "qa_start"}:
+            ckpt = init_checkpoint_path(cfg, "QA")
+            if ckpt is not None:
+                specs.append({"name": "QA_start", "checkpoint": ckpt, "pretrained": model_pretrained_name(cfg, "QA"), "source": "start_init_checkpoint"})
+            else:
+                warnings.append("skip QA_start: starts.QA.init_checkpoint missing or not found")
+            continue
+
+        if name_l in {"qa_loss_best", "qa_best", "rl_qa", "rl_qa_best"}:
+            ckpt = start_output_dir(cfg, "QA") / "best.pth"
+            if ckpt.exists():
+                specs.append({"name": "QA_loss_best", "checkpoint": ckpt, "pretrained": model_pretrained_name(cfg, "QA"), "source": "rl_root_loss_best"})
+            else:
+                warnings.append(f"skip QA_loss_best: missing {ckpt}")
+            continue
+
+        if name_l in {"qa_reward_best", "qa_best_reward", "rl_qa_reward", "rl_qa_last"}:
+            root = start_output_dir(cfg, "QA")
+            ckpt, source, warning = reward_checkpoint_or_fallback(root)
+            if ckpt is not None:
+                specs.append({"name": "QA_reward_best", "checkpoint": ckpt, "pretrained": model_pretrained_name(cfg, "QA"), "source": source})
+            warnings.append(f"QA_reward_best: {warning}" if warning else "")
+            continue
+
+        # Treat as label:path for a custom checkpoint.
+        if ":" in name:
+            label, raw_path = name.split(":", 1)
+            ckpt = repo_path(raw_path)
+            if ckpt.exists():
+                specs.append({"name": label, "checkpoint": ckpt, "pretrained": model_pretrained_name(cfg), "source": "custom"})
+            else:
+                warnings.append(f"skip {label}: missing {ckpt}")
         else:
-            ckpt = str(spec)
-        if not ckpt:
-            continue
-        out[str(name)] = {"checkpoint": str(ckpt)}
-    if not out:
-        raise RuntimeError("No compare models selected from config.eval.compare_models / compare_models.")
-    return out
+            warnings.append(f"skip unknown model spec: {name}")
+
+    for w in warnings:
+        if w:
+            print(f"[warn] {w}", flush=True)
+    if not specs:
+        raise FileNotFoundError("No model checkpoints/pretrained specs available. Check root best.pth/best_reward.pth files or pass --checkpoint.")
+    return specs
 
 
-def resolve_eval_datasets(args: argparse.Namespace, cfg: Dict[str, Any], start_name: str) -> List[str]:
-    cli_datasets = split_cli_values(args.datasets)
-    if cli_datasets:
-        return cli_datasets
-    eval_cfg = cfg.get("eval") or {}
-    base = resolve_base_data_dir(cfg, start_name)
-    return list(eval_cfg.get("datasets") or [base.name])
-
-
-def normalize_text(x: str) -> str:
-    x = str(x or "")
-    x = x.replace("\\mathrm{~m}", " m").replace("\\mathrm{m}", "m")
-    x = x.replace("\\left", "").replace("\\right", "")
-    x = re.sub(r"\s+", " ", x).strip()
-    if len(x) > 1 and x[-1] in ".;":
-        x = x[:-1].strip()
-    return x
-
+# ------------------------------ sample helpers -----------------------------
 
 def get_segment_text(sample: Dict[str, Any], names: Sequence[str]) -> str:
     segs = sample.get("segments") or {}
-    if isinstance(segs, dict):
-        for name in names:
-            if name in segs:
-                seg = segs[name]
-                if isinstance(seg, dict):
-                    txt = str(seg.get("text", ""))
-                else:
-                    txt = str(seg)
-                if txt.strip():
-                    return txt.strip()
+    for name in names:
+        if name in segs and isinstance(segs[name], dict):
+            text = str(segs[name].get("text", ""))
+            if text.strip():
+                return text.strip()
     return ""
 
 
@@ -197,15 +382,33 @@ def extract_gt_answer(sample: Dict[str, Any]) -> str:
     for key in ("answer", "solution", "final_answer", "target"):
         val = sample.get(key)
         if val is not None and str(val).strip():
-            return normalize_text(str(val))
+            return str(val).strip()
     text = get_segment_text(sample, ["answer", "final_answer", "target"])
     if text:
-        return normalize_text(text)
+        return text.strip()
     train_parts = []
     for _, seg in ordered_segments(sample):
         if isinstance(seg, dict) and bool(seg.get("train", False)):
             train_parts.append(str(seg.get("text", "")))
-    return normalize_text("".join(train_parts)) if train_parts else ""
+    if train_parts:
+        return "".join(train_parts).strip()
+    return ""
+
+
+def extract_question_reasoning(sample: Dict[str, Any]) -> Tuple[str, str]:
+    q = sample.get("question") or get_segment_text(sample, ["user", "question", "prompt"])
+    r = sample.get("reasoning") or get_segment_text(sample, ["reasoning", "rationale", "thinking"])
+    if not r:
+        pieces = []
+        for name, seg in ordered_segments(sample):
+            name_l = str(name).lower()
+            if "answer" in name_l:
+                break
+            text = str(seg.get("text", "")) if isinstance(seg, dict) else ""
+            if "reason" in name_l or "assistant" in name_l:
+                pieces.append(text)
+        r = "".join(pieces).strip()
+    return str(q or "").strip(), str(r or "").strip()
 
 
 def answer_kind(answer: str) -> str:
@@ -228,15 +431,17 @@ def answer_kind(answer: str) -> str:
     return "short_text"
 
 
-def load_samples(cfg: Dict[str, Any], start_name: str, dataset_name: str, split: str, tokenizer) -> List[Dict[str, Any]]:
-    path = resolve_dataset_path(cfg, start_name, dataset_name, split)
+def load_samples(cfg: Dict[str, Any], start_name: str, split: str, tokenizer) -> List[Dict[str, Any]]:
+    data_dir = resolve_data_dir(cfg, start_name)
+    path = data_dir / f"{split}.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"Data split not found: {path}")
     model_cfg = cfg.get("model") or {}
+    max_len = int(model_cfg.get("max_length", 1024))
     ds = AnswerSegmentDataset(
         path,
         tokenizer,
-        int(model_cfg.get("max_length", 1024)),
+        max_len,
         min_target_tokens=int(model_cfg.get("min_target_tokens", 1)),
         drop_overlength=bool(model_cfg.get("drop_overlength", True)),
         write_report=False,
@@ -244,7 +449,12 @@ def load_samples(cfg: Dict[str, Any], start_name: str, dataset_name: str, split:
     return ds.samples
 
 
-def pick_diverse_samples(samples: List[Dict[str, Any]], sample_ids: Sequence[str], num_samples: int, per_type: int) -> List[Dict[str, Any]]:
+def pick_diverse_samples(
+    samples: List[Dict[str, Any]],
+    sample_ids: Sequence[str],
+    num_samples: int,
+    per_type: int,
+) -> List[Dict[str, Any]]:
     if sample_ids:
         wanted = set(sample_ids)
         chosen = [s for s in samples if str(s.get("id", "")) in wanted]
@@ -255,7 +465,8 @@ def pick_diverse_samples(samples: List[Dict[str, Any]], sample_ids: Sequence[str
 
     buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for s in samples:
-        buckets[answer_kind(extract_gt_answer(s))].append(s)
+        ans = extract_gt_answer(s)
+        buckets[answer_kind(ans)].append(s)
 
     priority = ["interval", "equation", "unit_decimal", "symbolic", "decimal", "integer", "letter", "short_text"]
     chosen: List[Dict[str, Any]] = []
@@ -268,6 +479,7 @@ def pick_diverse_samples(samples: List[Dict[str, Any]], sample_ids: Sequence[str
                 seen.add(sid)
             if len(chosen) >= num_samples:
                 return chosen
+
     for s in samples:
         sid = str(s.get("id", id(s)))
         if sid not in seen:
@@ -278,30 +490,36 @@ def pick_diverse_samples(samples: List[Dict[str, Any]], sample_ids: Sequence[str
     return chosen
 
 
-def load_model_for_trace(cfg: Dict[str, Any], checkpoint: Path, device: torch.device):
+# ------------------------------- model load --------------------------------
+
+def load_model_for_trace(cfg: Dict[str, Any], spec: Dict[str, Any], device: torch.device):
     model_cfg = cfg.get("model") or {}
     training_cfg = cfg.get("training") or {}
-    pretrained = model_cfg.get("pretrained", "louaaron/sedd-medium")
+    pretrained = str(spec.get("pretrained") or model_cfg.get("pretrained") or "louaaron/sedd-medium")
     model = SEDD.from_pretrained(pretrained).to(device)
     model.config.model.length = int(model_cfg.get("max_length", getattr(model.config.model, "length", 1024)))
 
-    state = torch.load(checkpoint, map_location=device)
-    if isinstance(state, dict) and "model" in state:
-        model_state = state["model"]
-    elif isinstance(state, dict) and "model_state_dict" in state:
-        model_state = state["model_state_dict"]
-    else:
-        model_state = state
-    model.load_state_dict(model_state, strict=True)
+    checkpoint = spec.get("checkpoint")
+    if checkpoint is not None:
+        checkpoint = Path(checkpoint)
+        state = torch.load(checkpoint, map_location=device)
+        if isinstance(state, dict) and "model" in state:
+            model_state = state["model"]
+        elif isinstance(state, dict) and "model_state_dict" in state:
+            model_state = state["model_state_dict"]
+        else:
+            model_state = state
+        model.load_state_dict(model_state, strict=True)
 
-    if isinstance(state, dict) and "ema" in state:
-        try:
-            ema = ExponentialMovingAverage(model.parameters(), decay=float(training_cfg.get("ema", 0.9999)))
-            ema.load_state_dict(state["ema"])
-            ema.store(model.parameters())
-            ema.copy_to(model.parameters())
-        except Exception as exc:
-            print(f"[warn] failed to apply EMA from {checkpoint}: {exc}", flush=True)
+        # Use EMA weights if available, same as eval/training convention.
+        if isinstance(state, dict) and "ema" in state:
+            try:
+                ema = ExponentialMovingAverage(model.parameters(), decay=float(training_cfg.get("ema", 0.9999)))
+                ema.load_state_dict(state["ema"])
+                ema.store(model.parameters())
+                ema.copy_to(model.parameters())
+            except Exception as exc:
+                print(f"[warn] failed to apply EMA from {checkpoint}: {exc}", flush=True)
 
     graph = graph_lib.get_graph(model.config, device)
     noise = noise_lib.get_noise(model.config).to(device)
@@ -309,14 +527,16 @@ def load_model_for_trace(cfg: Dict[str, Any], checkpoint: Path, device: torch.de
     return model, graph, noise
 
 
+# ------------------------------- trace score -------------------------------
+
 def visible_answer_tokens(tokenizer, ids: Sequence[int], mask_id: int, vocab_size: int) -> Tuple[str, List[str]]:
-    pieces: List[str] = []
-    token_texts: List[str] = []
+    pieces = []
+    token_texts = []
     for tok in ids:
         ti = int(tok)
         if ti == int(mask_id) or ti < 0 or ti >= vocab_size:
-            pieces.append("[MASK]")
-            token_texts.append("[MASK]")
+            pieces.append("□")
+            token_texts.append("□")
         else:
             txt = tokenizer.decode([ti])
             pieces.append(txt)
@@ -324,7 +544,56 @@ def visible_answer_tokens(tokenizer, ids: Sequence[int], mask_id: int, vocab_siz
     return "".join(pieces), token_texts
 
 
-def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg: Dict[str, Any], device: torch.device, args: argparse.Namespace, model_name: str, dataset_name: str) -> Dict[str, Any]:
+def score_state(curr_ids: Sequence[int], gt_ids: Sequence[int], mask_id: int, t_value: float) -> Dict[str, float]:
+    n = max(1, len(gt_ids))
+    curr = [int(x) for x in curr_ids[: len(gt_ids)]]
+    gt = [int(x) for x in gt_ids]
+    mask_count = sum(1 for x in curr if x == mask_id or x < 0)
+    filled = len(curr) - mask_count
+    pos_match = sum(1 for x, y in zip(curr, gt) if x == y) / n
+
+    gt_counter = Counter(gt)
+    overlap = 0
+    for x in curr:
+        if x == mask_id or x < 0:
+            continue
+        if gt_counter[x] > 0:
+            overlap += 1
+            gt_counter[x] -= 1
+    token_set = overlap / n
+    exact = 1.0 if len(curr) == len(gt) and all(x == y for x, y in zip(curr, gt)) else 0.0
+    fill_ratio = filled / n
+
+    if t_value > 0.70:
+        total = 0.45 * token_set + 0.30 * fill_ratio + 0.20 * pos_match + 0.05 * exact
+    elif t_value > 0.30:
+        total = 0.35 * pos_match + 0.35 * token_set + 0.20 * fill_ratio + 0.10 * exact
+    else:
+        total = 0.50 * exact + 0.30 * pos_match + 0.15 * token_set + 0.05 * fill_ratio
+
+    return {
+        "mask_count": float(mask_count),
+        "filled_ratio": float(fill_ratio),
+        "position_match": float(pos_match),
+        "token_set_match": float(token_set),
+        "exact_token_match": float(exact),
+        "stage_score": float(total),
+    }
+
+
+# ------------------------------- trace core --------------------------------
+
+def trace_one_sample(
+    model,
+    graph,
+    noise,
+    tokenizer,
+    sample: Dict[str, Any],
+    cfg: Dict[str, Any],
+    device: torch.device,
+    args: argparse.Namespace,
+    model_name: str,
+) -> Dict[str, Any]:
     model_cfg = cfg.get("model") or {}
     max_length = int(model_cfg.get("max_length", 1024))
     encoded = encode_sample(sample, tokenizer, max_length, tokenizer.eos_token_id)
@@ -334,7 +603,9 @@ def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg
 
     mask_id = int(mask_id_from_graph(graph))
     vocab_size = int(getattr(tokenizer, "vocab_size", 50257))
+    gt_ids = [int(encoded.ids[p]) for p in answer_pos]
     gt_answer = extract_gt_answer(sample)
+    question, reasoning = extract_question_reasoning(sample)
 
     x = torch.tensor([encoded.ids], dtype=torch.long, device=device)
     x[:, answer_pos] = mask_id
@@ -343,38 +614,42 @@ def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg
     num_steps = int(args.steps)
     t_start = float(args.t_start)
     t_end = float(args.t_end)
-    t_grid = make_t_grid(t_start=t_start, t_end=t_end, steps=num_steps)
+    dt_step = (t_start - t_end) / max(1, num_steps)
+    transition_kind = str(args.transition_kind)
 
-    rows: List[Dict[str, Any]] = []
-    prev_token_texts: Optional[List[str]] = None
-    prev_ids = [int(x[0, p].item()) for p in answer_pos]
+    trace_rows: List[Dict[str, Any]] = []
+    prev_score = None
+    prev_answer_ids = [int(x[0, p].item()) for p in answer_pos]
 
     with torch.no_grad():
         for step in range(num_steps + 1):
-            t_val = float(t_grid[step])
+            t_val = max(t_end, t_start - step * dt_step)
             curr_ids = [int(x[0, p].item()) for p in answer_pos]
             ans_text, token_texts = visible_answer_tokens(tokenizer, curr_ids, mask_id, vocab_size)
-            changed = [i for i, (a, b) in enumerate(zip(prev_ids, curr_ids)) if a != b]
-            rows.append({
-                "dataset": dataset_name,
+            score = score_state(curr_ids, gt_ids, mask_id, t_val)
+            score_delta = 0.0 if prev_score is None else score["stage_score"] - prev_score
+            changed = [i for i, (a, b) in enumerate(zip(prev_answer_ids, curr_ids)) if a != b]
+
+            record: Dict[str, Any] = {
                 "model": model_name,
-                "sample_id": str(sample.get("id", "")),
+                "sample_id": sample.get("id", ""),
                 "answer_kind": answer_kind(gt_answer),
-                "gt_answer": gt_answer,
                 "step": int(step),
                 "t": float(t_val),
                 "answer_text": ans_text,
                 "answer_token_texts": token_texts,
                 "answer_token_ids": curr_ids,
-                "mask_count": sum(1 for z in curr_ids if int(z) == mask_id or int(z) < 0),
+                "gt_answer": gt_answer,
+                "gt_answer_token_ids": gt_ids,
                 "changed_answer_indices": changed,
-            })
+                "stage_score_delta": float(score_delta),
+                **score,
+            }
+            trace_rows.append(record)
 
             if step == num_steps:
                 break
 
-            t_next = float(t_grid[step + 1])
-            dt_step = max(0.0, float(t_val) - float(t_next))
             t_tensor = torch.tensor([t_val], dtype=torch.float32, device=device)
             probs = transition_probs(
                 model,
@@ -383,20 +658,21 @@ def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg
                 x,
                 t_tensor,
                 dt_step,
-                kind=str(args.transition_kind),
+                kind=transition_kind,
                 train=False,
                 fixed_locs=encoded.layout.fixed_locs,
                 fixed_ids=encoded.layout.fixed_ids.to(device),
             )
 
-            prev_ids = curr_ids
-            prev_token_texts = token_texts
+            prev_score = score["stage_score"]
+            prev_answer_ids = curr_ids
 
             if args.mode == "greedy":
                 next_x = probs.argmax(dim=-1)
             else:
                 flat = probs.view(-1, probs.shape[-1])
-                next_x = torch.multinomial(flat.float().clamp_min(0.0), num_samples=1).view_as(x)
+                sampled = torch.multinomial(flat.float().clamp_min(0.0), num_samples=1).view_as(x)
+                next_x = sampled
 
             if args.freeze_filled:
                 keep = torch.zeros_like(x, dtype=torch.bool)
@@ -408,308 +684,309 @@ def trace_one_sample(model, graph, noise, tokenizer, sample: Dict[str, Any], cfg
             project_fixed_(x, encoded.layout.fixed_locs, encoded.layout.fixed_ids.to(device))
 
     return {
-        "dataset": dataset_name,
         "model": model_name,
-        "sample_id": str(sample.get("id", "")),
+        "sample_id": sample.get("id", ""),
         "answer_kind": answer_kind(gt_answer),
+        "question": question,
+        "reasoning": reasoning,
         "gt_answer": gt_answer,
+        "answer_positions": answer_pos,
+        "mask_id": mask_id,
         "num_steps": num_steps,
+        "t_start": t_start,
+        "t_end": t_end,
         "mode": args.mode,
         "freeze_filled": bool(args.freeze_filled),
-        "trace": rows,
+        "trace": trace_rows,
     }
 
 
-def clean_chain_text(text: str) -> str:
-    return str(text or "").replace("[MASK]", "□").replace("\n", "\\n")
+# ------------------------------- output helpers -----------------------------
+
+CHAIN_FIELDS = [
+    "sample_index",
+    "sample_id",
+    "answer_kind",
+    "model",
+    "step",
+    "t",
+    "answer",
+    "gt_answer",
+    "exact_text_match",
+    "exact_token_match",
+    "mask_count",
+    "filled_ratio",
+    "position_match",
+    "token_set_match",
+    "stage_score",
+    "stage_score_delta",
+    "changed_answer_indices",
+    "answer_token_texts",
+    "answer_token_ids",
+    "gt_answer_token_ids",
+]
 
 
-def token_for_display(tok: str) -> str:
-    tok = str(tok or "")
-    tok = tok.replace("[MASK]", "□").replace("\n", "\\n")
-    return tok if tok else "∅"
-
-
-def change_string(prev_tokens: Optional[Sequence[str]], curr_tokens: Sequence[str]) -> str:
-    if prev_tokens is None:
-        return ""
-    changes: List[str] = []
-    n = max(len(prev_tokens), len(curr_tokens))
-    for i in range(n):
-        a = prev_tokens[i] if i < len(prev_tokens) else ""
-        b = curr_tokens[i] if i < len(curr_tokens) else ""
-        if a != b:
-            changes.append(f"{i}:{token_for_display(a)}→{token_for_display(b)}")
-    return ";".join(changes)
-
-
-def compact_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    prev_tokens: Optional[List[str]] = None
-    for row in result.get("trace", []):
-        toks = list(row.get("answer_token_texts") or [])
+def result_to_chain_rows(result: Dict[str, Any], sample_index: int) -> List[Dict[str, Any]]:
+    rows = []
+    gt_norm = normalize_text(result.get("gt_answer", ""))
+    for tr in result.get("trace", []):
+        ans = str(tr.get("answer_text", ""))
         rows.append({
-            "dataset": str(result.get("dataset", "")),
-            "sample_id": str(result.get("sample_id", "")),
-            "model": str(result.get("model", "")),
-            "answer_kind": str(result.get("answer_kind", "")),
-            "gt_answer": str(result.get("gt_answer", "")),
-            "step": int(row.get("step", 0)),
-            "t": float(row.get("t", 0.0)),
-            "answer": clean_chain_text(row.get("answer_text", "")),
-            "change": change_string(prev_tokens, toks),
-            "mask_count": int(row.get("mask_count", 0)),
-            "changed_answer_indices": ";".join(map(str, row.get("changed_answer_indices", []))),
-            "answer_token_ids": " ".join(map(str, row.get("answer_token_ids", []))),
-            "answer_token_texts": " | ".join(token_for_display(t) for t in toks),
+            "sample_index": sample_index,
+            "sample_id": result.get("sample_id", ""),
+            "answer_kind": result.get("answer_kind", ""),
+            "model": result.get("model", ""),
+            "step": tr.get("step"),
+            "t": f"{float(tr.get('t', 0.0)):.6f}",
+            "answer": ans,
+            "gt_answer": result.get("gt_answer", ""),
+            "exact_text_match": 1 if normalize_text(ans) == gt_norm else 0,
+            "exact_token_match": int(float(tr.get("exact_token_match", 0.0))),
+            "mask_count": int(float(tr.get("mask_count", 0.0))),
+            "filled_ratio": f"{float(tr.get('filled_ratio', 0.0)):.6f}",
+            "position_match": f"{float(tr.get('position_match', 0.0)):.6f}",
+            "token_set_match": f"{float(tr.get('token_set_match', 0.0)):.6f}",
+            "stage_score": f"{float(tr.get('stage_score', 0.0)):.6f}",
+            "stage_score_delta": f"{float(tr.get('stage_score_delta', 0.0)):.6f}",
+            "changed_answer_indices": json.dumps(tr.get("changed_answer_indices", []), ensure_ascii=False),
+            "answer_token_texts": json.dumps(tr.get("answer_token_texts", []), ensure_ascii=False),
+            "answer_token_ids": json.dumps(tr.get("answer_token_ids", []), ensure_ascii=False),
+            "gt_answer_token_ids": json.dumps(tr.get("gt_answer_token_ids", []), ensure_ascii=False),
         })
-        prev_tokens = toks
     return rows
 
 
-def write_detail_csv(path: Path, results: List[Dict[str, Any]]) -> None:
-    fieldnames = [
-        "dataset", "sample_id", "model", "gt_answer", "answer_kind", "step", "t",
-        "answer", "change", "mask_count", "changed_answer_indices", "answer_token_ids", "answer_token_texts",
-    ]
+def write_csv(path: Path, rows: List[Dict[str, Any]], fields: Sequence[str] = CHAIN_FIELDS) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=list(fields))
         writer.writeheader()
-        for res in results:
-            if "trace" not in res:
-                continue
-            for r in compact_rows(res):
-                out = {k: r.get(k, "") for k in fieldnames}
-                out["t"] = f"{float(out['t']):.4f}"
-                writer.writerow(out)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
 
 
-def write_chain_csv(path: Path, results: List[Dict[str, Any]]) -> None:
-    compact: List[Dict[str, Any]] = []
-    model_order: List[str] = []
-    for res in results:
-        if "trace" not in res:
-            continue
-        m = str(res.get("model", ""))
-        if m not in model_order:
-            model_order.append(m)
-        compact.extend(compact_rows(res))
-
-    grouped: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
-    meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    for r in compact:
-        dataset = r["dataset"]
-        sid = r["sample_id"]
-        step = int(r["step"])
-        key = (dataset, sid, step)
-        if key not in grouped:
-            grouped[key] = {"dataset": dataset, "sample_id": sid, "step": step, "t": f"{float(r['t']):.4f}"}
-        meta.setdefault((dataset, sid), {"gt_answer": r["gt_answer"], "answer_kind": r["answer_kind"]})
-        m = r["model"]
-        grouped[key][f"{m}_answer"] = r["answer"]
-        grouped[key][f"{m}_change"] = r["change"]
-
-    fieldnames = ["dataset", "sample_id", "gt_answer", "answer_kind", "step", "t"]
-    for m in model_order:
-        fieldnames += [f"{m}_answer", f"{m}_change"]
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for (dataset, sid, step), row in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
-            out = {k: "" for k in fieldnames}
-            out.update(row)
-            out.update(meta.get((dataset, sid), {}))
-            writer.writerow(out)
+def final_answer(result: Dict[str, Any]) -> str:
+    trace = result.get("trace") or []
+    if not trace:
+        return ""
+    return str(trace[-1].get("answer_text", ""))
 
 
-def write_chain_md(path: Path, results: List[Dict[str, Any]]) -> None:
-    by_sample: Dict[Tuple[str, str], Dict[str, Dict[int, Dict[str, Any]]]] = defaultdict(lambda: defaultdict(dict))
-    model_order: List[str] = []
-    meta: Dict[Tuple[str, str], Dict[str, str]] = {}
-    for res in results:
-        if "trace" not in res:
-            continue
-        dataset = str(res.get("dataset", ""))
-        sid = str(res.get("sample_id", ""))
-        m = str(res.get("model", ""))
-        if m not in model_order:
-            model_order.append(m)
-        meta.setdefault((dataset, sid), {"gt_answer": str(res.get("gt_answer", "")), "answer_kind": str(res.get("answer_kind", ""))})
-        for r in compact_rows(res):
-            by_sample[(dataset, sid)][m][int(r["step"])] = r
+def final_exact(result: Dict[str, Any]) -> bool:
+    return normalize_text(final_answer(result)) == normalize_text(str(result.get("gt_answer", "")))
 
+
+def write_sample_report(path: Path, sample_order: List[Dict[str, Any]], results_by_sample: Dict[str, Dict[str, Dict[str, Any]]], model_names: List[str]) -> None:
     lines: List[str] = []
-    for key in sorted(by_sample.keys()):
-        dataset, sid = key
-        mta = meta.get(key, {})
-        lines.append(f"## {dataset} / {sid}")
-        lines.append(f"GT: `{mta.get('gt_answer', '')}`")
-        lines.append("")
-        header = "| step | t | " + " | ".join([f"{m} | Δ" for m in model_order]) + " |"
-        sep = "|---:|---:|" + "|".join(["---|---" for _ in model_order]) + "|"
-        lines.append(header)
-        lines.append(sep)
-        steps = sorted({st for m in model_order for st in by_sample[key].get(m, {}).keys()})
-        for st in steps:
-            first = None
-            for m in model_order:
-                first = by_sample[key].get(m, {}).get(st)
-                if first:
-                    break
-            t = f"{float(first['t']):.3f}" if first else ""
-            cells = [str(st), t]
-            for m in model_order:
-                r = by_sample[key].get(m, {}).get(st)
-                if r:
-                    ans = str(r["answer"]).replace("|", "\\|")
-                    chg = str(r["change"]).replace("|", "\\|")
-                    cells += [f"`{ans}`", chg]
-                else:
-                    cells += ["", ""]
-            lines.append("| " + " | ".join(cells) + " |")
+    for idx, sample in enumerate(sample_order, start=1):
+        sid = str(sample.get("id", ""))
+        q, r = extract_question_reasoning(sample)
+        gt = extract_gt_answer(sample)
+        lines.append(f"sample{idx}:")
+        lines.append(f"id: {sid}")
+        lines.append("question:")
+        lines.append(q)
+        lines.append("reasoning:")
+        lines.append(r)
+        lines.append("answer:")
+        lines.append(gt)
+        for model_name in model_names:
+            res = results_by_sample.get(sid, {}).get(model_name)
+            if not res:
+                lines.append(f"{model_name}:")
+                lines.append("<missing>")
+            elif "error" in res:
+                lines.append(f"{model_name}:")
+                lines.append(f"ERROR: {res.get('error')}")
+            else:
+                ans = final_answer(res)
+                mark = "✓" if final_exact(res) else "✗"
+                lines.append(f"{model_name}:")
+                lines.append(f"{ans}    [{mark}]")
         lines.append("")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def log_sample_comparison(logger: TeeLogger, idx: int, sample: Dict[str, Any], results_by_model: Dict[str, Dict[str, Any]], model_names: List[str]) -> None:
+    sid = str(sample.get("id", ""))
+    gt = extract_gt_answer(sample)
+    kind = answer_kind(gt)
+    q, _ = extract_question_reasoning(sample)
+    logger.print("=" * 88)
+    logger.print(f"sample {idx} | id={sid} | kind={kind}")
+    logger.print(f"GT: {gt!r}")
+    if q:
+        logger.print(f"Q: {short(q, 220)}")
+    logger.print("final answers:")
+    for model_name in model_names:
+        res = results_by_model.get(model_name)
+        if not res:
+            logger.print(f"  {model_name:22s}: <missing>")
+        elif "error" in res:
+            logger.print(f"  {model_name:22s}: ERROR {res.get('error')}")
+        else:
+            ans = final_answer(res)
+            mark = "OK" if final_exact(res) else "--"
+            tr = res.get("trace") or []
+            final_row = tr[-1] if tr else {}
+            logger.print(
+                f"  {model_name:22s}: {ans!r} | {mark} | "
+                f"mask={int(float(final_row.get('mask_count', 0)))} "
+                f"pos={float(final_row.get('position_match', 0.0)):.3f} "
+                f"tok={float(final_row.get('token_set_match', 0.0)):.3f}"
+            )
+
+
+def log_overall_summary(logger: TeeLogger, model_names: List[str], results_by_sample: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
+    logger.print("=" * 88)
+    logger.print("overall final exact summary")
+    for model_name in model_names:
+        total = 0
+        exact = 0
+        avg_mask = 0.0
+        for sample_results in results_by_sample.values():
+            res = sample_results.get(model_name)
+            if not res or "trace" not in res:
+                continue
+            total += 1
+            exact += int(final_exact(res))
+            final_row = res["trace"][-1]
+            avg_mask += float(final_row.get("mask_count", 0.0))
+        if total > 0:
+            logger.print(f"  {model_name:22s}: exact={exact}/{total} ({exact/total:.3f}) avg_final_mask={avg_mask/total:.3f}")
+        else:
+            logger.print(f"  {model_name:22s}: no valid results")
+
+
+# ---------------------------------- main ------------------------------------
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate compact SEDD answer recovery chains for eval models.")
+    parser = argparse.ArgumentParser(description="Compare SEDD/QRA/RL answer-mask recovery chains.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--start", default=None)
-    parser.add_argument("--split", default=None, help="Default: config.eval.split or test.")
-    parser.add_argument("--datasets", action="append", default=[], help="Dataset name under parent of current data_dir. Can repeat. Default: config.eval.datasets.")
-    parser.add_argument("--models", action="append", default=[], help="Only trace selected model names from config eval.compare_models. Can repeat.")
-    parser.add_argument("--num-samples", type=int, default=8, help="Number of samples per dataset.")
+    parser.add_argument("--start", default="QRA", help="Start key only used to choose data_dir; default QRA/S1K_RL.")
+    parser.add_argument("--split", default="test")
+    parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--samples-per-type", type=int, default=2)
-    parser.add_argument("--sample-id", action="append", default=[], help="Specific sample id. Can repeat; applied within each dataset.")
-    parser.add_argument("--run-name", default="sample_chain")
+    parser.add_argument("--sample-id", action="append", default=[], help="Specific sample id. Can be repeated.")
+    parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six: pretrain_start,pretrain_loss_best,pretrain_reward_best,QRA_start,QRA_loss_best,QRA_reward_best")
+    parser.add_argument("--checkpoint", default=None, help="Trace one specific checkpoint only.")
+    parser.add_argument("--checkpoint-name", default=None)
+    parser.add_argument("--run-name", default="compare_pretrain_qra_rl")
     parser.add_argument("--gpu", type=int, default=None)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--t-start", type=float, default=0.95)
     parser.add_argument("--t-end", type=float, default=0.01)
     parser.add_argument("--transition-kind", default="analytic", choices=["analytic", "denoise"])
-    parser.add_argument("--mode", default="sample", choices=["sample", "greedy"])
-    parser.add_argument("--freeze-filled", action="store_true", help="Monotonic-fill diagnostic mode; not the true SEDD chain.")
-    parser.add_argument("--strict-checkpoints", action="store_true", help="Error if a configured checkpoint is missing. Default: warn and skip.")
+    parser.add_argument("--mode", default="greedy", choices=["sample", "greedy"])
+    parser.add_argument("--freeze-filled", action="store_true", help="Diagnostic monotonic-fill mode; not true SEDD reverse chain.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    start_name = selected_start_name(cfg, args.start)
-    eval_cfg = cfg.get("eval") or {}
-    split = str(args.split or eval_cfg.get("split") or "test")
-    datasets = resolve_eval_datasets(args, cfg, start_name)
-    compare_models = resolve_compare_models(args, cfg, start_name)
-    device = choose_device(args, cfg)
     set_seed(args.seed)
+    device = choose_device(args, cfg)
+    start_name = selected_start_name(cfg, args.start)
+    data_dir = resolve_data_dir(cfg, start_name)
 
     tokenizer = GPT2TokenizerFast.from_pretrained((cfg.get("model") or {}).get("tokenizer", "gpt2"))
     tokenizer.pad_token = tokenizer.eos_token
 
+    samples = load_samples(cfg, start_name, args.split, tokenizer)
+    chosen = pick_diverse_samples(samples, args.sample_id, int(args.num_samples), int(args.samples_per_type))
+    if not chosen:
+        raise RuntimeError("No samples selected for tracing.")
+
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = REPO_DIR / "experiment" / "sample_chain" / f"{stamp}_{args.run_name}"
+    chains_dir = out_dir / "chains"
     out_dir.mkdir(parents=True, exist_ok=True)
+    chains_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[chain] device={device}", flush=True)
-    print(f"[chain] start={start_name} split={split} datasets={datasets}", flush=True)
-    print(f"[chain] models={list(compare_models.keys())}", flush=True)
-    print(f"[chain] out={out_dir}", flush=True)
+    logger = TeeLogger(out_dir / "run.log")
+    try:
+        model_specs = resolve_model_plan(args, cfg)
+        model_names = [str(s["name"]) for s in model_specs]
 
-    selected_by_dataset: Dict[str, List[Dict[str, Any]]] = {}
-    for dataset_name in datasets:
-        samples = load_samples(cfg, start_name, dataset_name, split, tokenizer)
-        chosen = pick_diverse_samples(samples, args.sample_id, int(args.num_samples), int(args.samples_per_type))
-        if not chosen:
-            print(f"[warn] no samples selected for dataset={dataset_name}", flush=True)
-            continue
-        selected_by_dataset[dataset_name] = chosen
-        print(f"[chain] dataset={dataset_name} loaded={len(samples)} selected={len(chosen)}", flush=True)
+        logger.print(f"[chain] device={device}")
+        logger.print(f"[chain] data={data_dir}/{args.split}.jsonl loaded={len(samples)} selected={len(chosen)}")
+        logger.print(f"[chain] models={model_names}")
+        for spec in model_specs:
+            logger.print(f"[chain] model_source {spec.get('name')}: {spec.get('source')} | {spec.get('checkpoint') or spec.get('pretrained')}")
+        logger.print(f"[chain] out={out_dir}")
+        dump_json(out_dir / "model_plan.json", model_specs)
+        logger.print(f"[chain] mode={args.mode} steps={args.steps} t={args.t_start}->{args.t_end} freeze_filled={bool(args.freeze_filled)}")
 
-    if not selected_by_dataset:
-        raise RuntimeError("No samples selected from any dataset.")
+        all_rows: List[Dict[str, Any]] = []
+        rows_by_sample: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        results_by_sample: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
-    # Resolve checkpoint paths and optionally skip missing, same spirit as eval script.
-    model_plan: List[Tuple[str, Path]] = []
-    missing: List[Tuple[str, Path]] = []
-    for model_name, spec in compare_models.items():
-        ckpt = repo_path(spec["checkpoint"])
-        if ckpt.exists():
-            model_plan.append((model_name, ckpt))
-        else:
-            missing.append((model_name, ckpt))
-    if missing:
-        msg = "; ".join([f"{n}={p}" for n, p in missing])
-        if args.strict_checkpoints:
-            raise FileNotFoundError(f"Missing configured checkpoint(s): {msg}")
-        print(f"[warn] skip missing checkpoint(s): {msg}", flush=True)
-    if not model_plan:
-        raise RuntimeError("No existing checkpoints to trace.")
-
-    summary = {
-        "time": stamp,
-        "config": str(args.config),
-        "start": start_name,
-        "split": split,
-        "datasets": datasets,
-        "device": str(device),
-        "steps": int(args.steps),
-        "t_start": float(args.t_start),
-        "t_end": float(args.t_end),
-        "transition_kind": str(args.transition_kind),
-        "mode": str(args.mode),
-        "freeze_filled": bool(args.freeze_filled),
-        "models": [{"name": n, "checkpoint": str(p)} for n, p in model_plan],
-        "missing_models": [{"name": n, "checkpoint": str(p)} for n, p in missing],
-        "samples": {
-            d: [{"id": s.get("id", ""), "answer": extract_gt_answer(s), "kind": answer_kind(extract_gt_answer(s))} for s in ss]
-            for d, ss in selected_by_dataset.items()
-        },
-        "note": "Chain dump for configured eval models. Use visual_rl_qra.py --chain-dir on this output for mask/exact trajectory plots.",
-    }
-    dump_json(out_dir / "summary.json", summary)
-
-    all_results: List[Dict[str, Any]] = []
-    for model_name, ckpt_path in model_plan:
-        print(f"[chain] loading {model_name}: {ckpt_path}", flush=True)
-        model, graph, noise = load_model_for_trace(cfg, ckpt_path, device)
-        try:
-            for dataset_name, chosen in selected_by_dataset.items():
-                for i, sample in enumerate(chosen):
-                    # Same seed for each model/sample/dataset, so stochastic differences come from model probs.
-                    dataset_seed = abs(hash(dataset_name)) % 10007
-                    set_seed(args.seed + dataset_seed + i * 1009)
-                    print(f"[chain] {model_name} dataset={dataset_name} sample={i+1}/{len(chosen)} id={sample.get('id','')} ans={extract_gt_answer(sample)!r}", flush=True)
+        for model_i, spec in enumerate(model_specs):
+            model_name = str(spec["name"])
+            ckpt = spec.get("checkpoint")
+            logger.print("-" * 88)
+            logger.print(f"[chain] loading {model_name}: {ckpt if ckpt else spec.get('pretrained')} ({spec.get('source')})")
+            model, graph, noise = load_model_for_trace(cfg, spec, device)
+            try:
+                for sample_i, sample in enumerate(chosen, start=1):
+                    sid = str(sample.get("id", f"sample_{sample_i}"))
+                    set_seed(args.seed + sample_i * 1009 + model_i * 917 + stable_int(model_name, 997))
+                    logger.print(f"[chain] {model_name} sample {sample_i}/{len(chosen)} id={sid} gt={extract_gt_answer(sample)!r}")
                     try:
-                        res = trace_one_sample(model, graph, noise, tokenizer, sample, cfg, device, args, model_name, dataset_name)
+                        res = trace_one_sample(model, graph, noise, tokenizer, sample, cfg, device, args, model_name)
                     except Exception as exc:
                         res = {
-                            "dataset": dataset_name,
                             "model": model_name,
-                            "sample_id": str(sample.get("id", "")),
-                            "gt_answer": extract_gt_answer(sample),
-                            "answer_kind": answer_kind(extract_gt_answer(sample)),
+                            "sample_id": sid,
                             "error": repr(exc),
+                            "gt_answer": extract_gt_answer(sample),
+                            "question": extract_question_reasoning(sample)[0],
+                            "reasoning": extract_question_reasoning(sample)[1],
                         }
-                        print(f"[warn] failed {model_name}/{dataset_name}/{sample.get('id','')}: {exc}", flush=True)
-                    all_results.append(res)
-        finally:
-            del model, graph, noise
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                        logger.print(f"[warn] failed {model_name} sample {sid}: {exc}")
+                    results_by_sample[sid][model_name] = res
+                    if "trace" in res:
+                        rows = result_to_chain_rows(res, sample_i)
+                        all_rows.extend(rows)
+                        rows_by_sample[sid].extend(rows)
+            finally:
+                del model, graph, noise
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-    write_chain_csv(out_dir / "chain.csv", all_results)
-    write_detail_csv(out_dir / "detail.csv", all_results)
-    write_chain_md(out_dir / "chain.md", all_results)
-    dump_json(out_dir / "errors.json", [r for r in all_results if "error" in r])
+        # Write requested outputs.
+        write_csv(out_dir / "chain.csv", all_rows)
+        used_names = set()
+        for sample_i, sample in enumerate(chosen, start=1):
+            sid = str(sample.get("id", f"sample_{sample_i}"))
+            base = safe_name(sid, f"sample_{sample_i}")
+            name = base
+            if name in used_names:
+                name = f"{base}_{sample_i}"
+            used_names.add(name)
+            write_csv(chains_dir / f"{name}_chain.csv", rows_by_sample.get(sid, []))
 
-    print(f"[chain] wrote {out_dir / 'chain.csv'}", flush=True)
-    print(f"[chain] wrote {out_dir / 'detail.csv'}", flush=True)
-    print(f"[chain] wrote {out_dir / 'chain.md'}", flush=True)
+        write_sample_report(out_dir / "sample_report.txt", chosen, results_by_sample, model_names)
+
+        # Terminal/log comparison after all models have been run, so each sample is grouped.
+        logger.print("\n" + "#" * 88)
+        logger.print("FINAL ANSWER COMPARISON")
+        for sample_i, sample in enumerate(chosen, start=1):
+            sid = str(sample.get("id", ""))
+            log_sample_comparison(logger, sample_i, sample, results_by_sample.get(sid, {}), model_names)
+        log_overall_summary(logger, model_names, results_by_sample)
+
+        logger.print("-" * 88)
+        logger.print(f"wrote: {out_dir / 'chain.csv'}")
+        logger.print(f"wrote: {chains_dir}/<sample_id>_chain.csv")
+        logger.print(f"wrote: {out_dir / 'run.log'}")
+        logger.print(f"wrote: {out_dir / 'sample_report.txt'}")
+    finally:
+        logger.close()
 
 
 if __name__ == "__main__":
