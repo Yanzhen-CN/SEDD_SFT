@@ -146,6 +146,19 @@ def cycle_samples(samples: List[Dict], seed: int) -> Iterable[Dict]:
         for item in order:
             yield item
 
+def cycle_random_batches(samples: List[Dict], seed: int, samples_per_update: int) -> Iterable[List[Dict]]:
+    """Yield random per-update batches forever.
+
+    This helper keeps make_update_batch_iter as a normal function that returns
+    an iterable.  Do not inline a ``yield`` inside make_update_batch_iter,
+    otherwise Python turns that function into a generator and ``return
+    other_generator`` will immediately raise StopIteration with that generator
+    as its value.
+    """
+    sample_iter = cycle_samples(samples, seed)
+    while True:
+        yield [next(sample_iter) for _ in range(max(1, int(samples_per_update)))]
+
 
 DEFAULT_KIND_ORDER = [
     "interval",
@@ -430,6 +443,16 @@ def cycle_kind_quota_batches(
         yield batch
 
 def make_update_batch_iter(samples: List[Dict[str, Any]], cfg: Dict[str, Any], seed: int, samples_per_update: int) -> Iterable[List[Dict[str, Any]]]:
+    """Return an infinite iterable of per-update sample batches.
+
+    Important: this function must NOT contain a ``yield`` statement.  If it
+    does, Python treats the whole function as a generator; then statements like
+    ``return cycle_kind_quota_batches(...)`` do not return that iterable to the
+    caller, but instead stop the generator immediately.  That was the cause of
+    the runtime error:
+
+        StopIteration: <generator object cycle_kind_quota_batches ...>
+    """
     train_cfg = cfg.get("training", {}) or {}
     rollout_cfg = cfg.get("rollout", {}) or {}
     selector = str(
@@ -444,9 +467,7 @@ def make_update_batch_iter(samples: List[Dict[str, Any]], cfg: Dict[str, Any], s
     if selector in {"kind_balanced", "balanced", "answer_kind_balanced", "type_balanced"}:
         kind_order = train_cfg.get("sample_kind_order", rollout_cfg.get("sample_kind_order", DEFAULT_KIND_ORDER))
         return cycle_kind_balanced_batches(samples, seed, samples_per_update, list(kind_order or DEFAULT_KIND_ORDER))
-    random_iter = cycle_samples(samples, seed)
-    while True:
-        yield [next(random_iter) for _ in range(samples_per_update)]
+    return cycle_random_batches(samples, seed, samples_per_update)
 
 
 def summarize_batch_kinds(samples: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -971,7 +992,15 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         valid = 0
         already_backward_count = 0
         logged_loss_values: List[float] = []
-        update_samples = next(batch_iter)
+        try:
+            update_samples = next(batch_iter)
+        except StopIteration:
+            # Defensive fallback: a batch iterator should be infinite.  If a
+            # future sampler accidentally stops, recreate it instead of killing
+            # a long server run.
+            print("[warn] sample batch iterator stopped; recreating it", flush=True)
+            batch_iter = make_update_batch_iter(samples, cfg, seed + step, samples_per_update)
+            update_samples = next(batch_iter)
         batch_kind_counts = summarize_batch_kinds(update_samples)
         for micro_start in range(0, len(update_samples), micro_batch_size):
             micro_samples = update_samples[micro_start: micro_start + micro_batch_size]
