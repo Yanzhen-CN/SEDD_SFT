@@ -855,10 +855,10 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     best_step = 0
     best_row: Dict[str, Any] = {}
     best_eval_info: Dict[str, Any] = {}
-    best_path = out_dir / "best_run.pth"
-    best_mini_path = out_dir / "best_mini_run.pth"
-    best_reward_path = out_dir / "best_reward_run.pth"
-    last_path = out_dir / "last_run.pth"
+    best_path = out_dir / "best.pth"
+    best_mini_path = out_dir / "best_mini.pth"
+    best_reward_path = out_dir / "best_reward.pth"
+    last_path = out_dir / "last.pth"
     best_mini_metric_value = initial_best_value(best_mode)
     best_mini_step = 0
     best_reward_metric_value = initial_best_value(reward_best_mode)
@@ -967,7 +967,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                 )
                 dump_json(out_dir / "best_mini_eval.json", eval_info_step)
 
-        # Full validation: complete validation split. This is the official best_run criterion.
+        # Full validation: complete validation split. This is the official loss-best criterion.
         full_eval_now = full_eval_every > 0 and (step % full_eval_every == 0 or step == steps)
         row["is_full_eval"] = 1.0 if full_eval_now else 0.0
         if full_eval_now:
@@ -1150,7 +1150,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
 
     eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
     eval_info.update({
-        "eval_kind": "full_final_best_run",
+        "eval_kind": "full_final_best",
         "eval_split": full_eval_split,
         "eval_limit": full_eval_limit_for_logs,
         "run_id": run_id,
@@ -1179,7 +1179,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                     pass
             mini_full_eval = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
             mini_full_eval.update({
-                "eval_kind": "full_final_best_mini_run",
+                "eval_kind": "full_final_best_mini",
                 "eval_split": full_eval_split,
                 "eval_limit": full_eval_limit_for_logs,
                 "run_id": run_id,
@@ -1198,9 +1198,9 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                 eval_info = mini_full_eval
                 best_eval_info = dict(mini_full_eval)
                 dump_json(out_dir / "best_eval.json", best_eval_info)
-                print(f"[final rerank] best_mini_run won on full eval: {best_metric_name}={mini_metric:.6g}", flush=True)
+                print(f"[final rerank] best_mini won on full eval: {best_metric_name}={mini_metric:.6g}", flush=True)
         except Exception as exc:
-            print(f"[warn] failed to full-evaluate best_mini_run: {exc}", flush=True)
+            print(f"[warn] failed to full-evaluate best_mini: {exc}", flush=True)
 
     eval_info["best_step"] = best_step
     eval_info["best_metric_value"] = best_metric_value
@@ -1222,7 +1222,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                     pass
             reward_eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
             reward_eval_info.update({
-                "eval_kind": "full_final_best_reward_run",
+                "eval_kind": "full_final_best_reward",
                 "eval_split": full_eval_split,
                 "eval_limit": full_eval_limit_for_logs,
                 "run_id": run_id,
@@ -1235,7 +1235,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
             reward_eval_info["best_metric_value"] = best_reward_metric_value
             dump_json(out_dir / "best_reward_eval.json", reward_eval_info)
         except Exception as exc:
-            print(f"[warn] failed to reload/evaluate best_reward_run: {exc}", flush=True)
+            print(f"[warn] failed to reload/evaluate best_reward: {exc}", flush=True)
 
     metrics_json = {
         "run_id": run_id,

@@ -59,7 +59,7 @@ training:
   ema: 0.9999
   log_every: 1
 
-  # Periodic checkpoint for recovery only. best_run.pth is selected by validation.
+  # Periodic checkpoint for recovery only. best.pth is selected by validation.
   save_every: 500
 
   # Dense mini-eval: every step evaluates the fixed val-mini.jsonl subset.
@@ -68,8 +68,8 @@ training:
   eval_limit: all
 
   # Sparse full-eval: every 10 steps evaluates the complete val.jsonl split.
-  # best_run.pth is selected by full validation, not by one training sample and
-  # not by the 8-sample mini eval. At the end, best_mini_run.pth is also
+  # best.pth is selected by full validation, not by one training sample and
+  # not by the 8-sample mini eval. At the end, best_mini.pth is also
   # full-evaluated once as a cheap safeguard against missing an in-between step.
   full_eval_every: 10
   full_eval_limit: all

@@ -127,72 +127,102 @@ def candidate_record(run_dir: Path, ckpt: Path, kind: str, source: str = "") -> 
     }
 
 
+def first_existing(paths: List[Path]) -> Optional[Path]:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def recover_file(target: Path, sources: List[Path], label: str) -> Tuple[Optional[Path], str, bool]:
+    """Return target if present; otherwise copy the first existing legacy/source file to target."""
+    if target.exists():
+        return target, label, False
+    src = first_existing(sources)
+    if src is None:
+        return None, "missing", False
+    try:
+        shutil.copy2(src, target)
+        print(f"[recover] wrote {target} from {src}", flush=True)
+        return target, f"recovered_from_{src.name}", True
+    except Exception as exc:
+        print(f"[warn] failed to recover {target} from {src}: {exc}", flush=True)
+        return src, f"fallback_{src.name}", False
+
+
 def find_loss_candidates(run_root: Path, include_last: bool = False, include_mini: bool = True) -> List[Dict[str, Any]]:
-    names = ["best_run.pth"]
-    if include_mini:
-        names.append("best_mini_run.pth")
-    if include_last:
-        names.append("last_run.pth")
-    out: List[Dict[str, Any]] = []
-    seen = set()
-    for d in run_dirs(run_root):
-        for name in names:
-            ckpt = d / name
-            if ckpt.exists() and ckpt.resolve() not in seen:
-                seen.add(ckpt.resolve())
-                out.append(candidate_record(d, ckpt, "loss_candidate"))
-    return out
+    """Find per-run loss-best checkpoints.
 
-
-def find_reward_candidates(run_root: Path, recover_missing: bool = True) -> List[Dict[str, Any]]:
-    """One reward candidate per run: best_reward_run.pth if present, else last_run.pth.
-
-    Recovery rule for old runs:
-      - if <run>/best_reward_run.pth exists, use it;
-      - otherwise, if <run>/last_run.pth exists, copy it to
-        <run>/best_reward_run.pth and use that copy.
-
-    This physically backfills per-run best_reward_run.pth, so future generate /
-    select passes do not need to guess from last_run.pth again. Root best.pth is
-    still chosen only from loss candidates; this reward path only competes for
-    root best_reward.pth.
+    New layout uses <run>/best.pth and <run>/best_mini.pth.  For old runs, this
+    function can recover from <run>/best_run.pth and <run>/best_mini_run.pth by
+    copying them to the new names.  Root best.pth is never treated as a run.
     """
     out: List[Dict[str, Any]] = []
     seen = set()
     for d in run_dirs(run_root):
-        preferred = d / "best_reward_run.pth"
-        fallback = d / "last_run.pth"
+        candidates: List[Tuple[str, Path, List[Path]]] = [
+            ("loss_best", d / "best.pth", [d / "best_run.pth"]),
+        ]
+        if include_mini:
+            candidates.append(("mini_best", d / "best_mini.pth", [d / "best_mini_run.pth"]))
+        if include_last:
+            candidates.append(("last", d / "last.pth", [d / "last_run.pth"]))
+        for kind, target, legacy_sources in candidates:
+            ckpt, source, recovered = recover_file(target, legacy_sources, kind)
+            if ckpt is None:
+                continue
+            rp = ckpt.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            rec = candidate_record(d, ckpt, "loss_candidate", source=source)
+            rec["recovered_checkpoint"] = bool(recovered)
+            out.append(rec)
+    return out
+
+
+def find_reward_candidates(run_root: Path, recover_missing: bool = True) -> List[Dict[str, Any]]:
+    """One reward candidate per run: best_reward.pth if present, else last.pth.
+
+    Recovery rule for old or earlier runs:
+      - if <run>/best_reward.pth exists, use it;
+      - else if old <run>/best_reward_run.pth exists, copy it to best_reward.pth;
+      - else if <run>/last.pth or old <run>/last_run.pth exists, copy it to
+        best_reward.pth and use that copy.
+
+    This physically backfills per-run best_reward.pth.  Root best.pth is still
+    chosen only from loss candidates; this reward path only competes for root
+    best_reward.pth.
+    """
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for d in run_dirs(run_root):
+        preferred = d / "best_reward.pth"
+        sources = [d / "best_reward_run.pth", d / "last.pth", d / "last_run.pth"]
         recovered = False
         if preferred.exists():
             ckpt = preferred
-            source = "best_reward_run"
-        elif fallback.exists():
-            if recover_missing:
-                try:
-                    shutil.copy2(fallback, preferred)
-                    ckpt = preferred
-                    source = "recovered_from_last_run"
-                    recovered = True
-                    print(f"[recover] wrote {preferred} from {fallback}", flush=True)
-                except Exception as exc:
-                    print(f"[warn] failed to recover {preferred} from {fallback}: {exc}", flush=True)
-                    ckpt = fallback
-                    source = "last_run_fallback_no_best_reward"
-            else:
-                ckpt = fallback
-                source = "last_run_fallback_no_best_reward"
+            source = "best_reward"
         else:
-            continue
+            if not recover_missing:
+                src = first_existing(sources)
+                if src is None:
+                    continue
+                ckpt = src
+                source = f"fallback_{src.name}"
+            else:
+                ckpt, source, recovered = recover_file(preferred, sources, "best_reward")
+                if ckpt is None:
+                    continue
         rp = ckpt.resolve()
         if rp in seen:
             continue
         seen.add(rp)
         rec = candidate_record(d, ckpt, "reward_candidate", source=source)
-        rec["recovered_best_reward_run"] = bool(recovered)
-        rec["fallback_last_run"] = str(fallback) if source != "best_reward_run" else ""
+        rec["recovered_best_reward"] = bool(recovered)
+        rec["fallback_last"] = str(first_existing([d / "last.pth", d / "last_run.pth"]) or "") if source != "best_reward" else ""
         out.append(rec)
     return out
-
 
 def metric_from_eval(eval_info: Dict[str, Any], name: str, mode: str) -> float:
     if name == "full_eval_loss":
@@ -286,7 +316,7 @@ def copy_root_outputs(
 ) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     # Clean old verbose files and old naming.
-    for extra in ["best_selection_report.csv", "best_selection_report.json", "best_last.pth"]:
+    for extra in ["best_selection_report.csv", "best_selection_report.json", "best_reward.pth"]:
         try:
             (out_root / extra).unlink()
         except FileNotFoundError:
@@ -390,10 +420,10 @@ def main() -> None:
     parser.add_argument("--best-mode", type=str, default="", choices=["min", "max"])
     parser.add_argument("--best-reward-metric", type=str, default="", help="Metric for root best_reward.pth. Default training.best_reward_metric/full_eval_rollout_reward.")
     parser.add_argument("--best-reward-mode", type=str, default="", choices=["min", "max"])
-    parser.add_argument("--include-last-for-loss", action="store_true", help="Also allow last_run.pth to compete for conservative best.pth. Default false.")
-    parser.add_argument("--no-mini", action="store_true", help="Do not include best_mini_run.pth for conservative best.pth.")
+    parser.add_argument("--include-last-for-loss", action="store_true", help="Also allow last.pth to compete for conservative best.pth. Default false.")
+    parser.add_argument("--no-mini", action="store_true", help="Do not include best_mini.pth for conservative best.pth.")
     parser.add_argument("--no-ema", action="store_true", help="Evaluate raw model weights instead of EMA weights in checkpoint.")
-    parser.add_argument("--no-recover-best-reward", action="store_true", help="Do not backfill per-run best_reward_run.pth from last_run.pth.")
+    parser.add_argument("--no-recover-best-reward", action="store_true", help="Do not backfill per-run best_reward.pth from last.pth.")
     parser.add_argument("--gpu", type=int, default=None)
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
@@ -445,10 +475,10 @@ def main() -> None:
 
     loss_candidates = find_loss_candidates(out_root, include_last=args.include_last_for_loss, include_mini=not args.no_mini)
     if not loss_candidates:
-        raise RuntimeError(f"No loss candidates found under {out_root}; expected <run_id>/best_run.pth.")
+        raise RuntimeError(f"No loss candidates found under {out_root}; expected <run_id>/best.pth.")
     reward_candidates = find_reward_candidates(out_root, recover_missing=not args.no_recover_best_reward)
     if not reward_candidates:
-        print(f"[warn] No reward candidates found under {out_root}; expected <run_id>/best_reward_run.pth or last_run.pth.", flush=True)
+        print(f"[warn] No reward candidates found under {out_root}; expected <run_id>/best_reward.pth or last.pth.", flush=True)
 
     loss_best: Optional[Dict[str, Any]] = None
     loss_best_value = initial_best_value(best_mode)
@@ -481,7 +511,7 @@ def main() -> None:
                     "checkpoint": row.get("checkpoint"),
                     "checkpoint_name": row.get("checkpoint_name"),
                     "candidate_source": row.get("candidate_source"),
-                    "recovered_best_reward_run": bool(cand.get("recovered_best_reward_run", False)),
+                    "recovered_best_reward": bool(cand.get("recovered_best_reward", False)),
                     "best_metric_name": reward_metric_name,
                     "best_mode": reward_mode,
                     "best_metric_value": metric_value,
