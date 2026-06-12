@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+"""Compact visualizer for RL-QRA.
+
+It produces two kinds of plots:
+1. Training curves from modelparameter/rl_<start>/<run_id>/metrics.csv
+   - one loss plot and one reward plot per run/global best
+2. Test comparison plots from modelparameter/test_result/test_rl_qra.csv
+   - one bar chart for test loss and one bar chart for test rollout reward
+
+The goal is to match the answer-pipeline style: a small set of directly useful
+figures rather than one figure per metric.
+"""
+
 import argparse
 import csv
 import json
@@ -12,6 +24,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 
 DEFAULT_RUN_ROOT = SCRIPT_DIR / "modelparameter" / "rl_QRA"
+DEFAULT_TEST_RESULT_DIR = SCRIPT_DIR / "modelparameter" / "test_result"
 DEFAULT_OUT_DIR = SCRIPT_DIR / "visual" / "rl_QRA"
 
 LOSS_SERIES = ["loss", "eval_loss", "full_eval_loss"]
@@ -38,9 +51,12 @@ def to_float(value: object) -> Optional[float]:
         return None
 
 
+def safe_name(text: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in str(text))[:160] or "run"
+
+
 def collect_metric_files(run_root: Path) -> List[Tuple[str, Path]]:
     files: List[Tuple[str, Path]] = []
-    # Root global-best curve copied from the selected run.
     best = run_root / "best_metrics.csv"
     if best.exists():
         files.append(("global_best", best))
@@ -104,7 +120,6 @@ def summarize_metric_file(run_name: str, path: Path) -> Dict[str, object]:
         if vals:
             summary[f"last100_{key}"] = sum(vals) / len(vals)
             summary[f"final_{key}"] = vals[-1]
-    # Add compact final json info if present.
     json_candidates = []
     if path.name == "best_metrics.csv":
         json_candidates += [path.parent / "best_metrics.json", path.parent / "best_eval.json"]
@@ -147,12 +162,11 @@ def write_summary(rows: List[Dict[str, object]], path: Path) -> None:
         writer.writerows(rows)
 
 
-def visualize(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
-    out_dir.mkdir(parents=True, exist_ok=True)
+def visualize_training(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
     summaries: List[Dict[str, object]] = []
     for run_name, metrics_path in collect_metric_files(run_root):
         rows = read_csv(metrics_path)
-        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in run_name)[:160]
+        safe = safe_name(run_name)
         summaries.append(summarize_metric_file(run_name, metrics_path))
         plot_series(rows, LOSS_SERIES, out_dir / f"{safe}_loss.png", f"{run_name}: loss curves", "loss")
         plot_series(rows, REWARD_SERIES, out_dir / f"{safe}_reward.png", f"{run_name}: reward curves", "reward")
@@ -165,23 +179,100 @@ def visualize(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
     summaries.sort(key=sort_key)
     write_summary(summaries, out_dir / "training_summary.csv")
     (out_dir / "training_summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
-    (out_dir / "visual_summary.json").write_text(json.dumps({
-        "run_root": str(run_root),
-        "out_dir": str(out_dir),
-        "num_metric_runs": len(summaries),
-        "plots": "one *_loss.png and one *_reward.png per run/global_best",
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
     return summaries
 
 
+def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title: str, ylabel: str, higher_better: bool) -> bool:
+    pairs = []
+    for r in rows:
+        if str(r.get("status", "ok")) not in {"", "ok"}:
+            continue
+        v = to_float(r.get(metric))
+        if v is None:
+            continue
+        pairs.append((str(r.get("model", "model")), v))
+    if not pairs:
+        return False
+    pairs = sorted(pairs, key=lambda x: x[1], reverse=higher_better)
+    labels = [p[0] for p in pairs]
+    values = [p[1] for p in pairs]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(10, 5))
+    plt.bar(labels, values)
+    plt.xticks(rotation=25, ha="right")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    return True
+
+
+def visualize_test_results(test_result_dir: Path, out_dir: Path) -> Dict[str, object]:
+    csv_path = test_result_dir / "test_rl_qra.csv"
+    rows = read_csv(csv_path)
+    # Backward compatibility only: old temporary script wrote test_rl_qa.csv.
+    # New workflow should run test_rl_qra.py and produce test_rl_qra.csv.
+    if not rows:
+        legacy = test_result_dir / "test_rl_qa.csv"
+        legacy_rows = read_csv(legacy)
+        if legacy_rows:
+            csv_path = legacy
+            rows = legacy_rows
+    summary: Dict[str, object] = {"test_result_csv": str(csv_path), "rows": len(rows)}
+    if not rows:
+        return summary
+    plot_test_bar(rows, "test_loss", out_dir / "test_loss_compare.png", "Test set loss comparison", "test loss", higher_better=False)
+    plot_test_bar(rows, "test_rollout_reward", out_dir / "test_reward_compare.png", "Test set rollout reward comparison", "test rollout reward", higher_better=True)
+    write_summary([{k: v for k, v in r.items()} for r in rows], out_dir / "test_summary.csv")
+    (out_dir / "test_summary.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    # compact winners
+    valid = [r for r in rows if str(r.get("status", "ok")) in {"", "ok"}]
+    if valid:
+        best_loss = min(valid, key=lambda r: to_float(r.get("test_loss")) if to_float(r.get("test_loss")) is not None else float("inf"))
+        best_reward = max(valid, key=lambda r: to_float(r.get("test_rollout_reward")) if to_float(r.get("test_rollout_reward")) is not None else -float("inf"))
+        summary["best_by_test_loss"] = best_loss.get("model")
+        summary["best_by_test_reward"] = best_reward.get("model")
+    return summary
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compact RL visualizer: only loss and reward curves.")
+    parser = argparse.ArgumentParser(description="Compact RL-QRA visualizer for training curves and test-set model comparison.")
     parser.add_argument("--run-root", default=str(DEFAULT_RUN_ROOT), help="Usually rl_qra_pipeline/modelparameter/rl_QRA")
+    parser.add_argument("--test-result-dir", default=str(DEFAULT_TEST_RESULT_DIR))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
+    parser.add_argument("--no-training", action="store_true")
+    parser.add_argument("--no-test", action="store_true")
     args = parser.parse_args()
-    summaries = visualize(Path(args.run_root), Path(args.out_dir))
-    print(f"Wrote compact visuals to: {args.out_dir}")
-    print(f"Runs visualized: {len(summaries)}")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    training_summary: List[Dict[str, object]] = []
+    test_summary: Dict[str, object] = {"skipped": True}
+
+    if not args.no_training:
+        training_summary = visualize_training(Path(args.run_root), out_dir)
+    if not args.no_test:
+        test_summary = visualize_test_results(Path(args.test_result_dir), out_dir)
+
+    final = {
+        "run_root": str(args.run_root),
+        "test_result_dir": str(args.test_result_dir),
+        "out_dir": str(out_dir),
+        "num_training_runs": len(training_summary),
+        "test": test_summary,
+        "plots": [
+            "<run>_loss.png",
+            "<run>_reward.png",
+            "test_loss_compare.png",
+            "test_reward_compare.png",
+        ],
+    }
+    (out_dir / "visual_summary.json").write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Wrote visuals to: {out_dir}")
+    print(f"Training runs visualized: {len(training_summary)}")
+    if not args.no_test:
+        print(f"Test rows visualized: {test_summary.get('rows', 0)}")
 
 
 if __name__ == "__main__":

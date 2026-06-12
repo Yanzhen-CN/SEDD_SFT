@@ -8,7 +8,7 @@ Default comparison models are exactly six:
 
 For each start family we compare: starting model, RL loss-best checkpoint,
 and RL reward-best checkpoint.  The reward-best checkpoint is best_reward.pth;
-if it is missing, the script falls back to the newest per-run last_run.pth and
+if it is missing, the script falls back to the newest per-run last.pth and
 records that fallback in model_plan.json/run.log.
 
 Default output:
@@ -169,7 +169,7 @@ def start_output_dir(cfg: Dict[str, Any], start_name: str) -> Path:
     return repo_path(start_cfg.get("output_dir", f"rl_qra_pipeline/modelparameter/rl_{start_name}"))
 
 
-def latest_run_checkpoint(run_root: Path, filename: str = "last_run.pth") -> Optional[Path]:
+def latest_run_checkpoint(run_root: Path, filename: str = "last.pth") -> Optional[Path]:
     """Return the newest per-run checkpoint under rl_<start>/<run_id>/filename.
 
     Root best.pth is intentionally not considered here.  This is for comparing
@@ -185,6 +185,12 @@ def latest_run_checkpoint(run_root: Path, filename: str = "last_run.pth") -> Opt
         ckpt = p / filename
         if ckpt.exists():
             candidates.append(ckpt)
+            continue
+        # Backward compatibility for older run directories. New runs write last.pth.
+        if filename == "last.pth":
+            legacy = p / "last_run.pth"
+            if legacy.exists():
+                candidates.append(legacy)
     if not candidates:
         return None
     return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
@@ -205,7 +211,7 @@ def model_pretrained_name(cfg: Dict[str, Any], start_name: str = "pretrain") -> 
 
 
 def reward_checkpoint_or_fallback(root: Path) -> Tuple[Optional[Path], str, Optional[str]]:
-    """Return root best_reward.pth, or newest run last_run.pth as fallback.
+    """Return root best_reward.pth, or newest run last.pth as fallback.
 
     The fallback is only for old runs before reward-best recovery existed.
     A warning string is returned so model_plan.json/run.log makes this explicit.
@@ -213,10 +219,10 @@ def reward_checkpoint_or_fallback(root: Path) -> Tuple[Optional[Path], str, Opti
     ckpt = root / "best_reward.pth"
     if ckpt.exists():
         return ckpt, "rl_root_best_reward", None
-    fallback = latest_run_checkpoint(root, "last_run.pth")
+    fallback = latest_run_checkpoint(root, "last.pth")
     if fallback is not None:
-        return fallback, "latest_run_last_fallback_missing_best_reward", f"missing {ckpt}; fallback to newest run last_run.pth"
-    return None, "missing", f"missing {ckpt} and no */last_run.pth under {root}"
+        return fallback, "latest_run_last_fallback_missing_best_reward", f"missing {ckpt}; fallback to newest run {fallback.name}"
+    return None, "missing", f"missing {ckpt} and no */last.pth under {root}"
 
 
 def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -489,6 +495,109 @@ def pick_diverse_samples(
             break
     return chosen
 
+
+
+
+def sample_source_text(sample: Dict[str, Any]) -> str:
+    return str(sample.get("source", sample.get("dataset_source", "")) or "")
+
+
+def is_synthetic_sample(sample: Dict[str, Any]) -> bool:
+    source = sample_source_text(sample).lower()
+    sid = str(sample.get("id", "")).lower()
+    return source.startswith("synthetic") or "synthetic" in source or "synthetic" in sid
+
+
+def source_group(sample: Dict[str, Any]) -> str:
+    return "synthetic" if is_synthetic_sample(sample) else "origin"
+
+
+def pick_diverse_from_pool(pool: List[Dict[str, Any]], limit: int, per_type: int, seed: int) -> List[Dict[str, Any]]:
+    if limit <= 0 or not pool:
+        return []
+    rng = random.Random(seed)
+    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for s in pool:
+        buckets[answer_kind(extract_gt_answer(s))].append(s)
+    for items in buckets.values():
+        rng.shuffle(items)
+    priority = ["interval", "equation", "unit_decimal", "symbolic", "decimal", "integer", "letter", "short_text"]
+    chosen: List[Dict[str, Any]] = []
+    seen = set()
+    # First pass: cover answer types.
+    for k in priority:
+        for s in buckets.get(k, [])[:max(1, per_type)]:
+            if len(chosen) >= limit:
+                return chosen
+            sid = str(s.get("id", id(s)))
+            if sid not in seen:
+                chosen.append(s)
+                seen.add(sid)
+    # Fill remaining slots deterministically from the pool.
+    remaining = list(pool)
+    rng.shuffle(remaining)
+    for s in remaining:
+        if len(chosen) >= limit:
+            break
+        sid = str(s.get("id", id(s)))
+        if sid not in seen:
+            chosen.append(s)
+            seen.add(sid)
+    return chosen
+
+
+def pick_balanced_origin_synthetic_samples(
+    samples: List[Dict[str, Any]],
+    sample_ids: Sequence[str],
+    num_samples: int,
+    num_origin: int,
+    num_synthetic: int,
+    per_type: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Pick diagnostic samples.
+
+    Default behavior is 8 origin + 8 synthetic samples.  This makes the chain
+    comparison cover both real filtered QRA examples and the synthetic hard
+    short-answer cases introduced for slot/format robustness.  If --num-samples
+    is explicitly positive, fall back to the old diverse total-sample selector.
+    """
+    if sample_ids:
+        wanted = set(sample_ids)
+        chosen = [s for s in samples if str(s.get("id", "")) in wanted]
+        missing = wanted - {str(s.get("id", "")) for s in chosen}
+        if missing:
+            print(f"[warn] missing sample ids: {sorted(missing)}", flush=True)
+        return chosen[: max(1, len(sample_ids))]
+
+    if num_samples and int(num_samples) > 0:
+        return pick_diverse_samples(samples, [], int(num_samples), int(per_type))
+
+    origin_pool = [s for s in samples if not is_synthetic_sample(s)]
+    synth_pool = [s for s in samples if is_synthetic_sample(s)]
+    origin = pick_diverse_from_pool(origin_pool, int(num_origin), int(per_type), seed + 17)
+    synth = pick_diverse_from_pool(synth_pool, int(num_synthetic), int(per_type), seed + 29)
+
+    chosen: List[Dict[str, Any]] = []
+    seen = set()
+    for group in (origin, synth):
+        for s in group:
+            sid = str(s.get("id", id(s)))
+            if sid not in seen:
+                chosen.append(s)
+                seen.add(sid)
+
+    # If one side is underfilled, backfill from all remaining samples.
+    target = max(0, int(num_origin)) + max(0, int(num_synthetic))
+    if len(chosen) < target:
+        remaining = [s for s in samples if str(s.get("id", id(s))) not in seen]
+        extra = pick_diverse_from_pool(remaining, target - len(chosen), int(per_type), seed + 43)
+        for s in extra:
+            sid = str(s.get("id", id(s)))
+            if sid not in seen:
+                chosen.append(s)
+                seen.add(sid)
+    return chosen
 
 # ------------------------------- model load --------------------------------
 
@@ -766,6 +875,116 @@ def write_csv(path: Path, rows: List[Dict[str, Any]], fields: Sequence[str] = CH
             writer.writerow({k: row.get(k, "") for k in fields})
 
 
+
+
+def format_token_change(prev_tokens: List[str], curr_tokens: List[str]) -> str:
+    changes = []
+    n = max(len(prev_tokens), len(curr_tokens))
+    for i in range(n):
+        old = prev_tokens[i] if i < len(prev_tokens) else ""
+        new = curr_tokens[i] if i < len(curr_tokens) else ""
+        if old != new:
+            changes.append(f"{i}:{old}→{new}")
+    return ";".join(changes)
+
+
+def trace_by_step(result: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    out: Dict[int, Dict[str, Any]] = {}
+    for row in result.get("trace") or []:
+        try:
+            out[int(row.get("step", 0))] = row
+        except Exception:
+            pass
+    return out
+
+
+def build_wide_chain_rows(
+    sample_order: List[Dict[str, Any]],
+    results_by_sample: Dict[str, Dict[str, Dict[str, Any]]],
+    model_names: List[str],
+) -> List[Dict[str, Any]]:
+    """Build reference-style chain rows.
+
+    One row is one (sample, denoising step).  Each model gets side-by-side
+    columns: <model>_answer and <model>_change, plus compact diagnostic fields.
+    This is easier to inspect than long format when comparing multiple models on
+    the same sample.
+    """
+    rows: List[Dict[str, Any]] = []
+    for sample_i, sample in enumerate(sample_order, start=1):
+        sid = str(sample.get("id", f"sample_{sample_i}"))
+        gt = extract_gt_answer(sample)
+        q, r = extract_question_reasoning(sample)
+        sample_results = results_by_sample.get(sid, {})
+        max_step = 0
+        for res in sample_results.values():
+            if isinstance(res, dict) and "trace" in res:
+                for tr in res.get("trace") or []:
+                    try:
+                        max_step = max(max_step, int(tr.get("step", 0)))
+                    except Exception:
+                        pass
+        trace_maps = {m: trace_by_step(sample_results.get(m, {})) for m in model_names}
+        prev_tokens: Dict[str, List[str]] = {m: [] for m in model_names}
+        for step in range(max_step + 1):
+            t_val = ""
+            for m in model_names:
+                tr = trace_maps.get(m, {}).get(step)
+                if tr is not None:
+                    t_val = f"{float(tr.get('t', 0.0)):.4f}"
+                    break
+            row: Dict[str, Any] = {
+                "dataset": sample.get("dataset", sample.get("mode", "S1K_RL")),
+                "sample_index": sample_i,
+                "sample_id": sid,
+                "source_group": source_group(sample),
+                "source": sample_source_text(sample),
+                "gt_answer": gt,
+                "answer_kind": answer_kind(gt),
+                "step": step,
+                "t": t_val,
+            }
+            # Keep short previews in the all-chain CSV. Full question/reasoning are in sample_report.txt.
+            row["question_preview"] = short(q, 120)
+            row["reasoning_preview"] = short(r, 120)
+            for m in model_names:
+                tr = trace_maps.get(m, {}).get(step)
+                if tr is None:
+                    row[f"{m}_answer"] = ""
+                    row[f"{m}_change"] = ""
+                    row[f"{m}_exact"] = ""
+                    row[f"{m}_mask"] = ""
+                    row[f"{m}_pos"] = ""
+                    row[f"{m}_tok"] = ""
+                    continue
+                curr_tokens = [str(x) for x in (tr.get("answer_token_texts") or [])]
+                if step == 0:
+                    change = ""
+                else:
+                    change = format_token_change(prev_tokens.get(m, []), curr_tokens)
+                prev_tokens[m] = curr_tokens
+                ans = str(tr.get("answer_text", ""))
+                row[f"{m}_answer"] = ans
+                row[f"{m}_change"] = change
+                row[f"{m}_exact"] = 1 if normalize_text(ans) == normalize_text(gt) else 0
+                row[f"{m}_mask"] = int(float(tr.get("mask_count", 0.0)))
+                row[f"{m}_pos"] = f"{float(tr.get('position_match', 0.0)):.4f}"
+                row[f"{m}_tok"] = f"{float(tr.get('token_set_match', 0.0)):.4f}"
+            rows.append(row)
+    return rows
+
+
+def wide_chain_fields(model_names: List[str]) -> List[str]:
+    fields = [
+        "dataset", "sample_index", "sample_id", "source_group", "source", "gt_answer",
+        "answer_kind", "step", "t", "question_preview", "reasoning_preview",
+    ]
+    for m in model_names:
+        fields.extend([
+            f"{m}_answer", f"{m}_change", f"{m}_exact", f"{m}_mask", f"{m}_pos", f"{m}_tok",
+        ])
+    return fields
+
 def final_answer(result: Dict[str, Any]) -> str:
     trace = result.get("trace") or []
     if not trace:
@@ -867,7 +1086,9 @@ def main() -> None:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--start", default="QRA", help="Start key only used to choose data_dir; default QRA/S1K_RL.")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--num-samples", type=int, default=0, help="If >0, use old total diverse sampling. Default 0 means use --num-origin-samples + --num-synthetic-samples.")
+    parser.add_argument("--num-origin-samples", type=int, default=8, help="Default diagnostic origin/real sample count.")
+    parser.add_argument("--num-synthetic-samples", type=int, default=8, help="Default diagnostic synthetic sample count.")
     parser.add_argument("--samples-per-type", type=int, default=2)
     parser.add_argument("--sample-id", action="append", default=[], help="Specific sample id. Can be repeated.")
     parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six: pretrain_start,pretrain_loss_best,pretrain_reward_best,QRA_start,QRA_loss_best,QRA_reward_best")
@@ -896,7 +1117,15 @@ def main() -> None:
     tokenizer.pad_token = tokenizer.eos_token
 
     samples = load_samples(cfg, start_name, args.split, tokenizer)
-    chosen = pick_diverse_samples(samples, args.sample_id, int(args.num_samples), int(args.samples_per_type))
+    chosen = pick_balanced_origin_synthetic_samples(
+        samples,
+        args.sample_id,
+        int(args.num_samples),
+        int(args.num_origin_samples),
+        int(args.num_synthetic_samples),
+        int(args.samples_per_type),
+        int(args.seed),
+    )
     if not chosen:
         raise RuntimeError("No samples selected for tracing.")
 
@@ -912,7 +1141,8 @@ def main() -> None:
         model_names = [str(s["name"]) for s in model_specs]
 
         logger.print(f"[chain] device={device}")
-        logger.print(f"[chain] data={data_dir}/{args.split}.jsonl loaded={len(samples)} selected={len(chosen)}")
+        selected_counts = Counter(source_group(s) for s in chosen)
+        logger.print(f"[chain] data={data_dir}/{args.split}.jsonl loaded={len(samples)} selected={len(chosen)} origin={selected_counts.get('origin',0)} synthetic={selected_counts.get('synthetic',0)}")
         logger.print(f"[chain] models={model_names}")
         for spec in model_specs:
             logger.print(f"[chain] model_source {spec.get('name')}: {spec.get('source')} | {spec.get('checkpoint') or spec.get('pretrained')}")
@@ -959,7 +1189,12 @@ def main() -> None:
                     torch.cuda.empty_cache()
 
         # Write requested outputs.
-        write_csv(out_dir / "chain.csv", all_rows)
+        # chain.csv is reference-style wide format: one row per sample/step with all model answers side by side.
+        wide_rows = build_wide_chain_rows(chosen, results_by_sample, model_names)
+        wide_fields = wide_chain_fields(model_names)
+        write_csv(out_dir / "chain.csv", wide_rows, fields=wide_fields)
+        # Keep a long-format diagnostic file as an extra, but do not use it for the main presentation.
+        write_csv(out_dir / "chain_long.csv", all_rows)
         used_names = set()
         for sample_i, sample in enumerate(chosen, start=1):
             sid = str(sample.get("id", f"sample_{sample_i}"))
@@ -968,7 +1203,8 @@ def main() -> None:
             if name in used_names:
                 name = f"{base}_{sample_i}"
             used_names.add(name)
-            write_csv(chains_dir / f"{name}_chain.csv", rows_by_sample.get(sid, []))
+            sample_wide_rows = [r for r in wide_rows if str(r.get("sample_id", "")) == sid]
+            write_csv(chains_dir / f"{name}_chain.csv", sample_wide_rows, fields=wide_fields)
 
         write_sample_report(out_dir / "sample_report.txt", chosen, results_by_sample, model_names)
 
@@ -983,6 +1219,7 @@ def main() -> None:
         logger.print("-" * 88)
         logger.print(f"wrote: {out_dir / 'chain.csv'}")
         logger.print(f"wrote: {chains_dir}/<sample_id>_chain.csv")
+        logger.print(f"wrote: {out_dir / 'chain_long.csv'}")
         logger.print(f"wrote: {out_dir / 'run.log'}")
         logger.print(f"wrote: {out_dir / 'sample_report.txt'}")
     finally:
