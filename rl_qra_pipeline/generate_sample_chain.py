@@ -2,19 +2,19 @@ from __future__ import annotations
 
 """Compare SEDD/QRA/RL answer-mask recovery chains.
 
-Default comparison models are exactly six and the main chain.csv columns are:
-    pretrain, rl_pretrain_bestloss, rl_pretrain_bestreward,
-    QRA, rl_QRA_bestloss, rl_QRA_bestreward
+Default comparison models are exactly six:
+    pretrain_start, pretrain_loss_best, pretrain_reward_best,
+    QRA_start, QRA_loss_best, QRA_reward_best
 
-For each start family we compare: starting model, RL loss-best checkpoint
-(best.pth), and RL reward-best checkpoint (best_reward.pth).  If reward-best
-is missing, the script falls back to the newest per-run last.pth and records
-that fallback in model_plan.json/run.log.
+For each start family we compare: starting model, RL loss-best checkpoint,
+and RL reward-best checkpoint.  The reward-best checkpoint is best_reward.pth;
+if it is missing, the script falls back to the newest per-run last.pth and
+records that fallback in model_plan.json/run.log.
 
 Default output:
     experiment/sample_chain/<timestamp>_<run_name>/
-        chain.csv                         # one row per sample/step, six model answers side by side
-        chains/<sample_id>_chain.csv       # one CSV per sample, same compact wide columns
+        chain.csv                         # compact wide format: all samples / all models / all steps
+        chains/<sample_id>_chain.csv       # one CSV per sample, all models in that sample
         run.log                           # terminal-style comparison log
         sample_report.txt                 # question/reasoning/GT + final answer of every model
 
@@ -60,12 +60,42 @@ from state_builder import (  # noqa: E402
 
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 DEFAULT_MODELS = [
-    "pretrain",
-    "rl_pretrain_bestloss",
-    "rl_pretrain_bestreward",
-    "QRA",
-    "rl_QRA_bestloss",
-    "rl_QRA_bestreward",
+    "pretrain_start",
+    "pretrain_loss_best",
+    "pretrain_reward_best",
+    "QRA_start",
+    "QRA_loss_best",
+    "QRA_reward_best",
+]
+
+DISPLAY_MODEL_NAMES = {
+    "pretrain_start": "pretrain",
+    "pretrain_loss_best": "rl_pretrain_bestloss",
+    "pretrain_reward_best": "rl_pretrain_bestreward",
+    "QRA_start": "QRA",
+    "QRA_loss_best": "rl_QRA_bestloss",
+    "QRA_reward_best": "rl_QRA_bestreward",
+}
+
+DEFAULT_REFERENCE_SAMPLE_IDS = [
+    # Synthetic hard cases from S1K_RL/test.jsonl
+    "s1f_rl_synthetic_interval_test_000011",
+    "s1f_rl_synthetic_interval_test_000018",
+    "s1f_rl_synthetic_equation_test_000014",
+    "s1f_rl_synthetic_equation_test_000019",
+    "s1f_rl_synthetic_unit_decimal_test_000028",
+    "s1f_rl_synthetic_unit_decimal_test_000001",
+    "s1f_rl_synthetic_inequality_test_000002",
+    "s1f_rl_synthetic_inequality_test_000025",
+    # Real/origin QRA cases copied into S1K_RL/test.jsonl
+    "s1k_157",
+    "s1k_26",
+    "s1k_499",
+    "s1k_50",
+    "s1k_66",
+    "s1k_195",
+    "s1k_330",
+    "s1k_256",
 ]
 
 
@@ -228,13 +258,13 @@ def reward_checkpoint_or_fallback(root: Path) -> Tuple[Optional[Path], str, Opti
 def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return model specs with fields: name, checkpoint, pretrained, source.
 
-    The default comparison is exactly six columns:
-      pretrain                = pretrained/cache SEDD start
-      rl_pretrain_bestloss    = rl_pretrain/best.pth
-      rl_pretrain_bestreward  = rl_pretrain/best_reward.pth
-      QRA                     = starts.QRA.init_checkpoint
-      rl_QRA_bestloss         = rl_QRA/best.pth
-      rl_QRA_bestreward       = rl_QRA/best_reward.pth
+    The default comparison is exactly six models:
+      pretrain_start        = pretrained/cache SEDD start
+      pretrain_loss_best    = rl_pretrain/best.pth
+      pretrain_reward_best  = rl_pretrain/best_reward.pth
+      QRA_start             = starts.QRA.init_checkpoint
+      QRA_loss_best         = rl_QRA/best.pth
+      QRA_reward_best       = rl_QRA/best_reward.pth
     """
     if args.checkpoint:
         return [{
@@ -255,37 +285,37 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
         # ----- pretrain family: start / loss-best / reward-best -----
         if name_l in {"pretrain", "pretrain_start", "start_pretrain"}:
             specs.append({
-                "name": "pretrain",
+                "name": "pretrain_start",
                 "checkpoint": None,
                 "pretrained": model_pretrained_name(cfg, "pretrain"),
                 "source": "start_pretrained_or_cache",
             })
             continue
 
-        if name_l in {"rl_pretrain_bestloss", "pretrain_loss_best", "pretrain_best", "rl_pretrain", "rl_pretrain_best"}:
+        if name_l in {"pretrain_loss_best", "pretrain_best", "rl_pretrain", "rl_pretrain_best"}:
             ckpt = start_output_dir(cfg, "pretrain") / "best.pth"
             if ckpt.exists():
                 specs.append({
-                    "name": "rl_pretrain_bestloss",
+                    "name": "pretrain_loss_best",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "pretrain"),
                     "source": "rl_root_loss_best",
                 })
             else:
-                warnings.append(f"skip rl_pretrain_bestloss: missing {ckpt}")
+                warnings.append(f"skip pretrain_loss_best: missing {ckpt}")
             continue
 
-        if name_l in {"rl_pretrain_bestreward", "pretrain_reward_best", "pretrain_best_reward", "rl_pretrain_reward", "rl_pretrain_last"}:
+        if name_l in {"pretrain_reward_best", "pretrain_best_reward", "rl_pretrain_reward", "rl_pretrain_last"}:
             root = start_output_dir(cfg, "pretrain")
             ckpt, source, warning = reward_checkpoint_or_fallback(root)
             if ckpt is not None:
                 specs.append({
-                    "name": "rl_pretrain_bestreward",
+                    "name": "pretrain_reward_best",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "pretrain"),
                     "source": source,
                 })
-            warnings.append(f"rl_pretrain_bestreward: {warning}" if warning else "")
+            warnings.append(f"pretrain_reward_best: {warning}" if warning else "")
             continue
 
         # ----- QRA family: start / loss-best / reward-best -----
@@ -293,7 +323,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
             ckpt = init_checkpoint_path(cfg, "QRA")
             if ckpt is not None:
                 specs.append({
-                    "name": "QRA",
+                    "name": "QRA_start",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": "start_init_checkpoint",
@@ -302,30 +332,30 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
                 warnings.append("skip QRA_start: starts.QRA.init_checkpoint missing or not found")
             continue
 
-        if name_l in {"rl_qra_bestloss", "qra_loss_best", "qra_best", "rl_qra", "rl_qra_best"}:
+        if name_l in {"qra_loss_best", "qra_best", "rl_qra", "rl_qra_best"}:
             ckpt = start_output_dir(cfg, "QRA") / "best.pth"
             if ckpt.exists():
                 specs.append({
-                    "name": "rl_QRA_bestloss",
+                    "name": "QRA_loss_best",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": "rl_root_loss_best",
                 })
             else:
-                warnings.append(f"skip rl_QRA_bestloss: missing {ckpt}")
+                warnings.append(f"skip QRA_loss_best: missing {ckpt}")
             continue
 
-        if name_l in {"rl_qra_bestreward", "qra_reward_best", "qra_best_reward", "rl_qra_reward", "rl_qra_last"}:
+        if name_l in {"qra_reward_best", "qra_best_reward", "rl_qra_reward", "rl_qra_last"}:
             root = start_output_dir(cfg, "QRA")
             ckpt, source, warning = reward_checkpoint_or_fallback(root)
             if ckpt is not None:
                 specs.append({
-                    "name": "rl_QRA_bestreward",
+                    "name": "QRA_reward_best",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": source,
                 })
-            warnings.append(f"rl_QRA_bestreward: {warning}" if warning else "")
+            warnings.append(f"QRA_reward_best: {warning}" if warning else "")
             continue
 
         # ----- optional QA aliases kept for manual calls -----
@@ -512,6 +542,15 @@ def source_group(sample: Dict[str, Any]) -> str:
     return "synthetic" if is_synthetic_sample(sample) else "origin"
 
 
+def display_dataset(sample: Dict[str, Any]) -> str:
+    """Dataset label used in chain.csv.
+
+    Synthetic hard cases are labeled S1K_RL, while original filtered S1K/QRA
+    cases are labeled QRA, matching the diagnostic sample list.
+    """
+    return "S1K_RL" if is_synthetic_sample(sample) else "QRA"
+
+
 def pick_diverse_from_pool(pool: List[Dict[str, Any]], limit: int, per_type: int, seed: int) -> List[Dict[str, Any]]:
     if limit <= 0 or not pool:
         return []
@@ -598,6 +637,38 @@ def pick_balanced_origin_synthetic_samples(
                 chosen.append(s)
                 seen.add(sid)
     return chosen
+
+
+def pick_fixed_reference_samples(
+    samples: List[Dict[str, Any]],
+    reference_ids: Sequence[str],
+    seed: int,
+) -> List[Dict[str, Any]]:
+    """Pick the fixed diagnostic samples used for chain comparison.
+
+    The list is ordered as 8 synthetic S1K_RL cases followed by 8 real QRA
+    cases.  Missing ids are reported and the remaining slots are backfilled
+    deterministically, so the script still runs on older data files.
+    """
+    by_id = {str(s.get("id", "")): s for s in samples}
+    chosen: List[Dict[str, Any]] = []
+    seen = set()
+    missing: List[str] = []
+    for sid in reference_ids:
+        sample = by_id.get(str(sid))
+        if sample is None:
+            missing.append(str(sid))
+            continue
+        chosen.append(sample)
+        seen.add(str(sid))
+    if missing:
+        print(f"[warn] fixed reference sample ids missing: {missing}", flush=True)
+    target = len(reference_ids)
+    if len(chosen) < target:
+        remaining = [s for s in samples if str(s.get("id", id(s))) not in seen]
+        chosen.extend(pick_diverse_from_pool(remaining, target - len(chosen), per_type=2, seed=seed + 101))
+    return chosen[:target]
+
 
 # ------------------------------- model load --------------------------------
 
@@ -903,19 +974,20 @@ def build_wide_chain_rows(
     results_by_sample: Dict[str, Dict[str, Dict[str, Any]]],
     model_names: List[str],
 ) -> List[Dict[str, Any]]:
-    """Build the compact reference-style chain CSV.
+    """Build compact reference-style chain rows.
 
-    One row is one (sample, denoising step).  The only model columns are the
-    visible answer strings for the six comparison models, exactly like:
-      dataset,sample_id,gt_answer,answer_kind,step,t,pretrain,...
+    One row is one (sample, denoising step).  The columns intentionally match
+    the simple diagnostic format:
 
-    The generation process is shown by reading each model column down the rows.
-    Detailed diagnostics remain in run.log/sample_report.txt instead of making
-    chain.csv wide and hard to read.
+        dataset,sample_id,gt_answer,answer_kind,step,t,
+        pretrain,rl_pretrain_bestloss,rl_pretrain_bestreward,
+        QRA,rl_QRA_bestloss,rl_QRA_bestreward
+
+    Model changes can be read directly by comparing consecutive rows.
     """
     rows: List[Dict[str, Any]] = []
-    for sample_i, sample in enumerate(sample_order, start=1):
-        sid = str(sample.get("id", f"sample_{sample_i}"))
+    for sample in sample_order:
+        sid = str(sample.get("id", ""))
         gt = extract_gt_answer(sample)
         sample_results = results_by_sample.get(sid, {})
         max_step = 0
@@ -935,7 +1007,7 @@ def build_wide_chain_rows(
                     t_val = f"{float(tr.get('t', 0.0)):.4f}"
                     break
             row: Dict[str, Any] = {
-                "dataset": source_group(sample),
+                "dataset": display_dataset(sample),
                 "sample_id": sid,
                 "gt_answer": gt,
                 "answer_kind": answer_kind(gt),
@@ -950,10 +1022,8 @@ def build_wide_chain_rows(
 
 
 def wide_chain_fields(model_names: List[str]) -> List[str]:
-    return [
-        "dataset", "sample_id", "gt_answer", "answer_kind", "step", "t",
-        *model_names,
-    ]
+    return ["dataset", "sample_id", "gt_answer", "answer_kind", "step", "t", *model_names]
+
 
 def final_answer(result: Dict[str, Any]) -> str:
     trace = result.get("trace") or []
@@ -1061,7 +1131,8 @@ def main() -> None:
     parser.add_argument("--num-synthetic-samples", type=int, default=8, help="Default diagnostic synthetic sample count.")
     parser.add_argument("--samples-per-type", type=int, default=2)
     parser.add_argument("--sample-id", action="append", default=[], help="Specific sample id. Can be repeated.")
-    parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six compact columns: pretrain,rl_pretrain_bestloss,rl_pretrain_bestreward,QRA,rl_QRA_bestloss,rl_QRA_bestreward")
+    parser.add_argument("--no-fixed-reference-samples", action="store_true", help="Disable the built-in fixed 16-sample diagnostic list and use balanced sampling instead.")
+    parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six: pretrain_start,pretrain_loss_best,pretrain_reward_best,QRA_start,QRA_loss_best,QRA_reward_best")
     parser.add_argument("--checkpoint", default=None, help="Trace one specific checkpoint only.")
     parser.add_argument("--checkpoint-name", default=None)
     parser.add_argument("--run-name", default="compare_pretrain_qra_rl")
@@ -1073,7 +1144,7 @@ def main() -> None:
     parser.add_argument("--t-start", type=float, default=0.95)
     parser.add_argument("--t-end", type=float, default=0.01)
     parser.add_argument("--transition-kind", default="analytic", choices=["analytic", "denoise"])
-    parser.add_argument("--mode", default="greedy", choices=["sample", "greedy"])
+    parser.add_argument("--mode", default="sample", choices=["sample", "greedy"], help="Default sample matches stochastic SEDD reverse chains. Greedy often stays at mask/no-op until late steps.")
     parser.add_argument("--freeze-filled", action="store_true", help="Diagnostic monotonic-fill mode; not true SEDD reverse chain.")
     args = parser.parse_args()
 
@@ -1087,15 +1158,18 @@ def main() -> None:
     tokenizer.pad_token = tokenizer.eos_token
 
     samples = load_samples(cfg, start_name, args.split, tokenizer)
-    chosen = pick_balanced_origin_synthetic_samples(
-        samples,
-        args.sample_id,
-        int(args.num_samples),
-        int(args.num_origin_samples),
-        int(args.num_synthetic_samples),
-        int(args.samples_per_type),
-        int(args.seed),
-    )
+    if (not args.sample_id) and int(args.num_samples) <= 0 and (not args.no_fixed_reference_samples):
+        chosen = pick_fixed_reference_samples(samples, DEFAULT_REFERENCE_SAMPLE_IDS, int(args.seed))
+    else:
+        chosen = pick_balanced_origin_synthetic_samples(
+            samples,
+            args.sample_id,
+            int(args.num_samples),
+            int(args.num_origin_samples),
+            int(args.num_synthetic_samples),
+            int(args.samples_per_type),
+            int(args.seed),
+        )
     if not chosen:
         raise RuntimeError("No samples selected for tracing.")
 
@@ -1108,6 +1182,10 @@ def main() -> None:
     logger = TeeLogger(out_dir / "run.log")
     try:
         model_specs = resolve_model_plan(args, cfg)
+        for spec in model_specs:
+            internal = str(spec.get("name", ""))
+            spec["internal_name"] = internal
+            spec["name"] = DISPLAY_MODEL_NAMES.get(internal, internal)
         model_names = [str(s["name"]) for s in model_specs]
 
         logger.print(f"[chain] device={device}")
@@ -1159,7 +1237,7 @@ def main() -> None:
                     torch.cuda.empty_cache()
 
         # Write requested outputs.
-        # chain.csv is compact reference-style wide format: one row per sample/step.
+        # chain.csv is reference-style wide format: one row per sample/step with all model answers side by side.
         wide_rows = build_wide_chain_rows(chosen, results_by_sample, model_names)
         wide_fields = wide_chain_fields(model_names)
         write_csv(out_dir / "chain.csv", wide_rows, fields=wide_fields)

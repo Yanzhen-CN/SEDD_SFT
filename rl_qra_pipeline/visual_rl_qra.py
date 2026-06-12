@@ -16,16 +16,19 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent
 
-DEFAULT_RUN_ROOT = SCRIPT_DIR / "modelparameter" / "rl_QRA"
+DEFAULT_RUN_ROOTS = [
+    SCRIPT_DIR / "modelparameter" / "rl_pretrain",
+    SCRIPT_DIR / "modelparameter" / "rl_QRA",
+]
 DEFAULT_TEST_RESULT_DIR = SCRIPT_DIR / "modelparameter" / "test_result"
-DEFAULT_OUT_DIR = SCRIPT_DIR / "visual" / "rl_QRA"
+DEFAULT_OUT_DIR = SCRIPT_DIR / "visualization" / "rl_qra"
 
 LOSS_SERIES = ["loss", "eval_loss", "full_eval_loss"]
 REWARD_SERIES = ["rollout_reward", "eval_rollout_reward", "full_eval_rollout_reward", "reward_best_metric_value"]
@@ -162,20 +165,101 @@ def write_summary(rows: List[Dict[str, object]], path: Path) -> None:
         writer.writerows(rows)
 
 
-def visualize_training(run_root: Path, out_dir: Path) -> List[Dict[str, object]]:
+def group_name_from_root(run_root: Path) -> str:
+    return safe_name(run_root.name or "rl_group")
+
+
+def choose_metric_series(rows: List[Dict[str, str]], preferred: Sequence[str]) -> Tuple[str, List[Tuple[float, float]]]:
+    """Return the first available metric series from a preference list."""
+    for metric in preferred:
+        pts: List[Tuple[float, float]] = []
+        for i, row in enumerate(rows):
+            y = to_float(row.get(metric))
+            if y is None:
+                continue
+            x = to_float(row.get("step"))
+            pts.append((float(i if x is None else x), y))
+        if pts:
+            return metric, pts
+    return "", []
+
+
+def plot_group_overlay(
+    metric_files: List[Tuple[str, Path]],
+    preferred: Sequence[str],
+    out_path: Path,
+    title: str,
+    ylabel: str,
+) -> bool:
+    """One compact curve plot per RL group.
+
+    Each line is one run/global-best file.  For each file we prefer full-eval
+    metrics, then mini-eval metrics, then train metrics.  This keeps the figure
+    answer-pipeline-like: one loss curve image and one reward curve image per
+    RL family, rather than many files per metric.
+    """
+    plotted = False
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(9, 5))
+    for run_name, path in metric_files:
+        rows = read_csv(path)
+        metric, pts = choose_metric_series(rows, preferred)
+        if not pts:
+            continue
+        pts = sorted(pts, key=lambda x: x[0])
+        label = run_name if metric == preferred[0] else f"{run_name} ({metric})"
+        plt.plot([x for x, _ in pts], [y for _, y in pts], linewidth=1.2, label=label)
+        plotted = True
+    if not plotted:
+        plt.close()
+        return False
+    plt.xlabel("step")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180)
+    plt.close()
+    return True
+
+
+def visualize_training(run_roots: Sequence[Path], out_dir: Path) -> List[Dict[str, object]]:
+    """Visualize both RL groups by default: rl_pretrain and rl_QRA."""
     summaries: List[Dict[str, object]] = []
-    for run_name, metrics_path in collect_metric_files(run_root):
-        rows = read_csv(metrics_path)
-        safe = safe_name(run_name)
-        summaries.append(summarize_metric_file(run_name, metrics_path))
-        plot_series(rows, LOSS_SERIES, out_dir / f"{safe}_loss.png", f"{run_name}: loss curves", "loss")
-        plot_series(rows, REWARD_SERIES, out_dir / f"{safe}_reward.png", f"{run_name}: reward curves", "reward")
+    loss_preferred = ["full_eval_loss", "eval_loss", "loss"]
+    reward_preferred = ["full_eval_rollout_reward", "eval_rollout_reward", "rollout_reward", "reward_best_metric_value"]
+
+    for run_root in run_roots:
+        group = group_name_from_root(run_root)
+        metric_files = collect_metric_files(run_root)
+        for run_name, metrics_path in metric_files:
+            item = summarize_metric_file(f"{group}/{run_name}", metrics_path)
+            item["group"] = group
+            summaries.append(item)
+        plot_group_overlay(
+            metric_files,
+            loss_preferred,
+            out_dir / f"{group}_loss.png",
+            f"{group}: validation/training loss curves",
+            "loss",
+        )
+        plot_group_overlay(
+            metric_files,
+            reward_preferred,
+            out_dir / f"{group}_reward.png",
+            f"{group}: rollout reward curves",
+            "reward",
+        )
+
     def sort_key(row: Dict[str, object]):
-        for k in ("full_eval_loss", "last100_full_eval_loss", "eval_loss", "last100_eval_loss", "final_loss"):
+        for k in ("group", "full_eval_loss", "last100_full_eval_loss", "eval_loss", "last100_eval_loss", "final_loss"):
+            if k == "group":
+                continue
             v = to_float(row.get(k))
             if v is not None:
-                return v
-        return float("inf")
+                return (str(row.get("group", "")), v)
+        return (str(row.get("group", "")), float("inf"))
+
     summaries.sort(key=sort_key)
     write_summary(summaries, out_dir / "training_summary.csv")
     (out_dir / "training_summary.json").write_text(json.dumps(summaries, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -193,7 +277,6 @@ def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title
         pairs.append((str(r.get("model", "model")), v))
     if not pairs:
         return False
-    pairs = sorted(pairs, key=lambda x: x[1], reverse=higher_better)
     labels = [p[0] for p in pairs]
     values = [p[1] for p in pairs]
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -238,7 +321,7 @@ def visualize_test_results(test_result_dir: Path, out_dir: Path) -> Dict[str, ob
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compact RL-QRA visualizer for training curves and test-set model comparison.")
-    parser.add_argument("--run-root", default=str(DEFAULT_RUN_ROOT), help="Usually rl_qra_pipeline/modelparameter/rl_QRA")
+    parser.add_argument("--run-root", action="append", default=None, help="RL root to visualize. Can be repeated. Default: rl_pretrain and rl_QRA.")
     parser.add_argument("--test-result-dir", default=str(DEFAULT_TEST_RESULT_DIR))
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--no-training", action="store_true")
@@ -251,19 +334,22 @@ def main() -> None:
     test_summary: Dict[str, object] = {"skipped": True}
 
     if not args.no_training:
-        training_summary = visualize_training(Path(args.run_root), out_dir)
+        run_roots = [Path(x) for x in args.run_root] if args.run_root else list(DEFAULT_RUN_ROOTS)
+        training_summary = visualize_training(run_roots, out_dir)
     if not args.no_test:
         test_summary = visualize_test_results(Path(args.test_result_dir), out_dir)
 
     final = {
-        "run_root": str(args.run_root),
+        "run_roots": [str(x) for x in (args.run_root or DEFAULT_RUN_ROOTS)],
         "test_result_dir": str(args.test_result_dir),
         "out_dir": str(out_dir),
         "num_training_runs": len(training_summary),
         "test": test_summary,
         "plots": [
-            "<run>_loss.png",
-            "<run>_reward.png",
+            "rl_pretrain_loss.png",
+            "rl_pretrain_reward.png",
+            "rl_QRA_loss.png",
+            "rl_QRA_reward.png",
             "test_loss_compare.png",
             "test_reward_compare.png",
         ],
