@@ -52,8 +52,15 @@ starts:
 training:
   # 1500 steps is about 2+ passes over the current S1K_RL train split.
   steps: 1500
-  batch_size: 1
-  lr: 5.0e-7
+  # Effective number of different samples used before one optimizer.step().
+  # Try 8, 16, 32 depending on GPU memory. Old batch_size is kept as alias.
+  samples_per_update: 8
+  batch_size: 8
+  # Split samples_per_update into smaller groups for memory/control flow.
+  # With rollout.memory_safe_replay=true, gradients are normalized by samples_per_update
+  # so changing 1 -> 8/16/32 does not implicitly multiply the learning rate.
+  micro_batch_size: 2
+  lr: 2.0e-7
   weight_decay: 0.0
   grad_clip: 0.5
   ema: 0.9999
@@ -110,9 +117,9 @@ rrpi:
   max_debug_rows: 8
 
 rollout:
-  # Reward can be switched without overwriting files:
-  #   slot_alignment: original/pretrain-oriented slot reward
-  #   qra_refine: QRA-oriented small-correction reward
+  # Reward can be switched without changing code:
+  #   slot_alignment -> pretrain RL / format-slot learning
+  #   qra_refine     -> QRA RL / exact-first token-aware refinement
   reward_name: qra_refine
 
   # Sample-chain-aligned rollout: for each fixed t transition, every answer
@@ -142,15 +149,15 @@ rollout:
 
   # Probability-adjustment size. Small values are intentional; prefer multiple
   # RL rounds over one aggressive update.
-  policy_loss_scale: 0.012
-  advantage_clip: 0.20
-  reward_clip: 1.00
+  policy_loss_scale: 0.006
+  advantage_clip: 0.12
+  reward_clip: 0.60
   gamma: 0.95
   baseline: raw_clip
 
   # Stabilizers.
   entropy_weight: 0.0005
-  sft_anchor_scale: 0.008
+  sft_anchor_scale: 0.012
   anchor_late_power: 1.0
 
   debug_every: 20

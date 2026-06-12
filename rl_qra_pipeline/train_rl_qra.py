@@ -70,24 +70,8 @@ METRIC_FIELDS = [
     "eval_rollout_entropy",
     "eval_rollout_logprob",
     "eval_rollout_anchor_loss",
-    # Sparse full-validation metrics. These are populated on full_eval steps.
-    "full_eval_loss",
-    "full_eval_count",
-    "full_eval_rollout_loss",
-    "full_eval_rollout_reward",
-    "full_eval_rollout_reward_std",
-    "full_eval_rollout_entropy",
-    "full_eval_rollout_logprob",
-    "full_eval_rollout_anchor_loss",
-    "is_full_eval",
-    # Mini-eval and full-eval checkpoint selection markers.
-    "mini_best_metric_value",
-    "is_best_mini_eval",
     "best_metric_value",
     "is_best_eval",
-    # Reward-oriented checkpoint selection, used for root best_reward.pth.
-    "reward_best_metric_value",
-    "is_best_reward_eval",
 ]
 
 
@@ -99,19 +83,6 @@ def load_config(path: str | Path) -> Dict:
 def resolve_repo_path(value: str | Path) -> Path:
     p = Path(value)
     return p if p.is_absolute() else REPO_DIR / p
-
-
-def is_disabled_checkpoint(value: object) -> bool:
-    """True means initialize directly from SEDD.from_pretrained(...).
-
-    This is needed for --start pretrain: other pipelines usually do not have a
-    local pretrain.pth; they rely on the Hugging Face cache/download path.
-    """
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value.strip().lower() in {"", "none", "null", "pretrained", "hf", "cache", "false"}
-    return False
 
 
 def set_seed(seed: int) -> None:
@@ -205,9 +176,7 @@ def load_policy(cfg: Dict, device: torch.device):
 
     ckpt_value = cfg.get("model", {}).get("init_checkpoint", "")
     loaded_from = pretrained
-    if is_disabled_checkpoint(ckpt_value):
-        print(f"Using pretrained/HF-cache weights: {pretrained}", flush=True)
-    else:
+    if ckpt_value:
         ckpt_path = resolve_repo_path(ckpt_value)
         if ckpt_path.exists():
             state = torch.load(ckpt_path, map_location=device)
@@ -221,14 +190,10 @@ def load_policy(cfg: Dict, device: torch.device):
                     print(f"[warn] failed to load EMA from checkpoint: {exc}", flush=True)
             loaded_from = str(ckpt_path)
             print(f"Loaded start checkpoint: {ckpt_path}", flush=True)
-        elif bool(cfg.get("model", {}).get("allow_missing_init_checkpoint", False)):
-            print(f"[warn] init checkpoint not found, falling back to pretrained/HF-cache weights: {ckpt_path}", flush=True)
         else:
             raise FileNotFoundError(
                 f"init checkpoint not found: {ckpt_path}\n"
-                "For --start pretrain, set starts.pretrain.init_checkpoint: null/''/pretrained "
-                "so SEDD.from_pretrained(...) uses the Hugging Face cache. "
-                "For QA/QRA, fix starts.<name>.init_checkpoint in rl_qra_config.yaml."
+                "Fix starts.<name>.init_checkpoint in rl_qra_config.yaml, or pass --start to select another start."
             )
 
     graph = graph_lib.get_graph(model.config, device)
@@ -393,31 +358,6 @@ def mean_dict(rows: List[Dict[str, float]]) -> Dict[str, float]:
     return out
 
 
-def add_eval_prefix(row: Dict[str, Any], prefix: str, eval_info: Dict[str, Any]) -> None:
-    """Copy evaluate_loss outputs into a metrics row with either eval_ or full_eval_ prefix."""
-    row[f"{prefix}_loss"] = float(eval_info.get("eval_loss", float("inf")))
-    row[f"{prefix}_count"] = int(eval_info.get("eval_count", 0))
-    row[f"{prefix}_rollout_loss"] = float(eval_info.get("rollout_loss", 0.0))
-    row[f"{prefix}_rollout_reward"] = float(eval_info.get("rollout_reward", 0.0))
-    row[f"{prefix}_rollout_reward_std"] = float(eval_info.get("rollout_reward_std", 0.0))
-    row[f"{prefix}_rollout_entropy"] = float(eval_info.get("rollout_entropy", 0.0))
-    row[f"{prefix}_rollout_logprob"] = float(eval_info.get("rollout_logprob", 0.0))
-    row[f"{prefix}_rollout_anchor_loss"] = float(eval_info.get("rollout_anchor_loss", 0.0))
-
-
-def metric_from_full_eval(eval_info: Dict[str, Any], name: str, mode: str) -> float:
-    """Read best metric from final/full eval info.
-
-    full_eval_loss is stored as eval_loss inside eval.json, so we map it here.
-    """
-    if name == "full_eval_loss":
-        return get_metric_value(eval_info, "full_eval_loss", get_metric_value(eval_info, "eval_loss", initial_best_value(mode)))
-    if name.startswith("full_eval_"):
-        fallback_key = name[len("full_eval_"):]
-        return get_metric_value(eval_info, name, get_metric_value(eval_info, fallback_key, initial_best_value(mode)))
-    return get_metric_value(eval_info, name, get_metric_value(eval_info, "eval_loss", initial_best_value(mode)))
-
-
 def metric_better(new_value: float, best_value: float, mode: str = "min") -> bool:
     """Return whether a validation metric improved.
 
@@ -507,9 +447,9 @@ def evaluate_loss(model, graph, noise, tokenizer, samples: List[Dict], cfg: Dict
     return out
 
 
-def load_eval_samples(cfg: Dict, tokenizer, train_samples: List[Dict], requested_split: Optional[str] = None) -> Tuple[List[Dict], str]:
+def load_eval_samples(cfg: Dict, tokenizer, train_samples: List[Dict]) -> Tuple[List[Dict], str]:
     data_cfg = cfg.get("data", {})
-    requested = requested_split if requested_split is not None else data_cfg.get("eval_split", "val")
+    requested = data_cfg.get("eval_split", "val")
     candidates = []
     if requested:
         candidates.append(str(requested))
@@ -529,57 +469,6 @@ def load_eval_samples(cfg: Dict, tokenizer, train_samples: List[Dict], requested
     limit = int(data_cfg.get("eval_limit", 128) or 128)
     return train_samples[: min(limit, len(train_samples))], "train_fallback"
 
-
-
-
-def safe_delta(new: Any, old: Any) -> Optional[float]:
-    try:
-        new_f = float(new)
-        old_f = float(old)
-        if not np.isfinite(new_f) or not np.isfinite(old_f):
-            return None
-        return new_f - old_f
-    except Exception:
-        return None
-
-
-def relative_loss_improvement(before: Any, after: Any) -> Optional[float]:
-    try:
-        before_f = float(before)
-        after_f = float(after)
-        if not np.isfinite(before_f) or not np.isfinite(after_f) or abs(before_f) < 1e-12:
-            return None
-        # Positive means the evaluated loss decreased after RL.
-        return (before_f - after_f) / abs(before_f)
-    except Exception:
-        return None
-
-
-def before_after_summary(baseline_eval: Dict[str, Any], after_eval: Dict[str, Any]) -> Dict[str, Any]:
-    """Compact RL-effect summary for json reports.
-
-    Loss is still the rollout composite eval loss. Reward is the rollout reward
-    used by the RL objective; for this project it is often more aligned with
-    format/type/slot quality than pure loss.
-    """
-    return {
-        "before_loss": baseline_eval.get("eval_loss"),
-        "after_loss": after_eval.get("eval_loss"),
-        "delta_loss": safe_delta(after_eval.get("eval_loss"), baseline_eval.get("eval_loss")),
-        "relative_loss_improvement": relative_loss_improvement(baseline_eval.get("eval_loss"), after_eval.get("eval_loss")),
-        "before_rollout_loss": baseline_eval.get("rollout_loss"),
-        "after_rollout_loss": after_eval.get("rollout_loss"),
-        "delta_rollout_loss": safe_delta(after_eval.get("rollout_loss"), baseline_eval.get("rollout_loss")),
-        "before_rollout_reward": baseline_eval.get("rollout_reward"),
-        "after_rollout_reward": after_eval.get("rollout_reward"),
-        "delta_rollout_reward": safe_delta(after_eval.get("rollout_reward"), baseline_eval.get("rollout_reward")),
-        "before_entropy": baseline_eval.get("rollout_entropy"),
-        "after_entropy": after_eval.get("rollout_entropy"),
-        "delta_entropy": safe_delta(after_eval.get("rollout_entropy"), baseline_eval.get("rollout_entropy")),
-        "before_anchor_loss": baseline_eval.get("rollout_anchor_loss"),
-        "after_anchor_loss": after_eval.get("rollout_anchor_loss"),
-        "delta_anchor_loss": safe_delta(after_eval.get("rollout_anchor_loss"), baseline_eval.get("rollout_anchor_loss")),
-    }
 
 def update_global_best(
     out_root: Path,
@@ -617,7 +506,7 @@ def update_global_best(
             except Exception:
                 current_best = initial_best_value(best_mode)
 
-        new_metric = metric_from_full_eval(eval_info, best_metric_name, best_mode)
+        new_metric = get_metric_value(eval_info, best_metric_name, get_metric_value(eval_info, "eval_loss", initial_best_value(best_mode)))
         if metric_better(new_metric, current_best, best_mode):
             improved = True
             if best_ckpt.exists():
@@ -642,102 +531,6 @@ def update_global_best(
         release_lock(lock)
     return improved
 
-
-
-def update_global_reward_best(
-    out_root: Path,
-    run_dir: Path,
-    reward_ckpt: Path,
-    reward_eval_info: Dict[str, Any],
-    metrics_json: Dict[str, Any],
-    run_info_path: Path,
-    reward_metric_name: str = "full_eval_rollout_reward",
-    reward_mode: str = "max",
-) -> bool:
-    """Update root best_reward.pth using an RL/reward-oriented metric.
-
-    best.pth remains the conservative validation-loss best.  best_reward.pth is
-    the reward-oriented checkpoint for generation comparison.  To keep root
-    layout compact, no separate best_reward_*.json files are created; metadata is
-    merged into best_metrics.json and best_eval.json under the key reward_best.
-    """
-    out_root.mkdir(parents=True, exist_ok=True)
-    lock = out_root / ".global_best.lock"
-    acquire_lock(lock)
-    improved = False
-    try:
-        metrics_path = out_root / "best_metrics.json"
-        eval_path = out_root / "best_eval.json"
-        current_metrics: Dict[str, Any] = {}
-        current_eval: Dict[str, Any] = {}
-        if metrics_path.exists():
-            try:
-                current_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-            except Exception:
-                current_metrics = {}
-        if eval_path.exists():
-            try:
-                current_eval = json.loads(eval_path.read_text(encoding="utf-8"))
-            except Exception:
-                current_eval = {}
-
-        current_reward = current_metrics.get("reward_best", {}) if isinstance(current_metrics.get("reward_best"), dict) else {}
-        current_best = get_metric_value(current_reward, "best_metric_value", initial_best_value(reward_mode))
-        new_metric = metric_from_full_eval(reward_eval_info, reward_metric_name, reward_mode)
-
-        if metric_better(new_metric, current_best, reward_mode):
-            improved = True
-            if reward_ckpt.exists():
-                shutil.copy2(reward_ckpt, out_root / "best_reward.pth")
-            reward_payload = {
-                "time": dt.datetime.now().isoformat(timespec="seconds"),
-                "selected_kind": "reward_best",
-                "run_dir": str(run_dir),
-                "checkpoint": str(reward_ckpt),
-                "checkpoint_name": reward_ckpt.name,
-                "best_metric_name": reward_metric_name,
-                "best_mode": reward_mode,
-                "best_metric_value": new_metric,
-                "eval_loss": reward_eval_info.get("eval_loss"),
-                "full_eval_loss": reward_eval_info.get("full_eval_loss", reward_eval_info.get("eval_loss")),
-                "eval_count": reward_eval_info.get("eval_count"),
-                "rollout_reward": reward_eval_info.get("rollout_reward"),
-                "rollout_loss": reward_eval_info.get("rollout_loss"),
-                "rollout_entropy": reward_eval_info.get("rollout_entropy"),
-                "rollout_anchor_loss": reward_eval_info.get("rollout_anchor_loss"),
-                "eval_metrics": reward_eval_info,
-                "before_after": metrics_json.get("reward_best", {}).get("before_after", {}),
-            }
-            current_metrics.setdefault("time", reward_payload["time"])
-            current_metrics["reward_best"] = reward_payload
-            current_metrics["best_reward_checkpoint"] = str(out_root / "best_reward.pth")
-            dump_json(metrics_path, current_metrics)
-
-            if not current_eval:
-                current_eval = {"time": reward_payload["time"]}
-            current_eval["reward_best"] = reward_payload
-            current_eval["best_reward_checkpoint"] = str(out_root / "best_reward.pth")
-            dump_json(eval_path, current_eval)
-
-            if run_info_path.exists() and not (out_root / "best_run_info.json").exists():
-                shutil.copy2(run_info_path, out_root / "best_run_info.json")
-
-            append_jsonl(out_root / "improvement_log.jsonl", {
-                "time": reward_payload["time"],
-                "selected_kind": "reward_best",
-                "run_dir": str(run_dir),
-                "checkpoint": str(reward_ckpt),
-                "best_metric_name": reward_metric_name,
-                "best_mode": reward_mode,
-                "old_best_metric": current_best,
-                "new_best_metric": new_metric,
-                "new_eval_loss": reward_eval_info.get("eval_loss"),
-                "new_rollout_reward": reward_eval_info.get("rollout_reward"),
-                "improved": True,
-            })
-    finally:
-        release_lock(lock)
-    return improved
 
 def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA", cli_gpu: int | None = None, cli_cpu: bool = False) -> Path:
     seed = int(cfg.get("seed", 42))
@@ -769,15 +562,29 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         raise RuntimeError("No training samples loaded.")
     sample_iter = cycle_samples(samples, seed)
 
-    # Load validation samples once.  Mini eval uses a fixed cheap split
-    # (usually val-mini.jsonl); full eval uses the complete validation split.
-    data_cfg = cfg.get("data", {})
-    eval_samples, eval_split = load_eval_samples(cfg, tokenizer, samples, data_cfg.get("eval_split", "val-mini"))
-    full_eval_samples, full_eval_split = load_eval_samples(cfg, tokenizer, samples, data_cfg.get("full_eval_split", "val"))
+    # Load validation samples once.  Best checkpoints are selected by mean validation metrics,
+    # never by the single training sample loss from an update step.
+    eval_samples, eval_split = load_eval_samples(cfg, tokenizer, samples)
 
     lr = float(cfg["training"].get("lr", 2e-6))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(cfg["training"].get("weight_decay", 0.0)))
-    batch_size = int(cfg["training"].get("batch_size", 1))
+    train_cfg = cfg.get("training", {})
+    # Effective number of different training samples used before one optimizer.step().
+    # Keep backward compatibility: old configs can still use training.batch_size.
+    samples_per_update = int(
+        train_cfg.get(
+            "samples_per_update",
+            train_cfg.get("rl_samples_per_update", train_cfg.get("batch_size", 1)),
+        )
+    )
+    samples_per_update = max(1, samples_per_update)
+    # Split the effective update batch into smaller chunks for memory testing.
+    # With rollout.memory_safe_replay=true this mostly controls logging/control flow,
+    # because each rollout action is replayed/backwarded one by one.
+    micro_batch_size = int(train_cfg.get("micro_batch_size", train_cfg.get("rl_micro_batch_size", samples_per_update)))
+    micro_batch_size = max(1, min(samples_per_update, micro_batch_size))
+    # Backward-compatible alias used below.
+    batch_size = samples_per_update
     steps = int(cfg["training"].get("steps", 1000))
     grad_clip = float(cfg["training"].get("grad_clip", 1.0))
     save_every = int(cfg["training"].get("save_every", 100))
@@ -788,16 +595,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         default=int(cfg.get("data", {}).get("eval_limit", 64) or 64),
     )
     eval_limit_for_logs = eval_limit_label(eval_limit)
-    full_eval_every = int(cfg["training"].get("full_eval_every", 0) or 0)
-    full_eval_limit = parse_eval_limit(
-        cfg["training"].get("full_eval_limit", "all"),
-        default=int(cfg.get("data", {}).get("full_eval_limit", cfg.get("data", {}).get("eval_limit", 64)) or 64),
-    )
-    full_eval_limit_for_logs = eval_limit_label(full_eval_limit)
-    best_metric_name = str(cfg["training"].get("best_metric", "full_eval_loss"))
+    best_metric_name = str(cfg["training"].get("best_metric", "eval_loss"))
     best_mode = str(cfg["training"].get("best_mode", "min")).lower()
-    reward_best_metric_name = str(cfg["training"].get("best_reward_metric", cfg["training"].get("reward_best_metric", "full_eval_rollout_reward")))
-    reward_best_mode = str(cfg["training"].get("best_reward_mode", cfg["training"].get("reward_best_mode", "max"))).lower()
     rrpi_cfg = cfg.get("rrpi", cfg.get("guided", {}))
     rollout_cfg = cfg.get("rollout", {})
     mode_for_debug = str(cfg.get("rl", {}).get("mode", rrpi_cfg.get("mode", "rrpi")))
@@ -808,19 +607,6 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         debug_every = int(rrpi_cfg.get("debug_every", 20))
         max_debug_rows = int(rrpi_cfg.get("max_debug_rows", 8))
 
-    # One baseline full validation before RL. This gives json reports an explicit
-    # before/after comparison instead of only absolute after-RL numbers.
-    baseline_eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
-    baseline_eval_info.update({
-        "eval_kind": "full_baseline_before_rl",
-        "eval_split": full_eval_split,
-        "eval_limit": full_eval_limit_for_logs,
-        "run_id": run_id,
-        "start": start_name,
-        "loaded_from": loaded_from,
-    })
-    baseline_eval_info["full_eval_loss"] = baseline_eval_info.get("eval_loss", float("inf"))
-
     run_info = {
         "algorithm": str(cfg.get("rl", {}).get("mode", "rrpi")),
         "start": start_name,
@@ -829,17 +615,14 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "run_dir": str(out_dir),
         "loaded_from": loaded_from,
         "num_samples": len(samples),
+        "samples_per_update": samples_per_update,
+        "micro_batch_size": micro_batch_size,
         "data_split": split,
         "eval_split": eval_split,
         "eval_limit": eval_limit_for_logs,
         "eval_every": eval_every,
-        "full_eval_split": full_eval_split,
-        "full_eval_limit": full_eval_limit_for_logs,
-        "full_eval_every": full_eval_every,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
-        "reward_best_metric_name": reward_best_metric_name,
-        "reward_best_mode": reward_best_mode,
         "device": str(device),
         "cli_gpu": cli_gpu,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
@@ -847,7 +630,6 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     }
     run_info_path = out_dir / "run_info.json"
     dump_json(run_info_path, run_info)
-    dump_json(out_dir / "baseline_eval.json", baseline_eval_info)
     metrics_path = out_dir / "metrics.csv"
     debug_path = out_dir / "rollout_debug.jsonl"
 
@@ -855,25 +637,13 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     best_step = 0
     best_row: Dict[str, Any] = {}
     best_eval_info: Dict[str, Any] = {}
-    best_path = out_dir / "best.pth"
-    best_mini_path = out_dir / "best_mini.pth"
-    best_reward_path = out_dir / "best_reward.pth"
-    last_path = out_dir / "last.pth"
-    best_mini_metric_value = initial_best_value(best_mode)
-    best_mini_step = 0
-    best_reward_metric_value = initial_best_value(reward_best_mode)
-    best_reward_step = 0
-    best_reward_eval_info: Dict[str, Any] = {}
-    best_reward_row: Dict[str, Any] = {}
+    best_path = out_dir / "best_run.pth"
+    last_path = out_dir / "last_run.pth"
 
     numeric_keys = [
         k for k in METRIC_FIELDS
-        if k not in {
-            "step", "loss", "lr", "best_metric_value", "is_best_eval",
-            "mini_best_metric_value", "is_best_mini_eval", "is_full_eval",
-            "reward_best_metric_value", "is_best_reward_eval",
-        }
-        and not k.startswith("eval_") and not k.startswith("full_eval_")
+        if k not in {"step", "loss", "lr", "best_metric_value", "is_best_eval"}
+        and not k.startswith("eval_")
     ]
     last_debug_records: List[Dict[str, Any]] = []
     last_row: Dict[str, Any] = {}
@@ -887,33 +657,44 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         valid = 0
         already_backward_count = 0
         logged_loss_values: List[float] = []
-        for _ in range(batch_size):
-            sample = next(sample_iter)
-            try:
-                loss_i, stats_i = compute_rl_loss(model, graph, noise, tokenizer, sample, cfg, device)
-            except Exception as exc:
-                print(f"[warn] skip sample {sample.get('id', '')}: {exc}", flush=True)
-                continue
-            if bool(stats_i.get("_already_backward", False)):
-                already_backward_count += 1
+        update_samples = [next(sample_iter) for _ in range(samples_per_update)]
+        for micro_start in range(0, len(update_samples), micro_batch_size):
+            micro_samples = update_samples[micro_start: micro_start + micro_batch_size]
+            for sample in micro_samples:
+                # For memory_safe_replay rollout_chain_loss calls backward internally.
+                # This temporary config field keeps gradient magnitude invariant when
+                # samples_per_update is changed from 1 -> 8/16/32.
+                cfg_i = cfg
+                if mode_for_debug in {"rollout", "rollout_chain", "chain"} and bool(rollout_cfg.get("memory_safe_replay", True)):
+                    cfg_i = copy.deepcopy(cfg)
+                    cfg_i.setdefault("rollout", {})["loss_normalizer"] = float(samples_per_update)
+                    cfg_i["rollout"]["micro_batch_size"] = int(micro_batch_size)
+                    cfg_i["rollout"]["samples_per_update"] = int(samples_per_update)
                 try:
-                    logged_loss_values.append(float(loss_i.detach().item()))
-                except Exception:
-                    pass
-            else:
-                losses.append(loss_i)
-                try:
-                    logged_loss_values.append(float(loss_i.detach().item()))
-                except Exception:
-                    pass
-            valid += 1
-            for k in numeric_keys:
-                if k in stats_i:
+                    loss_i, stats_i = compute_rl_loss(model, graph, noise, tokenizer, sample, cfg_i, device)
+                except Exception as exc:
+                    print(f"[warn] skip sample {sample.get('id', '')}: {exc}", flush=True)
+                    continue
+                if bool(stats_i.get("_already_backward", False)):
+                    already_backward_count += 1
                     try:
-                        agg[k] += float(stats_i.get(k, 0.0))
+                        logged_loss_values.append(float(loss_i.detach().item()))
                     except Exception:
                         pass
-            debug_records.extend(stats_i.get("debug_records", []) or [])
+                else:
+                    losses.append(loss_i)
+                    try:
+                        logged_loss_values.append(float(loss_i.detach().item()))
+                    except Exception:
+                        pass
+                valid += 1
+                for k in numeric_keys:
+                    if k in stats_i:
+                        try:
+                            agg[k] += float(stats_i.get(k, 0.0))
+                        except Exception:
+                            pass
+                debug_records.extend(stats_i.get("debug_records", []) or [])
         if not losses and valid <= 0:
             continue
 
@@ -933,13 +714,12 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         for k, v in agg.items():
             row[k] = v / max(1, valid)
 
-        # Mini validation: fixed cheap subset, usually val-mini.jsonl.
-        # It is useful for dense curves and for a fallback best_mini checkpoint.
+        # Periodic validation.  This is deliberately not the single-sample training loss.
+        # It is a mean over a fixed eval subset, so it is meaningful for best_run.pth and plots.
         eval_now = eval_every > 0 and (step % eval_every == 0 or step == steps)
         if eval_now:
             eval_info_step = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
             eval_info_step.update({
-                "eval_kind": "mini",
                 "eval_split": eval_split,
                 "eval_limit": eval_limit_for_logs,
                 "step": step,
@@ -947,52 +727,24 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                 "best_metric_name": best_metric_name,
                 "best_mode": best_mode,
             })
-            add_eval_prefix(row, "eval", eval_info_step)
-            mini_metric_value = get_metric_value(eval_info_step, "eval_loss", initial_best_value(best_mode))
-            row["mini_best_metric_value"] = mini_metric_value
-            improved_mini = metric_better(mini_metric_value, best_mini_metric_value, best_mode)
-            row["is_best_mini_eval"] = 1.0 if improved_mini else 0.0
-            append_jsonl(out_dir / "eval_history.jsonl", eval_info_step)
-            if improved_mini:
-                best_mini_metric_value = mini_metric_value
-                best_mini_step = step
-                save_checkpoint(
-                    best_mini_path,
-                    model,
-                    ema,
-                    optimizer,
-                    cfg,
-                    step,
-                    {"best_metric_name": "eval_loss", "best_mode": best_mode, "best_metric_value": mini_metric_value, **row},
-                )
-                dump_json(out_dir / "best_mini_eval.json", eval_info_step)
-
-        # Full validation: complete validation split. This is the official loss-best criterion.
-        full_eval_now = full_eval_every > 0 and (step % full_eval_every == 0 or step == steps)
-        row["is_full_eval"] = 1.0 if full_eval_now else 0.0
-        if full_eval_now:
-            full_eval_info_step = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
-            full_eval_info_step.update({
-                "eval_kind": "full",
-                "eval_split": full_eval_split,
-                "eval_limit": full_eval_limit_for_logs,
-                "step": step,
-                "run_id": run_id,
-                "best_metric_name": best_metric_name,
-                "best_mode": best_mode,
-            })
-            full_eval_info_step["full_eval_loss"] = full_eval_info_step.get("eval_loss", float("inf"))
-            add_eval_prefix(row, "full_eval", full_eval_info_step)
-            metric_value = metric_from_full_eval(full_eval_info_step, best_metric_name, best_mode)
+            row["eval_loss"] = float(eval_info_step.get("eval_loss", float("inf")))
+            row["eval_count"] = int(eval_info_step.get("eval_count", 0))
+            row["eval_rollout_loss"] = float(eval_info_step.get("rollout_loss", 0.0))
+            row["eval_rollout_reward"] = float(eval_info_step.get("rollout_reward", 0.0))
+            row["eval_rollout_reward_std"] = float(eval_info_step.get("rollout_reward_std", 0.0))
+            row["eval_rollout_entropy"] = float(eval_info_step.get("rollout_entropy", 0.0))
+            row["eval_rollout_logprob"] = float(eval_info_step.get("rollout_logprob", 0.0))
+            row["eval_rollout_anchor_loss"] = float(eval_info_step.get("rollout_anchor_loss", 0.0))
+            metric_value = get_metric_value(eval_info_step, best_metric_name, get_metric_value(eval_info_step, "eval_loss", initial_best_value(best_mode)))
             row["best_metric_value"] = metric_value
             improved_eval = metric_better(metric_value, best_metric_value, best_mode)
             row["is_best_eval"] = 1.0 if improved_eval else 0.0
-            append_jsonl(out_dir / "full_eval_history.jsonl", full_eval_info_step)
+            append_jsonl(out_dir / "eval_history.jsonl", eval_info_step)
             if improved_eval:
                 best_metric_value = metric_value
                 best_step = step
                 best_row = dict(row)
-                best_eval_info = dict(full_eval_info_step)
+                best_eval_info = dict(eval_info_step)
                 save_checkpoint(
                     best_path,
                     model,
@@ -1003,42 +755,10 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                     {"best_metric_name": best_metric_name, "best_mode": best_mode, "best_metric_value": metric_value, **row},
                 )
                 dump_json(out_dir / "best_eval.json", best_eval_info)
-
-            reward_metric_value = metric_from_full_eval(full_eval_info_step, reward_best_metric_name, reward_best_mode)
-            row["reward_best_metric_value"] = reward_metric_value
-            improved_reward_eval = metric_better(reward_metric_value, best_reward_metric_value, reward_best_mode)
-            row["is_best_reward_eval"] = 1.0 if improved_reward_eval else 0.0
-            if improved_reward_eval:
-                best_reward_metric_value = reward_metric_value
-                best_reward_step = step
-                best_reward_row = dict(row)
-                best_reward_eval_info = dict(full_eval_info_step)
-                best_reward_eval_info.update({
-                    "best_metric_name": reward_best_metric_name,
-                    "best_mode": reward_best_mode,
-                    "best_metric_value": reward_metric_value,
-                    "best_step": best_reward_step,
-                })
-                save_checkpoint(
-                    best_reward_path,
-                    model,
-                    ema,
-                    optimizer,
-                    cfg,
-                    step,
-                    {"best_metric_name": reward_best_metric_name, "best_mode": reward_best_mode, "best_metric_value": reward_metric_value, **row},
-                )
-                dump_json(out_dir / "best_reward_eval.json", best_reward_eval_info)
-
-        if eval_now or full_eval_now:
-            eval_msg = f"mini_loss={row.get('eval_loss', float('nan')):.6g}" if row.get("eval_loss", "") != "" else "mini_loss=na"
-            full_msg = f" full_loss={row.get('full_eval_loss', float('nan')):.6g}" if row.get("full_eval_loss", "") != "" else ""
             print(
-                f"[eval step={step}] {eval_msg}{full_msg} "
-                f"mini_count={row.get('eval_count', 0)} full_count={row.get('full_eval_count', 0)} "
-                f"best_metric={best_metric_name} best={row.get('is_best_eval', 0.0)} "
-                f"reward_metric={reward_best_metric_name} reward_best={row.get('is_best_reward_eval', 0.0)} "
-                f"mini_best={row.get('is_best_mini_eval', 0.0)}",
+                f"[eval step={step}] {best_metric_name}={metric_value:.6g} mode={best_mode} "
+                f"eval_loss={row['eval_loss']:.6g} evalR={row.get('eval_rollout_reward', 0.0):+.3f} "
+                f"count={row.get('eval_count', 0)} best={'yes' if improved_eval else 'no'}",
                 flush=True,
             )
 
@@ -1049,11 +769,10 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
             append_csv(metrics_path, row)
             eval_msg = ""
             if row.get("eval_loss", "") != "":
-                eval_msg += f" eval_loss={float(row.get('eval_loss')):.4f}"
-            if row.get("full_eval_loss", "") != "":
-                eval_msg += f" full_eval_loss={float(row.get('full_eval_loss')):.4f}"
+                eval_msg = f" eval_loss={float(row.get('eval_loss')):.4f}"
             print(
                 f"step={step} loss={row['loss']:.4f} "
+                f"batch={valid}/{samples_per_update} micro={micro_batch_size} "
                 f"target_logp={row.get('target_logp', 0.0):.4f} "
                 f"modelR={row.get('model_reward', 0.0):+.3f} "
                 f"Rstd={row.get('rollout_reward_std', 0.0):.3f} "
@@ -1076,25 +795,31 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     if not last_path.exists():
         save_checkpoint(last_path, model, ema, optimizer, cfg, steps, last_row or {"loss": float("inf")})
 
-    # If sparse full eval was disabled or never produced a valid best, select by one final full-validation pass.
+    # If periodic eval was disabled or never produced a valid best, select by one final validation pass.
     if not best_path.exists():
-        final_eval_for_best = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
+        final_eval_for_best = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
         final_eval_for_best.update({
-            "eval_kind": "full_final_fallback",
-            "eval_split": full_eval_split,
-            "eval_limit": full_eval_limit_for_logs,
+            "eval_split": eval_split,
+            "eval_limit": eval_limit_for_logs,
             "step": steps,
             "run_id": run_id,
             "best_metric_name": best_metric_name,
             "best_mode": best_mode,
         })
-        final_eval_for_best["full_eval_loss"] = final_eval_for_best.get("eval_loss", float("inf"))
-        best_metric_value = metric_from_full_eval(final_eval_for_best, best_metric_name, best_mode)
+        best_metric_value = get_metric_value(
+            final_eval_for_best,
+            best_metric_name,
+            get_metric_value(final_eval_for_best, "eval_loss", initial_best_value(best_mode)),
+        )
         best_step = steps
         best_eval_info = dict(final_eval_for_best)
         best_row = dict(last_row or {})
-        add_eval_prefix(best_row, "full_eval", final_eval_for_best)
-        best_row.update({"best_metric_value": best_metric_value, "is_best_eval": 1.0})
+        best_row.update({
+            "eval_loss": final_eval_for_best.get("eval_loss"),
+            "eval_count": final_eval_for_best.get("eval_count"),
+            "best_metric_value": best_metric_value,
+            "is_best_eval": 1.0,
+        })
         save_checkpoint(
             best_path,
             model,
@@ -1105,34 +830,6 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
             {"best_metric_name": best_metric_name, "best_mode": best_mode, "best_metric_value": best_metric_value, **best_row},
         )
         dump_json(out_dir / "best_eval.json", best_eval_info)
-
-    if not best_reward_path.exists():
-        # If sparse full eval never ran, the final model is also the reward-best candidate.
-        final_reward_eval = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
-        final_reward_eval.update({
-            "eval_kind": "full_final_reward_fallback",
-            "eval_split": full_eval_split,
-            "eval_limit": full_eval_limit_for_logs,
-            "step": steps,
-            "run_id": run_id,
-            "best_metric_name": reward_best_metric_name,
-            "best_mode": reward_best_mode,
-        })
-        final_reward_eval["full_eval_loss"] = final_reward_eval.get("eval_loss", float("inf"))
-        best_reward_metric_value = metric_from_full_eval(final_reward_eval, reward_best_metric_name, reward_best_mode)
-        best_reward_step = steps
-        best_reward_eval_info = dict(final_reward_eval)
-        best_reward_eval_info["best_metric_value"] = best_reward_metric_value
-        save_checkpoint(
-            best_reward_path,
-            model,
-            ema,
-            optimizer,
-            cfg,
-            steps,
-            {"best_metric_name": reward_best_metric_name, "best_mode": reward_best_mode, "best_metric_value": best_reward_metric_value, **(last_row or {})},
-        )
-        dump_json(out_dir / "best_reward_eval.json", best_reward_eval_info)
 
     # Evaluate the run's validation-selected best checkpoint, then compete for root global best.
     try:
@@ -1148,94 +845,17 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     except Exception as exc:
         print(f"[warn] failed to reload best checkpoint for final eval: {exc}", flush=True)
 
-    eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
+    eval_info = evaluate_loss(model, graph, noise, tokenizer, eval_samples, cfg, device, limit=eval_limit)
     eval_info.update({
-        "eval_kind": "full_final_best",
-        "eval_split": full_eval_split,
-        "eval_limit": full_eval_limit_for_logs,
+        "eval_split": eval_split,
+        "eval_limit": eval_limit_for_logs,
         "run_id": run_id,
         "best_step": best_step,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
-        "reward_best_metric_name": reward_best_metric_name,
-        "reward_best_mode": reward_best_mode,
-        "best_metric_value": metric_from_full_eval(eval_info, best_metric_name, best_mode),
+        "best_metric_value": best_metric_value,
     })
-    eval_info["full_eval_loss"] = eval_info.get("eval_loss", float("inf"))
-    best_metric_value = metric_from_full_eval(eval_info, best_metric_name, best_mode)
-
-    # Cheap safeguard against missing a good step between sparse full evals:
-    # also full-evaluate the best mini-eval checkpoint, then keep it if it wins.
-    if best_mini_path.exists():
-        try:
-            state = torch.load(best_mini_path, map_location=device)
-            model.load_state_dict(state.get("model", state), strict=True)
-            if isinstance(state, dict) and "ema" in state:
-                try:
-                    ema.load_state_dict(state["ema"])
-                    ema.store(model.parameters())
-                    ema.copy_to(model.parameters())
-                except Exception:
-                    pass
-            mini_full_eval = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
-            mini_full_eval.update({
-                "eval_kind": "full_final_best_mini",
-                "eval_split": full_eval_split,
-                "eval_limit": full_eval_limit_for_logs,
-                "run_id": run_id,
-                "best_step": best_mini_step,
-                "best_metric_name": best_metric_name,
-                "best_mode": best_mode,
-            })
-            mini_full_eval["full_eval_loss"] = mini_full_eval.get("eval_loss", float("inf"))
-            mini_metric = metric_from_full_eval(mini_full_eval, best_metric_name, best_mode)
-            mini_full_eval["best_metric_value"] = mini_metric
-            dump_json(out_dir / "best_mini_full_eval.json", mini_full_eval)
-            if metric_better(mini_metric, best_metric_value, best_mode):
-                shutil.copy2(best_mini_path, best_path)
-                best_metric_value = mini_metric
-                best_step = best_mini_step
-                eval_info = mini_full_eval
-                best_eval_info = dict(mini_full_eval)
-                dump_json(out_dir / "best_eval.json", best_eval_info)
-                print(f"[final rerank] best_mini won on full eval: {best_metric_name}={mini_metric:.6g}", flush=True)
-        except Exception as exc:
-            print(f"[warn] failed to full-evaluate best_mini: {exc}", flush=True)
-
-    eval_info["best_step"] = best_step
-    eval_info["best_metric_value"] = best_metric_value
     dump_json(out_dir / "eval.json", eval_info)
-
-    # Final full-eval of the reward-selected checkpoint.  This is the per-run
-    # source for root best_reward.pth.
-    reward_eval_info = dict(best_reward_eval_info or {})
-    if best_reward_path.exists():
-        try:
-            state = torch.load(best_reward_path, map_location=device)
-            model.load_state_dict(state.get("model", state), strict=True)
-            if isinstance(state, dict) and "ema" in state:
-                try:
-                    ema.load_state_dict(state["ema"])
-                    ema.store(model.parameters())
-                    ema.copy_to(model.parameters())
-                except Exception:
-                    pass
-            reward_eval_info = evaluate_loss(model, graph, noise, tokenizer, full_eval_samples, cfg, device, limit=full_eval_limit)
-            reward_eval_info.update({
-                "eval_kind": "full_final_best_reward",
-                "eval_split": full_eval_split,
-                "eval_limit": full_eval_limit_for_logs,
-                "run_id": run_id,
-                "best_step": best_reward_step,
-                "best_metric_name": reward_best_metric_name,
-                "best_mode": reward_best_mode,
-            })
-            reward_eval_info["full_eval_loss"] = reward_eval_info.get("eval_loss", float("inf"))
-            best_reward_metric_value = metric_from_full_eval(reward_eval_info, reward_best_metric_name, reward_best_mode)
-            reward_eval_info["best_metric_value"] = best_reward_metric_value
-            dump_json(out_dir / "best_reward_eval.json", reward_eval_info)
-        except Exception as exc:
-            print(f"[warn] failed to reload/evaluate best_reward: {exc}", flush=True)
 
     metrics_json = {
         "run_id": run_id,
@@ -1243,33 +863,15 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "best_step": best_step,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
-        "reward_best_metric_name": reward_best_metric_name,
-        "reward_best_mode": reward_best_mode,
         "best_metric_value": best_metric_value,
         "last_train_loss": float(last_row.get("loss", float("inf"))) if last_row else float("inf"),
         "eval_loss": float(eval_info.get("eval_loss", float("inf"))),
-        "full_eval_loss": float(eval_info.get("full_eval_loss", eval_info.get("eval_loss", float("inf")))),
-        "eval_split": full_eval_split,
+        "eval_split": eval_split,
         "eval_count": int(eval_info.get("eval_count", 0)),
-        "mini_eval_split": eval_split,
-        "mini_eval_count": len(eval_samples),
-        "best_mini_step": best_mini_step,
         "last_row": last_row,
         "best_row": best_row,
         "best_eval_metrics": best_eval_info,
         "eval_metrics": eval_info,
-        "baseline_eval_metrics": baseline_eval_info,
-        "loss_best_before_after": before_after_summary(baseline_eval_info, eval_info),
-        "reward_best": {
-            "best_step": best_reward_step,
-            "best_metric_name": reward_best_metric_name,
-            "best_mode": reward_best_mode,
-            "best_metric_value": best_reward_metric_value,
-            "checkpoint": str(best_reward_path),
-            "eval_metrics": reward_eval_info,
-            "before_after": before_after_summary(baseline_eval_info, reward_eval_info),
-            "best_row": best_reward_row,
-        },
     }
     dump_json(out_dir / "metrics.json", metrics_json)
 
@@ -1284,32 +886,15 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         best_metric_name=best_metric_name,
         best_mode=best_mode,
     )
-    improved_reward = update_global_reward_best(
-        out_root,
-        out_dir,
-        best_reward_path,
-        reward_eval_info,
-        metrics_json,
-        run_info_path,
-        reward_metric_name=reward_best_metric_name,
-        reward_mode=reward_best_mode,
-    )
     print(f"Done. Outputs: {out_dir}", flush=True)
     print(
-        f"Run full_eval_loss={eval_info.get('full_eval_loss', eval_info.get('eval_loss'))} "
-        f"{best_metric_name}={metric_from_full_eval(eval_info, best_metric_name, best_mode)} "
+        f"Run eval_loss={eval_info.get('eval_loss')} "
+        f"{best_metric_name}={eval_info.get(best_metric_name, best_metric_value)} "
         f"best_step={best_step} improved_global_best={improved}",
-        flush=True,
-    )
-    print(
-        f"Run reward_best {reward_best_metric_name}={metric_from_full_eval(reward_eval_info, reward_best_metric_name, reward_best_mode)} "
-        f"best_reward_step={best_reward_step} improved_root_best_reward={improved_reward}",
         flush=True,
     )
     if improved:
         print(f"Updated root global best files under: {out_root}", flush=True)
-    if improved_reward:
-        print(f"Updated root reward-best checkpoint: {out_root / 'best_reward.pth'}", flush=True)
     return out_dir
 
 def main():

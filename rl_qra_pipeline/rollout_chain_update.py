@@ -448,7 +448,12 @@ def rollout_chain_loss(
             continue
 
         if memory_safe_replay and torch.is_grad_enabled():
-            denom = max(1, len(records)) * max(1, num_rollouts)
+            # When train_rl_qra.py accumulates multiple different samples before one
+            # optimizer.step(), memory_safe_replay still calls backward inside this
+            # function.  loss_normalizer keeps the effective update size invariant:
+            # sample 8/16/32 rollouts => average their gradients, not multiply LR.
+            loss_normalizer = float(r_cfg.get("loss_normalizer", 1.0) or 1.0)
+            denom = max(1, len(records)) * max(1, num_rollouts) * max(1.0, loss_normalizer)
             rollout_loss_value = 0.0
             for rec, a in zip(records, adv):
                 logprob, entropy, anchor_loss = _recompute_action_terms_from_state(
@@ -542,6 +547,9 @@ def rollout_chain_loss(
         "_already_backward": bool(memory_safe_replay) and torch.is_grad_enabled(),
         "guided_states": float(max(1, num_rollouts)),
         "guided_targets": float(len(all_rewards)),
+        "rollout_num_rollouts": float(max(1, num_rollouts)),
+        "rollout_loss_normalizer": float(r_cfg.get("loss_normalizer", 1.0) or 1.0),
+        "rollout_samples_per_update": float(r_cfg.get("samples_per_update", 1.0) or 1.0),
         "rrpi_loss": float(loss_out.detach().item()),
         "rollout_loss": float(loss_out.detach().item()),
         "rollout_reward": mean_reward,

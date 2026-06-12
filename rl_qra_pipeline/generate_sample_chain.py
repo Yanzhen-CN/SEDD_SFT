@@ -703,6 +703,21 @@ def load_model_for_trace(cfg: Dict[str, Any], spec: Dict[str, Any], device: torc
 
 # ------------------------------- trace score -------------------------------
 
+def visible_control_text(text: Any) -> str:
+    """Render decoded token text without real control characters.
+
+    Generation can sample GPT-2/BPE tokens containing real newlines or tabs.
+    For diagnostic CSVs we show them explicitly as \n / \t instead of letting
+    local CSV viewers split one logical row across multiple display lines.
+    """
+    s = "" if text is None else str(text)
+    s = s.replace("\r\n", "\\n")
+    s = s.replace("\n", "\\n")
+    s = s.replace("\r", "\\r")
+    s = s.replace("\t", "\\t")
+    return s
+
+
 def visible_answer_tokens(tokenizer, ids: Sequence[int], mask_id: int, vocab_size: int) -> Tuple[str, List[str]]:
     pieces = []
     token_texts = []
@@ -712,7 +727,8 @@ def visible_answer_tokens(tokenizer, ids: Sequence[int], mask_id: int, vocab_siz
             pieces.append("□")
             token_texts.append("□")
         else:
-            txt = tokenizer.decode([ti])
+            raw_txt = tokenizer.decode([ti])
+            txt = visible_control_text(raw_txt)
             pieces.append(txt)
             token_texts.append(txt)
     return "".join(pieces), token_texts
@@ -1275,6 +1291,11 @@ def main() -> None:
         wide_rows = build_wide_chain_rows(chosen, results_by_sample, model_names)
         wide_fields = wide_chain_fields(model_names)
         write_csv(out_dir / "chain.csv", wide_rows, fields=wide_fields)
+        # Long token-aware debug table: one row per sample/model/step.  This is
+        # the place to inspect whether a visible character came from one BPE
+        # token such as "mx" or from separate slots, and whether a token carried
+        # a real newline rendered as \n.
+        write_csv(out_dir / "chain_debug_long.csv", all_rows, fields=CHAIN_FIELDS)
         used_names = set()
         for sample_i, sample in enumerate(chosen, start=1):
             sid = str(sample.get("id", f"sample_{sample_i}"))
@@ -1298,6 +1319,7 @@ def main() -> None:
 
         logger.print("-" * 88)
         logger.print(f"wrote: {out_dir / 'chain.csv'}")
+        logger.print(f"wrote: {out_dir / 'chain_debug_long.csv'}")
         logger.print(f"wrote: {chains_dir}/<sample_id>_chain.csv")
         logger.print(f"wrote: {out_dir / 'run.log'}")
         logger.print(f"wrote: {out_dir / 'sample_report.txt'}")
