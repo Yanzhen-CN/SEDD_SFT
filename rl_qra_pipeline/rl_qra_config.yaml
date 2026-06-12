@@ -50,16 +50,47 @@ starts:
     output_name: rl_QRA
 
 training:
-  # 1500 steps is about 2+ passes over the current S1K_RL train split.
-  steps: 1500
+  # QRA refine uses batched rollout updates. With samples_per_update=16,
+  # 180 optimizer steps = 2880 sample-rollouts; this is deliberately
+  # much smaller than the old 1500 single-sample updates to avoid over-RL.
+  steps: 100
   # Effective number of different samples used before one optimizer.step().
   # Try 8, 16, 32 depending on GPU memory. Old batch_size is kept as alias.
-  samples_per_update: 8
-  batch_size: 8
+  samples_per_update: 16
+  batch_size: 16
   # Split samples_per_update into smaller groups for memory/control flow.
   # With rollout.memory_safe_replay=true, gradients are normalized by samples_per_update
   # so changing 1 -> 8/16/32 does not implicitly multiply the learning rate.
   micro_batch_size: 8
+  # Select samples per update with a simple-focused quota instead of pure random.
+  # QRA refine should mostly protect easy/short answers and only lightly expose
+  # hard forms each update. For samples_per_update=16, the default quota below is:
+  #   integer 4, decimal 3, letter 3, interval 2, unit_decimal 1, symbolic 1, equation 1, inequality 1.
+  # Hard kinds are capped at one sample per update unless their cap is raised.
+  sample_selector: kind_quota
+  sample_kind_order:
+    - integer
+    - decimal
+    - letter
+    - interval
+    - unit_decimal
+    - symbolic
+    - equation
+    - inequality
+  sample_kind_quota:
+    integer: 4
+    decimal: 3
+    letter: 3
+    interval: 2
+    unit_decimal: 1
+    symbolic: 1
+    equation: 1
+    inequality: 1
+  sample_kind_max_per_update:
+    symbolic: 1
+    equation: 1
+    inequality: 1
+
   lr: 2.0e-7
   weight_decay: 0.0
   grad_clip: 0.5
@@ -67,7 +98,7 @@ training:
   log_every: 1
 
   # Periodic checkpoint for recovery only. best.pth is selected by validation.
-  save_every: 500
+  save_every: 50
 
   # Dense mini-eval: every step evaluates the fixed val-mini.jsonl subset.
   # This gives a cheap, comparable curve because the 8 mini samples are fixed.

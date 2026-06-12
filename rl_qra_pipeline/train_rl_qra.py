@@ -147,6 +147,316 @@ def cycle_samples(samples: List[Dict], seed: int) -> Iterable[Dict]:
             yield item
 
 
+DEFAULT_KIND_ORDER = [
+    "interval",
+    "decimal",
+    "integer",
+    "letter",
+    "symbolic",
+    "unit_decimal",
+    "equation",
+    "inequality",
+]
+
+
+def normalize_answer_kind(kind: Any) -> str:
+    k = str(kind or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "single_integer": "integer",
+        "int": "integer",
+        "number": "integer",
+        "single_letter": "letter",
+        "choice": "letter",
+        "multiple_choice": "letter",
+        "unit": "unit_decimal",
+        "unit_number": "unit_decimal",
+        "units": "unit_decimal",
+        "ineq": "inequality",
+        "expr": "symbolic",
+    }
+    return aliases.get(k, k or "other")
+
+
+def infer_answer_kind(sample: Dict[str, Any]) -> str:
+    # Prefer explicit metadata if preparation code already tagged the answer.
+    for key in ("answer_kind", "answer_type", "kind", "type"):
+        if sample.get(key):
+            return normalize_answer_kind(sample.get(key))
+    for parent_key in ("meta", "base_meta", "answer_meta"):
+        meta = sample.get(parent_key)
+        if isinstance(meta, dict):
+            for key in ("answer_kind", "answer_type", "kind", "type"):
+                if meta.get(key):
+                    return normalize_answer_kind(meta.get(key))
+
+    # Synthetic ids usually contain the type name.
+    sid = str(sample.get("id", "")).lower()
+    for kind in DEFAULT_KIND_ORDER:
+        if f"_{kind}_" in sid or sid.endswith(f"_{kind}"):
+            return kind
+
+    # Fallback heuristic from answer text.  This is only for sampling balance,
+    # not for reward correctness.
+    import re
+    ans = str(sample.get("answer", "") or "").strip()
+    compact = re.sub(r"\s+", "", ans)
+    if re.fullmatch(r"[A-E]", compact):
+        return "letter"
+    if re.fullmatch(r"[\(\[][+-]?\d+(?:\.\d+)?,[+-]?\d+(?:\.\d+)?[\)\]]", compact):
+        return "interval"
+    if re.search(r"(?:<=|>=|<|>|\leq|\geq)", compact):
+        return "inequality"
+    if "=" in compact:
+        return "equation"
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?[a-zA-Z\\/%°]+", compact) or re.fullmatch(r"[+-]?\d+(?:\.\d+)?[a-zA-Z].*", compact):
+        return "unit_decimal"
+    if re.fullmatch(r"[+-]?\d+", compact):
+        return "integer"
+    if re.fullmatch(r"[+-]?\d*\.\d+", compact):
+        return "decimal"
+    if any(ch in compact for ch in ["/", "^", "\\", "_", "{"]):
+        return "symbolic"
+    return "other"
+
+
+def make_kind_buckets(samples: List[Dict[str, Any]], seed: int) -> Dict[str, List[Dict[str, Any]]]:
+    rng = random.Random(seed)
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for sample in samples:
+        kind = infer_answer_kind(sample)
+        buckets.setdefault(kind, []).append(sample)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+    return buckets
+
+
+def cycle_kind_balanced_batches(
+    samples: List[Dict[str, Any]],
+    seed: int,
+    samples_per_update: int,
+    kind_order: List[str] | None = None,
+) -> Iterable[List[Dict[str, Any]]]:
+    """Yield update batches with approximately balanced answer kinds.
+
+    For samples_per_update=8 and the default 8 kinds, this tries to draw
+    one sample per kind.  For samples_per_update=16, it draws two rounds of
+    the same kind order.  Missing/empty kinds are skipped and the remaining
+    kinds are cycled.  Every selected sample has equal update weight later;
+    this function only controls which samples enter the update.
+    """
+    rng = random.Random(seed)
+    buckets = make_kind_buckets(samples, seed)
+    configured = [normalize_answer_kind(k) for k in (kind_order or DEFAULT_KIND_ORDER)]
+    ordered_kinds = [k for k in configured if buckets.get(k)]
+    # Append any remaining detected kinds so they are not silently ignored.
+    ordered_kinds.extend(k for k in sorted(buckets) if k not in ordered_kinds and buckets.get(k))
+    if not ordered_kinds:
+        random_iter = cycle_samples(samples, seed)
+        while True:
+            yield [next(random_iter) for _ in range(samples_per_update)]
+
+    ptr = {k: 0 for k in ordered_kinds}
+    offset = 0
+    while True:
+        batch: List[Dict[str, Any]] = []
+        round_kinds = ordered_kinds[offset:] + ordered_kinds[:offset]
+        while len(batch) < samples_per_update:
+            for kind in round_kinds:
+                bucket = buckets[kind]
+                if ptr[kind] >= len(bucket):
+                    rng.shuffle(bucket)
+                    ptr[kind] = 0
+                batch.append(bucket[ptr[kind]])
+                ptr[kind] += 1
+                if len(batch) >= samples_per_update:
+                    break
+        offset = (offset + 1) % max(1, len(ordered_kinds))
+        yield batch
+
+
+
+def _positive_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except Exception:
+        return int(default)
+
+
+def make_kind_quota_plan(train_cfg: Dict[str, Any], rollout_cfg: Dict[str, Any], samples_per_update: int) -> Tuple[List[str], Dict[str, int], str]:
+    """Build a per-update kind quota plan.
+
+    The quota sampler is meant for QRA refine: simple answer kinds should be
+    over-represented and hard symbolic/equation/inequality samples should be
+    capped.  The explicit sample_kind_quota is the source of truth.  If its
+    total differs from samples_per_update, we scale/fill/truncate while
+    respecting optional per-kind caps.
+    """
+    quota_cfg = train_cfg.get("sample_kind_quota", rollout_cfg.get("sample_kind_quota", {})) or {}
+    weight_cfg = train_cfg.get("sample_kind_weights", rollout_cfg.get("sample_kind_weights", {})) or {}
+    cap_cfg = train_cfg.get("sample_kind_max_per_update", rollout_cfg.get("sample_kind_max_per_update", {})) or {}
+    kind_order = train_cfg.get("sample_kind_order", rollout_cfg.get("sample_kind_order", DEFAULT_KIND_ORDER)) or DEFAULT_KIND_ORDER
+    kind_order = [normalize_answer_kind(k) for k in list(kind_order)]
+
+    # Default simple-focused quota for 16 samples/update.  This intentionally
+    # gives integer/decimal/letter more mass and caps hard kinds at 1 each.
+    if not quota_cfg and not weight_cfg:
+        quota_cfg = {
+            "integer": 4,
+            "decimal": 3,
+            "letter": 3,
+            "interval": 2,
+            "unit_decimal": 1,
+            "symbolic": 1,
+            "equation": 1,
+            "inequality": 1,
+        }
+        cap_cfg = {**{"symbolic": 1, "equation": 1, "inequality": 1}, **dict(cap_cfg)}
+
+    quotas: Dict[str, int] = {}
+    for k in kind_order:
+        nk = normalize_answer_kind(k)
+        if nk in quota_cfg:
+            quotas[nk] = _positive_int(quota_cfg.get(nk), 0)
+        elif nk in weight_cfg:
+            quotas[nk] = _positive_int(weight_cfg.get(nk), 0)
+        else:
+            quotas[nk] = 0
+    # Include any explicitly configured kinds that are not in sample_kind_order.
+    for raw_k, raw_v in {**dict(weight_cfg), **dict(quota_cfg)}.items():
+        nk = normalize_answer_kind(raw_k)
+        if nk not in quotas:
+            quotas[nk] = _positive_int(raw_v, 0)
+            kind_order.append(nk)
+
+    caps = {normalize_answer_kind(k): _positive_int(v, samples_per_update) for k, v in dict(cap_cfg).items()}
+
+    # If the requested update size differs from the quota total, adjust using
+    # weights from the same simple-first order.  This keeps 8/16/32 usable from
+    # one config.
+    total = sum(quotas.values())
+    if total <= 0:
+        quotas = {k: 1 for k in kind_order}
+        total = sum(quotas.values())
+
+    def can_add(k: str) -> bool:
+        return quotas.get(k, 0) < caps.get(k, samples_per_update)
+
+    if total < samples_per_update:
+        # Fill extra slots by cycling simple-first kinds. Hard kinds with cap=1
+        # will not grow unless the user raises their cap.
+        idx = 0
+        fill_order = [k for k in kind_order if k in quotas and quotas[k] > 0] or list(quotas)
+        while sum(quotas.values()) < samples_per_update and fill_order:
+            k = fill_order[idx % len(fill_order)]
+            if can_add(k):
+                quotas[k] += 1
+            idx += 1
+            if idx > samples_per_update * max(4, len(fill_order) * 4):
+                # Caps may prevent filling; relax by adding to the first kind.
+                quotas[fill_order[0]] += 1
+    elif total > samples_per_update:
+        # Truncate from the tail first, so hard/later kinds lose slots before
+        # easy/front kinds. Keep one slot for a kind as long as possible.
+        reduce_order = list(reversed(kind_order))
+        idx = 0
+        while sum(quotas.values()) > samples_per_update and reduce_order:
+            k = reduce_order[idx % len(reduce_order)]
+            if quotas.get(k, 0) > 0:
+                quotas[k] -= 1
+            idx += 1
+
+    plan: List[str] = []
+    for k in kind_order:
+        plan.extend([k] * quotas.get(k, 0))
+    # Fallback if a weird config produced too few entries.
+    while len(plan) < samples_per_update:
+        plan.append(kind_order[0] if kind_order else DEFAULT_KIND_ORDER[0])
+    plan = plan[:samples_per_update]
+    return plan, quotas, ",".join(f"{k}:{quotas.get(k,0)}" for k in kind_order if quotas.get(k, 0) > 0)
+
+
+def cycle_kind_quota_batches(
+    samples: List[Dict[str, Any]],
+    seed: int,
+    samples_per_update: int,
+    cfg: Dict[str, Any],
+) -> Iterable[List[Dict[str, Any]]]:
+    """Yield per-update batches following explicit simple-focused quotas.
+
+    This differs from kind_balanced: it can intentionally oversample easy kinds
+    such as integer/decimal/letter and cap hard kinds such as equation and
+    inequality to at most one sample per update.
+    """
+    rng = random.Random(seed)
+    train_cfg = cfg.get("training", {}) or {}
+    rollout_cfg = cfg.get("rollout", {}) or {}
+    buckets = make_kind_buckets(samples, seed)
+    plan, quotas, plan_label = make_kind_quota_plan(train_cfg, rollout_cfg, samples_per_update)
+
+    # Keep known kinds in plan order, but if a requested kind is absent we will
+    # substitute from available simple-first kinds instead of failing.
+    fallback_order = [normalize_answer_kind(k) for k in (train_cfg.get("sample_fallback_order") or [
+        "integer", "decimal", "letter", "interval", "unit_decimal", "symbolic", "equation", "inequality", "other"
+    ])]
+    fallback_order.extend(k for k in sorted(buckets) if k not in fallback_order)
+    fallback_order = [k for k in fallback_order if buckets.get(k)]
+    if not fallback_order:
+        random_iter = cycle_samples(samples, seed)
+        while True:
+            yield [next(random_iter) for _ in range(samples_per_update)]
+
+    ptr = {k: 0 for k in buckets}
+
+    def draw_from_kind(kind: str) -> Dict[str, Any]:
+        draw_kind = kind if buckets.get(kind) else None
+        if draw_kind is None:
+            # Substitute with the first available simple-first kind.
+            draw_kind = fallback_order[0]
+        bucket = buckets[draw_kind]
+        if ptr[draw_kind] >= len(bucket):
+            rng.shuffle(bucket)
+            ptr[draw_kind] = 0
+        item = bucket[ptr[draw_kind]]
+        ptr[draw_kind] += 1
+        return item
+
+    step_offset = 0
+    while True:
+        # Rotate only within the same multiset quota so each kind gets the same
+        # count per update but sample ordering varies a little.
+        rotated = plan[step_offset:] + plan[:step_offset]
+        batch = [draw_from_kind(k) for k in rotated[:samples_per_update]]
+        step_offset = (step_offset + 1) % max(1, len(plan))
+        yield batch
+
+def make_update_batch_iter(samples: List[Dict[str, Any]], cfg: Dict[str, Any], seed: int, samples_per_update: int) -> Iterable[List[Dict[str, Any]]]:
+    train_cfg = cfg.get("training", {}) or {}
+    rollout_cfg = cfg.get("rollout", {}) or {}
+    selector = str(
+        train_cfg.get(
+            "sample_selector",
+            train_cfg.get("sampler", rollout_cfg.get("sample_selector", rollout_cfg.get("sampler", "random"))),
+        )
+    ).strip().lower()
+    selector = selector.replace("-", "_")
+    if selector in {"kind_quota", "quota", "simple_focused", "easy_focused", "qra_simple_focused"}:
+        return cycle_kind_quota_batches(samples, seed, samples_per_update, cfg)
+    if selector in {"kind_balanced", "balanced", "answer_kind_balanced", "type_balanced"}:
+        kind_order = train_cfg.get("sample_kind_order", rollout_cfg.get("sample_kind_order", DEFAULT_KIND_ORDER))
+        return cycle_kind_balanced_batches(samples, seed, samples_per_update, list(kind_order or DEFAULT_KIND_ORDER))
+    random_iter = cycle_samples(samples, seed)
+    while True:
+        yield [next(random_iter) for _ in range(samples_per_update)]
+
+
+def summarize_batch_kinds(samples: List[Dict[str, Any]]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for sample in samples:
+        kind = infer_answer_kind(sample)
+        out[kind] = out.get(kind, 0) + 1
+    return out
+
+
 def load_samples(cfg: Dict, split: str, tokenizer) -> List[Dict]:
     data_dir_value = cfg.get("data", {}).get("data_dir")
     if not data_dir_value:
@@ -560,7 +870,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     samples = load_samples(cfg, split, tokenizer)
     if not samples:
         raise RuntimeError("No training samples loaded.")
-    sample_iter = cycle_samples(samples, seed)
+    # The update sampler is created after samples_per_update is resolved below.
 
     # Load validation samples once.  Best checkpoints are selected by mean validation metrics,
     # never by the single training sample loss from an update step.
@@ -583,6 +893,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     # because each rollout action is replayed/backwarded one by one.
     micro_batch_size = int(train_cfg.get("micro_batch_size", train_cfg.get("rl_micro_batch_size", samples_per_update)))
     micro_batch_size = max(1, min(samples_per_update, micro_batch_size))
+    sample_selector = str(train_cfg.get("sample_selector", train_cfg.get("sampler", cfg.get("rollout", {}).get("sample_selector", "random")))).strip().lower()
+    batch_iter = make_update_batch_iter(samples, cfg, seed, samples_per_update)
     # Backward-compatible alias used below.
     batch_size = samples_per_update
     steps = int(cfg["training"].get("steps", 1000))
@@ -617,6 +929,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "num_samples": len(samples),
         "samples_per_update": samples_per_update,
         "micro_batch_size": micro_batch_size,
+        "sample_selector": sample_selector,
+        "sample_kind_order": train_cfg.get("sample_kind_order", cfg.get("rollout", {}).get("sample_kind_order", DEFAULT_KIND_ORDER)),
         "data_split": split,
         "eval_split": eval_split,
         "eval_limit": eval_limit_for_logs,
@@ -657,7 +971,8 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         valid = 0
         already_backward_count = 0
         logged_loss_values: List[float] = []
-        update_samples = [next(sample_iter) for _ in range(samples_per_update)]
+        update_samples = next(batch_iter)
+        batch_kind_counts = summarize_batch_kinds(update_samples)
         for micro_start in range(0, len(update_samples), micro_batch_size):
             micro_samples = update_samples[micro_start: micro_start + micro_batch_size]
             for sample in micro_samples:
