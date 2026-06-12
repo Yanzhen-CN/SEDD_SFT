@@ -2,19 +2,19 @@ from __future__ import annotations
 
 """Compare SEDD/QRA/RL answer-mask recovery chains.
 
-Default comparison models are exactly six:
-    pretrain_start, pretrain_loss_best, pretrain_reward_best,
-    QRA_start, QRA_loss_best, QRA_reward_best
+Default comparison models are exactly six and the main chain.csv columns are:
+    pretrain, rl_pretrain_bestloss, rl_pretrain_bestreward,
+    QRA, rl_QRA_bestloss, rl_QRA_bestreward
 
-For each start family we compare: starting model, RL loss-best checkpoint,
-and RL reward-best checkpoint.  The reward-best checkpoint is best_reward.pth;
-if it is missing, the script falls back to the newest per-run last.pth and
-records that fallback in model_plan.json/run.log.
+For each start family we compare: starting model, RL loss-best checkpoint
+(best.pth), and RL reward-best checkpoint (best_reward.pth).  If reward-best
+is missing, the script falls back to the newest per-run last.pth and records
+that fallback in model_plan.json/run.log.
 
 Default output:
     experiment/sample_chain/<timestamp>_<run_name>/
-        chain.csv                         # all samples / all models / all steps
-        chains/<sample_id>_chain.csv       # one CSV per sample, all models in that sample
+        chain.csv                         # one row per sample/step, six model answers side by side
+        chains/<sample_id>_chain.csv       # one CSV per sample, same compact wide columns
         run.log                           # terminal-style comparison log
         sample_report.txt                 # question/reasoning/GT + final answer of every model
 
@@ -60,12 +60,12 @@ from state_builder import (  # noqa: E402
 
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 DEFAULT_MODELS = [
-    "pretrain_start",
-    "pretrain_loss_best",
-    "pretrain_reward_best",
-    "QRA_start",
-    "QRA_loss_best",
-    "QRA_reward_best",
+    "pretrain",
+    "rl_pretrain_bestloss",
+    "rl_pretrain_bestreward",
+    "QRA",
+    "rl_QRA_bestloss",
+    "rl_QRA_bestreward",
 ]
 
 
@@ -228,13 +228,13 @@ def reward_checkpoint_or_fallback(root: Path) -> Tuple[Optional[Path], str, Opti
 def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return model specs with fields: name, checkpoint, pretrained, source.
 
-    The default comparison is exactly six models:
-      pretrain_start        = pretrained/cache SEDD start
-      pretrain_loss_best    = rl_pretrain/best.pth
-      pretrain_reward_best  = rl_pretrain/best_reward.pth
-      QRA_start             = starts.QRA.init_checkpoint
-      QRA_loss_best         = rl_QRA/best.pth
-      QRA_reward_best       = rl_QRA/best_reward.pth
+    The default comparison is exactly six columns:
+      pretrain                = pretrained/cache SEDD start
+      rl_pretrain_bestloss    = rl_pretrain/best.pth
+      rl_pretrain_bestreward  = rl_pretrain/best_reward.pth
+      QRA                     = starts.QRA.init_checkpoint
+      rl_QRA_bestloss         = rl_QRA/best.pth
+      rl_QRA_bestreward       = rl_QRA/best_reward.pth
     """
     if args.checkpoint:
         return [{
@@ -255,37 +255,37 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
         # ----- pretrain family: start / loss-best / reward-best -----
         if name_l in {"pretrain", "pretrain_start", "start_pretrain"}:
             specs.append({
-                "name": "pretrain_start",
+                "name": "pretrain",
                 "checkpoint": None,
                 "pretrained": model_pretrained_name(cfg, "pretrain"),
                 "source": "start_pretrained_or_cache",
             })
             continue
 
-        if name_l in {"pretrain_loss_best", "pretrain_best", "rl_pretrain", "rl_pretrain_best"}:
+        if name_l in {"rl_pretrain_bestloss", "pretrain_loss_best", "pretrain_best", "rl_pretrain", "rl_pretrain_best"}:
             ckpt = start_output_dir(cfg, "pretrain") / "best.pth"
             if ckpt.exists():
                 specs.append({
-                    "name": "pretrain_loss_best",
+                    "name": "rl_pretrain_bestloss",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "pretrain"),
                     "source": "rl_root_loss_best",
                 })
             else:
-                warnings.append(f"skip pretrain_loss_best: missing {ckpt}")
+                warnings.append(f"skip rl_pretrain_bestloss: missing {ckpt}")
             continue
 
-        if name_l in {"pretrain_reward_best", "pretrain_best_reward", "rl_pretrain_reward", "rl_pretrain_last"}:
+        if name_l in {"rl_pretrain_bestreward", "pretrain_reward_best", "pretrain_best_reward", "rl_pretrain_reward", "rl_pretrain_last"}:
             root = start_output_dir(cfg, "pretrain")
             ckpt, source, warning = reward_checkpoint_or_fallback(root)
             if ckpt is not None:
                 specs.append({
-                    "name": "pretrain_reward_best",
+                    "name": "rl_pretrain_bestreward",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "pretrain"),
                     "source": source,
                 })
-            warnings.append(f"pretrain_reward_best: {warning}" if warning else "")
+            warnings.append(f"rl_pretrain_bestreward: {warning}" if warning else "")
             continue
 
         # ----- QRA family: start / loss-best / reward-best -----
@@ -293,7 +293,7 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
             ckpt = init_checkpoint_path(cfg, "QRA")
             if ckpt is not None:
                 specs.append({
-                    "name": "QRA_start",
+                    "name": "QRA",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": "start_init_checkpoint",
@@ -302,30 +302,30 @@ def resolve_model_plan(args: argparse.Namespace, cfg: Dict[str, Any]) -> List[Di
                 warnings.append("skip QRA_start: starts.QRA.init_checkpoint missing or not found")
             continue
 
-        if name_l in {"qra_loss_best", "qra_best", "rl_qra", "rl_qra_best"}:
+        if name_l in {"rl_qra_bestloss", "qra_loss_best", "qra_best", "rl_qra", "rl_qra_best"}:
             ckpt = start_output_dir(cfg, "QRA") / "best.pth"
             if ckpt.exists():
                 specs.append({
-                    "name": "QRA_loss_best",
+                    "name": "rl_QRA_bestloss",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": "rl_root_loss_best",
                 })
             else:
-                warnings.append(f"skip QRA_loss_best: missing {ckpt}")
+                warnings.append(f"skip rl_QRA_bestloss: missing {ckpt}")
             continue
 
-        if name_l in {"qra_reward_best", "qra_best_reward", "rl_qra_reward", "rl_qra_last"}:
+        if name_l in {"rl_qra_bestreward", "qra_reward_best", "qra_best_reward", "rl_qra_reward", "rl_qra_last"}:
             root = start_output_dir(cfg, "QRA")
             ckpt, source, warning = reward_checkpoint_or_fallback(root)
             if ckpt is not None:
                 specs.append({
-                    "name": "QRA_reward_best",
+                    "name": "rl_QRA_bestreward",
                     "checkpoint": ckpt,
                     "pretrained": model_pretrained_name(cfg, "QRA"),
                     "source": source,
                 })
-            warnings.append(f"QRA_reward_best: {warning}" if warning else "")
+            warnings.append(f"rl_QRA_bestreward: {warning}" if warning else "")
             continue
 
         # ----- optional QA aliases kept for manual calls -----
@@ -903,18 +903,20 @@ def build_wide_chain_rows(
     results_by_sample: Dict[str, Dict[str, Dict[str, Any]]],
     model_names: List[str],
 ) -> List[Dict[str, Any]]:
-    """Build reference-style chain rows.
+    """Build the compact reference-style chain CSV.
 
-    One row is one (sample, denoising step).  Each model gets side-by-side
-    columns: <model>_answer and <model>_change, plus compact diagnostic fields.
-    This is easier to inspect than long format when comparing multiple models on
-    the same sample.
+    One row is one (sample, denoising step).  The only model columns are the
+    visible answer strings for the six comparison models, exactly like:
+      dataset,sample_id,gt_answer,answer_kind,step,t,pretrain,...
+
+    The generation process is shown by reading each model column down the rows.
+    Detailed diagnostics remain in run.log/sample_report.txt instead of making
+    chain.csv wide and hard to read.
     """
     rows: List[Dict[str, Any]] = []
     for sample_i, sample in enumerate(sample_order, start=1):
         sid = str(sample.get("id", f"sample_{sample_i}"))
         gt = extract_gt_answer(sample)
-        q, r = extract_question_reasoning(sample)
         sample_results = results_by_sample.get(sid, {})
         max_step = 0
         for res in sample_results.values():
@@ -925,7 +927,6 @@ def build_wide_chain_rows(
                     except Exception:
                         pass
         trace_maps = {m: trace_by_step(sample_results.get(m, {})) for m in model_names}
-        prev_tokens: Dict[str, List[str]] = {m: [] for m in model_names}
         for step in range(max_step + 1):
             t_val = ""
             for m in model_names:
@@ -934,56 +935,25 @@ def build_wide_chain_rows(
                     t_val = f"{float(tr.get('t', 0.0)):.4f}"
                     break
             row: Dict[str, Any] = {
-                "dataset": sample.get("dataset", sample.get("mode", "S1K_RL")),
-                "sample_index": sample_i,
+                "dataset": source_group(sample),
                 "sample_id": sid,
-                "source_group": source_group(sample),
-                "source": sample_source_text(sample),
                 "gt_answer": gt,
                 "answer_kind": answer_kind(gt),
                 "step": step,
                 "t": t_val,
             }
-            # Keep short previews in the all-chain CSV. Full question/reasoning are in sample_report.txt.
-            row["question_preview"] = short(q, 120)
-            row["reasoning_preview"] = short(r, 120)
             for m in model_names:
                 tr = trace_maps.get(m, {}).get(step)
-                if tr is None:
-                    row[f"{m}_answer"] = ""
-                    row[f"{m}_change"] = ""
-                    row[f"{m}_exact"] = ""
-                    row[f"{m}_mask"] = ""
-                    row[f"{m}_pos"] = ""
-                    row[f"{m}_tok"] = ""
-                    continue
-                curr_tokens = [str(x) for x in (tr.get("answer_token_texts") or [])]
-                if step == 0:
-                    change = ""
-                else:
-                    change = format_token_change(prev_tokens.get(m, []), curr_tokens)
-                prev_tokens[m] = curr_tokens
-                ans = str(tr.get("answer_text", ""))
-                row[f"{m}_answer"] = ans
-                row[f"{m}_change"] = change
-                row[f"{m}_exact"] = 1 if normalize_text(ans) == normalize_text(gt) else 0
-                row[f"{m}_mask"] = int(float(tr.get("mask_count", 0.0)))
-                row[f"{m}_pos"] = f"{float(tr.get('position_match', 0.0)):.4f}"
-                row[f"{m}_tok"] = f"{float(tr.get('token_set_match', 0.0)):.4f}"
+                row[m] = "" if tr is None else str(tr.get("answer_text", ""))
             rows.append(row)
     return rows
 
 
 def wide_chain_fields(model_names: List[str]) -> List[str]:
-    fields = [
-        "dataset", "sample_index", "sample_id", "source_group", "source", "gt_answer",
-        "answer_kind", "step", "t", "question_preview", "reasoning_preview",
+    return [
+        "dataset", "sample_id", "gt_answer", "answer_kind", "step", "t",
+        *model_names,
     ]
-    for m in model_names:
-        fields.extend([
-            f"{m}_answer", f"{m}_change", f"{m}_exact", f"{m}_mask", f"{m}_pos", f"{m}_tok",
-        ])
-    return fields
 
 def final_answer(result: Dict[str, Any]) -> str:
     trace = result.get("trace") or []
@@ -1091,7 +1061,7 @@ def main() -> None:
     parser.add_argument("--num-synthetic-samples", type=int, default=8, help="Default diagnostic synthetic sample count.")
     parser.add_argument("--samples-per-type", type=int, default=2)
     parser.add_argument("--sample-id", action="append", default=[], help="Specific sample id. Can be repeated.")
-    parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six: pretrain_start,pretrain_loss_best,pretrain_reward_best,QRA_start,QRA_loss_best,QRA_reward_best")
+    parser.add_argument("--models", default=",".join(DEFAULT_MODELS), help="Comma list. Default compares six compact columns: pretrain,rl_pretrain_bestloss,rl_pretrain_bestreward,QRA,rl_QRA_bestloss,rl_QRA_bestreward")
     parser.add_argument("--checkpoint", default=None, help="Trace one specific checkpoint only.")
     parser.add_argument("--checkpoint-name", default=None)
     parser.add_argument("--run-name", default="compare_pretrain_qra_rl")
@@ -1189,12 +1159,10 @@ def main() -> None:
                     torch.cuda.empty_cache()
 
         # Write requested outputs.
-        # chain.csv is reference-style wide format: one row per sample/step with all model answers side by side.
+        # chain.csv is compact reference-style wide format: one row per sample/step.
         wide_rows = build_wide_chain_rows(chosen, results_by_sample, model_names)
         wide_fields = wide_chain_fields(model_names)
         write_csv(out_dir / "chain.csv", wide_rows, fields=wide_fields)
-        # Keep a long-format diagnostic file as an extra, but do not use it for the main presentation.
-        write_csv(out_dir / "chain_long.csv", all_rows)
         used_names = set()
         for sample_i, sample in enumerate(chosen, start=1):
             sid = str(sample.get("id", f"sample_{sample_i}"))
@@ -1219,7 +1187,6 @@ def main() -> None:
         logger.print("-" * 88)
         logger.print(f"wrote: {out_dir / 'chain.csv'}")
         logger.print(f"wrote: {chains_dir}/<sample_id>_chain.csv")
-        logger.print(f"wrote: {out_dir / 'chain_long.csv'}")
         logger.print(f"wrote: {out_dir / 'run.log'}")
         logger.print(f"wrote: {out_dir / 'sample_report.txt'}")
     finally:
