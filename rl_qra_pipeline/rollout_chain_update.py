@@ -23,7 +23,43 @@ import torch
 from answer_specs import extract_answer_section, parse_answer_spec
 from slot_alignment_reward import normalize_advantages, reward_to_go
 from state_builder import encode_sample, mask_id_from_graph, project_fixed_, transition_probs
-from t_schedule import rollout_t_grid, transition_times_from_grid
+
+
+def make_t_grid(t_start: float = 0.95, t_end: float = 0.01, steps: int = 32) -> List[float]:
+    """Return fixed reverse-time state grid.
+
+    Kept inline on purpose: older pipeline versions already merged t_schedule.py
+    into rollout_chain_update.py / generate_sample_chain.py, so we must not
+    import a separate t_schedule module.
+    """
+    steps = int(steps)
+    t_start = float(t_start)
+    t_end = float(t_end)
+    if steps <= 0:
+        return [t_start]
+    dt = (t_start - t_end) / float(steps)
+    return [max(t_end, t_start - k * dt) for k in range(steps + 1)]
+
+
+def rollout_t_grid(cfg: Dict[str, Any]) -> List[float]:
+    r_cfg = cfg.get("rollout", {}) if isinstance(cfg, dict) else {}
+    custom = r_cfg.get("t_values")
+    if isinstance(custom, list) and len(custom) >= 2:
+        return [float(x) for x in custom]
+    return make_t_grid(
+        t_start=float(r_cfg.get("t_start", 0.95)),
+        t_end=float(r_cfg.get("t_end", 0.01)),
+        steps=int(r_cfg.get("steps", 32)),
+    )
+
+
+def transition_times_from_grid(t_grid: List[float]) -> List[Tuple[float, float, float]]:
+    out: List[Tuple[float, float, float]] = []
+    for k in range(max(0, len(t_grid) - 1)):
+        t_now = float(t_grid[k])
+        t_next = float(t_grid[k + 1])
+        out.append((t_now, t_next, max(0.0, t_now - t_next)))
+    return out
 
 
 @dataclass
