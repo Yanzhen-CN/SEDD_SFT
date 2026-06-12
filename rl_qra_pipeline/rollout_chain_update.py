@@ -15,44 +15,15 @@ our fixed t grid, not a tiny constant step_size=1e-5.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
+import importlib
 import torch
 
 from answer_specs import extract_answer_section, parse_answer_spec
-from slot_alignment_reward import normalize_advantages, reward_to_go, step_alignment_reward
+from slot_alignment_reward import normalize_advantages, reward_to_go
 from state_builder import encode_sample, mask_id_from_graph, project_fixed_, transition_probs
-
-
-def make_t_grid(t_start: float = 0.95, t_end: float = 0.01, steps: int = 32) -> List[float]:
-    steps = int(steps)
-    t_start = float(t_start)
-    t_end = float(t_end)
-    if steps <= 0:
-        return [t_start]
-    dt = (t_start - t_end) / float(steps)
-    return [max(t_end, t_start - k * dt) for k in range(steps + 1)]
-
-
-def rollout_t_grid(cfg: Dict[str, Any]) -> List[float]:
-    r_cfg = cfg.get("rollout", {}) if isinstance(cfg, dict) else {}
-    custom = r_cfg.get("t_values")
-    if isinstance(custom, list) and len(custom) >= 2:
-        return [float(x) for x in custom]
-    return make_t_grid(
-        t_start=float(r_cfg.get("t_start", 0.95)),
-        t_end=float(r_cfg.get("t_end", 0.01)),
-        steps=int(r_cfg.get("steps", 32)),
-    )
-
-
-def transition_times_from_grid(t_grid: Sequence[float]) -> List[Tuple[float, float, float]]:
-    out: List[Tuple[float, float, float]] = []
-    for k in range(max(0, len(t_grid) - 1)):
-        t_now = float(t_grid[k])
-        t_next = float(t_grid[k + 1])
-        out.append((t_now, t_next, max(0.0, t_now - t_next)))
-    return out
+from t_schedule import rollout_t_grid, transition_times_from_grid
 
 
 @dataclass
@@ -83,6 +54,52 @@ class RolloutRecord:
     anchor_loss: torch.Tensor | None = None
     apply_anchor: bool = False
     changed_count: int = 1
+
+
+
+
+def resolve_reward_function(cfg: Dict[str, Any]) -> Callable[..., Tuple[float, Dict[str, Any]]]:
+    """Resolve the rollout reward from config without overwriting reward files.
+
+    Config options under ``rollout``:
+      reward_name: slot_alignment | qra_refine | <python_module>
+      reward_module: optional explicit python module name
+
+    Examples:
+      reward_name: slot_alignment  -> rl_qra_pipeline/slot_alignment_reward.py
+      reward_name: qra_refine      -> rl_qra_pipeline/qra_refine_reward.py
+      reward_module: my_reward     -> import my_reward.step_alignment_reward
+    """
+    r_cfg = cfg.get("rollout", {}) or {}
+    name = str(
+        r_cfg.get("reward_module")
+        or r_cfg.get("reward_name")
+        or r_cfg.get("reward_type")
+        or "slot_alignment"
+    ).strip()
+    aliases = {
+        "": "slot_alignment_reward",
+        "slot": "slot_alignment_reward",
+        "slot_alignment": "slot_alignment_reward",
+        "pretrain": "slot_alignment_reward",
+        "pretrain_slot_alignment": "slot_alignment_reward",
+        "qra": "qra_refine_reward",
+        "qra_refine": "qra_refine_reward",
+        "qra_refinement": "qra_refine_reward",
+    }
+    module_name = aliases.get(name, name)
+    if module_name.endswith(".py"):
+        module_name = module_name[:-3]
+    mod = importlib.import_module(module_name)
+    fn = getattr(mod, "step_alignment_reward", None)
+    if fn is None:
+        raise AttributeError(f"Reward module {module_name!r} does not define step_alignment_reward")
+    return fn
+
+
+def selected_reward_name(cfg: Dict[str, Any]) -> str:
+    r_cfg = cfg.get("rollout", {}) or {}
+    return str(r_cfg.get("reward_name") or r_cfg.get("reward_module") or r_cfg.get("reward_type") or "slot_alignment")
 
 
 def _decode_token(tokenizer, token_id: int) -> str:
@@ -197,6 +214,7 @@ def rollout_answer_chain_with_logprob(
     transitions = transition_times_from_grid(t_grid)
     transition_kind = str(r_cfg.get("transition_kind", "analytic"))
     mode = str(r_cfg.get("mode", "sample"))
+    reward_fn = resolve_reward_function(cfg)
     reward_clip = float(r_cfg.get("reward_clip", 1.0))
     freeze_filled = bool(r_cfg.get("freeze_filled", False))
     eps = float(r_cfg.get("eps", 1e-12))
@@ -244,7 +262,7 @@ def rollout_answer_chain_with_logprob(
             local_probs = probs[0, pos, :]
             logprob = local_probs[tok].clamp_min(eps).log()
             entropy = _local_entropy(local_probs, eps=eps)
-            reward, parts = step_alignment_reward(
+            reward, parts = reward_fn(
                 before_ids=before_ids,
                 after_ids=after_ids,
                 gt_ids=gt_answer_ids,
@@ -301,20 +319,30 @@ def rollout_answer_chain_with_logprob(
         "answer_len": len(answer_positions),
         "t_grid": [float(x) for x in t_grid],
         "num_transitions": len(transitions),
+        "reward_name": selected_reward_name(cfg),
     }
 
 
 def _compute_returns_advantages(rewards: Sequence[float], cfg: Dict[str, Any], device: torch.device, dtype=torch.float32) -> torch.Tensor:
     r_cfg = cfg.get("rollout", {})
     gamma = float(r_cfg.get("gamma", 0.95))
-    baseline = str(r_cfg.get("baseline", "reward_to_go_norm"))
+    baseline = str(r_cfg.get("baseline", "raw_clip"))
     clip = float(r_cfg.get("advantage_clip", 0.25))
+
+    # QRA refinement: keep the sign of local rewards. With reward_to_go_norm,
+    # a good action can become negative after within-rollout normalization,
+    # which is bad when we only want small corrections to an already-good QRA.
+    if baseline in {"raw_clip", "raw", "step_raw"}:
+        vals = torch.tensor([float(r) for r in rewards], device=device, dtype=dtype)
+        return vals.clamp(-clip, clip) if clip and clip > 0 else vals
+    if baseline in {"reward_to_go_clip", "rtg_clip"}:
+        vals = torch.tensor(reward_to_go(rewards, gamma=gamma), device=device, dtype=dtype)
+        return vals.clamp(-clip, clip) if clip and clip > 0 else vals
     if baseline in {"step_norm", "step"}:
         values = [float(r) for r in rewards]
     else:
         values = reward_to_go(rewards, gamma=gamma)
     return normalize_advantages(values, clip=clip, device=device, dtype=dtype)
-
 
 def _recompute_action_terms_from_state(
     model,

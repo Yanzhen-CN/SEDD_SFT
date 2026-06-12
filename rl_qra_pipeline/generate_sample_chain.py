@@ -938,13 +938,39 @@ def result_to_chain_rows(result: Dict[str, Any], sample_index: int) -> List[Dict
     return rows
 
 
+def csv_safe_cell(value: Any) -> str:
+    """Make CSV cells robust for Excel/VScode display.
+
+    Model outputs may contain real newlines, tabs, or control characters.
+    Standard CSV can quote those values, but many local viewers display them as
+    broken rows.  We escape them visibly and write with UTF-8 BOM.
+    """
+    if value is None:
+        return ""
+    s = str(value)
+    s = s.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+    s = s.replace("\t", "\\t")
+    # Remove remaining C0 controls except normal printable text.
+    s = "".join(ch for ch in s if ch >= " " or ch in "\n\t")
+    return s
+
+
 def write_csv(path: Path, rows: List[Dict[str, Any]], fields: Sequence[str] = CHAIN_FIELDS) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(fields))
+    # utf-8-sig makes Windows Excel recognize UTF-8 symbols such as □.
+    # QUOTE_ALL plus csv_safe_cell prevents embedded commas/newlines from
+    # breaking local CSV viewers.
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=list(fields),
+            lineterminator="\n",
+            quoting=csv.QUOTE_ALL,
+            extrasaction="ignore",
+        )
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fields})
+            writer.writerow({k: csv_safe_cell(row.get(k, "")) for k in fields})
 
 
 
@@ -1012,13 +1038,13 @@ def build_wide_chain_rows(
             }
             for m in model_names:
                 tr = trace_maps.get(m, {}).get(step)
-                row[m] = "" if tr is None else str(tr.get("answer_text", ""))
+                row[model_display_name(m)] = "" if tr is None else str(tr.get("answer_text", ""))
             rows.append(row)
     return rows
 
 
 def wide_chain_fields(model_names: List[str]) -> List[str]:
-    return ["dataset", "sample_id", "gt_answer", "answer_kind", "step", "t"] + list(model_names)
+    return ["dataset", "sample_id", "gt_answer", "answer_kind", "step", "t"] + [model_display_name(m) for m in model_names]
 
 def final_answer(result: Dict[str, Any]) -> str:
     trace = result.get("trace") or []

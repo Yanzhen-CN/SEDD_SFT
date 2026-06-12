@@ -110,6 +110,11 @@ rrpi:
   max_debug_rows: 8
 
 rollout:
+  # Reward can be switched without overwriting files:
+  #   slot_alignment: original/pretrain-oriented slot reward
+  #   qra_refine: QRA-oriented small-correction reward
+  reward_name: qra_refine
+
   # Sample-chain-aligned rollout: for each fixed t transition, every answer
   # position is sampled from the SEDD transition distribution. This matches
   # generate_sample_chain.py and the SEDD tau-leaping sampler.
@@ -137,15 +142,15 @@ rollout:
 
   # Probability-adjustment size. Small values are intentional; prefer multiple
   # RL rounds over one aggressive update.
-  policy_loss_scale: 0.02
-  advantage_clip: 0.25
+  policy_loss_scale: 0.012
+  advantage_clip: 0.20
   reward_clip: 1.00
   gamma: 0.95
-  baseline: reward_to_go_norm
+  baseline: raw_clip
 
   # Stabilizers.
   entropy_weight: 0.0005
-  sft_anchor_scale: 0.005
+  sft_anchor_scale: 0.008
   anchor_late_power: 1.0
 
   debug_every: 20
