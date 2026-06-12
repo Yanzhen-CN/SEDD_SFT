@@ -130,6 +130,16 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def make_torch_generator(device: torch.device, seed: int) -> torch.Generator:
+    """Create an explicit per-trace generator for deterministic sampling."""
+    try:
+        gen = torch.Generator(device=device)
+    except Exception:
+        gen = torch.Generator(device=device.type)
+    gen.manual_seed(int(seed) % (2**63 - 1))
+    return gen
+
+
 def stable_int(text: str, mod: int = 10_000_000) -> int:
     h = hashlib.md5(text.encode("utf-8")).hexdigest()
     return int(h[:12], 16) % mod
@@ -758,6 +768,7 @@ def trace_one_sample(
     device: torch.device,
     args: argparse.Namespace,
     model_name: str,
+    sample_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     model_cfg = cfg.get("model") or {}
     max_length = int(model_cfg.get("max_length", 1024))
@@ -781,6 +792,7 @@ def trace_one_sample(
     t_end = float(args.t_end)
     dt_step = (t_start - t_end) / max(1, num_steps)
     transition_kind = str(args.transition_kind)
+    sampler_generator = make_torch_generator(device, int(sample_seed)) if sample_seed is not None else None
 
     trace_rows: List[Dict[str, Any]] = []
     prev_score = None
@@ -836,7 +848,11 @@ def trace_one_sample(
                 next_x = probs.argmax(dim=-1)
             else:
                 flat = probs.view(-1, probs.shape[-1])
-                sampled = torch.multinomial(flat.float().clamp_min(0.0), num_samples=1).view_as(x)
+                sampled = torch.multinomial(
+                    flat.float().clamp_min(0.0),
+                    num_samples=1,
+                    generator=sampler_generator,
+                ).view_as(x)
                 next_x = sampled
 
             if args.freeze_filled:
@@ -850,6 +866,7 @@ def trace_one_sample(
 
     return {
         "model": model_name,
+        "sample_seed": int(sample_seed) if sample_seed is not None else None,
         "sample_id": sample.get("id", ""),
         "answer_kind": answer_kind(gt_answer),
         "question": question,
@@ -1202,10 +1219,11 @@ def main() -> None:
             try:
                 for sample_i, sample in enumerate(chosen, start=1):
                     sid = str(sample.get("id", f"sample_{sample_i}"))
-                    set_seed(args.seed + sample_i * 1009 + model_i * 917 + stable_int(model_name, 997))
-                    logger.print(f"[chain] {model_name} sample {sample_i}/{len(chosen)} id={sid} gt={extract_gt_answer(sample)!r}")
+                    trace_seed = int(args.seed + sample_i * 1009 + model_i * 917 + stable_int(model_name, 997))
+                    set_seed(trace_seed)
+                    logger.print(f"[chain] {model_name} sample {sample_i}/{len(chosen)} id={sid} gt={extract_gt_answer(sample)!r} seed={trace_seed}")
                     try:
-                        res = trace_one_sample(model, graph, noise, tokenizer, sample, cfg, device, args, model_name)
+                        res = trace_one_sample(model, graph, noise, tokenizer, sample, cfg, device, args, model_name, sample_seed=trace_seed)
                     except Exception as exc:
                         res = {
                             "model": model_name,
