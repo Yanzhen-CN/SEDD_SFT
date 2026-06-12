@@ -11,8 +11,9 @@ Outputs:
    - test loss bar chart with pretrain/QRA start baselines
    - test reward bar chart with pretrain/QRA start baselines
 
-The combined plots are meant to make the reward/loss tradeoff visible while
-keeping the original separate figures for easier reading.
+The combined plots are meant to make the reward/loss tradeoff visible.
+Separate training loss-only/reward-only plots are intentionally not generated,
+so the output stays compact and comparison-focused.
 """
 
 import argparse
@@ -42,6 +43,15 @@ SUMMARY_KEYS = LOSS_SERIES + REWARD_SERIES + [
 
 PRETRAIN_BASELINE_NAMES = {"pretrain", "pretrain_start", "start_pretrain"}
 QRA_BASELINE_NAMES = {"qra", "qra_start", "start_qra", "QRA"}
+
+# Keep the visual language simple and high-contrast.
+LOSS_COLOR = "tab:blue"
+REWARD_COLOR = "tab:orange"
+PRETRAIN_COLOR = "tab:blue"
+QRA_COLOR = "tab:orange"
+OTHER_COLOR = "0.68"
+LINE_STYLES = ["-", "--", "-.", ":"]
+MARKERS = ["", "o", "s", "^"]
 
 
 def read_csv(path: Path) -> List[Dict[str, str]]:
@@ -156,37 +166,53 @@ def plot_group_loss_reward_overlay(
 ) -> bool:
     """Plot loss and reward in one figure with twin y-axes.
 
-    Loss is plotted on the left axis, reward on the right axis.  This is the
-    compact tradeoff plot requested for comparing whether reward increases while
-    validation loss stays stable.
+    Loss is always blue and reward is always orange.  Multiple runs are
+    distinguished only by linestyle/marker, so the visual comparison stays
+    obvious: blue curve family = loss, orange curve family = reward.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax_loss = plt.subplots(figsize=(10, 5.4))
+    fig, ax_loss = plt.subplots(figsize=(10.8, 5.8))
     ax_reward = ax_loss.twinx()
     plotted = False
 
-    for run_name, path in metric_files:
+    for idx, (run_name, path) in enumerate(metric_files):
         rows = read_csv(path)
         loss_metric, loss_pts = choose_metric_series(rows, loss_preferred)
         reward_metric, reward_pts = choose_metric_series(rows, reward_preferred)
+        linestyle = LINE_STYLES[idx % len(LINE_STYLES)]
+        marker = MARKERS[idx % len(MARKERS)]
+        markevery = max(1, len(rows) // 12) if rows else None
+
         if loss_pts:
             loss_pts = sorted(loss_pts, key=lambda x: x[0])
+            label = f"loss:{run_name}" if loss_metric == loss_preferred[0] else f"loss:{run_name} ({loss_metric})"
             ax_loss.plot(
                 [x for x, _ in loss_pts],
                 [y for _, y in loss_pts],
-                linewidth=1.2,
-                linestyle="-",
-                label=f"loss:{run_name}" if loss_metric == loss_preferred[0] else f"loss:{run_name} ({loss_metric})",
+                color=LOSS_COLOR,
+                linewidth=2.2,
+                linestyle=linestyle,
+                marker=marker or None,
+                markersize=3.2,
+                markevery=markevery,
+                alpha=0.92,
+                label=label,
             )
             plotted = True
         if reward_pts:
             reward_pts = sorted(reward_pts, key=lambda x: x[0])
+            label = f"reward:{run_name}" if reward_metric == reward_preferred[0] else f"reward:{run_name} ({reward_metric})"
             ax_reward.plot(
                 [x for x, _ in reward_pts],
                 [y for _, y in reward_pts],
-                linewidth=1.2,
-                linestyle="--",
-                label=f"reward:{run_name}" if reward_metric == reward_preferred[0] else f"reward:{run_name} ({reward_metric})",
+                color=REWARD_COLOR,
+                linewidth=2.2,
+                linestyle=linestyle,
+                marker=marker or None,
+                markersize=3.2,
+                markevery=markevery,
+                alpha=0.92,
+                label=label,
             )
             plotted = True
 
@@ -195,8 +221,11 @@ def plot_group_loss_reward_overlay(
         return False
 
     ax_loss.set_xlabel("step")
-    ax_loss.set_ylabel("loss")
-    ax_reward.set_ylabel("reward")
+    ax_loss.set_ylabel("loss", color=LOSS_COLOR)
+    ax_reward.set_ylabel("reward", color=REWARD_COLOR)
+    ax_loss.tick_params(axis="y", labelcolor=LOSS_COLOR)
+    ax_reward.tick_params(axis="y", labelcolor=REWARD_COLOR)
+    ax_loss.grid(True, alpha=0.22)
     ax_loss.set_title(title)
 
     handles1, labels1 = ax_loss.get_legend_handles_labels()
@@ -205,10 +234,9 @@ def plot_group_loss_reward_overlay(
         ax_loss.legend(handles1 + handles2, labels1 + labels2, fontsize=7, loc="best")
 
     fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
+    fig.savefig(out_path, dpi=200)
     plt.close(fig)
     return True
-
 
 def summarize_metric_file(run_name: str, path: Path) -> Dict[str, object]:
     rows = read_csv(path)
@@ -276,25 +304,18 @@ def visualize_training(run_roots: Sequence[Path], out_dir: Path) -> List[Dict[st
 
     for run_root in run_roots:
         group = group_name_from_root(run_root)
+        # Remove stale separate training plots from older visualizer versions.
+        # This keeps the output directory focused on the combined comparison plot.
+        for stale in (out_dir / f"{group}_loss.png", out_dir / f"{group}_reward.png"):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
         metric_files = collect_metric_files(run_root)
         for run_name, metrics_path in metric_files:
             item = summarize_metric_file(f"{group}/{run_name}", metrics_path)
             item["group"] = group
             summaries.append(item)
-        plot_group_overlay(
-            metric_files,
-            loss_preferred,
-            out_dir / f"{group}_loss.png",
-            f"{group}: validation/training loss curves",
-            "loss",
-        )
-        plot_group_overlay(
-            metric_files,
-            reward_preferred,
-            out_dir / f"{group}_reward.png",
-            f"{group}: rollout reward curves",
-            "reward",
-        )
         plot_group_loss_reward_overlay(
             metric_files,
             loss_preferred,
@@ -350,12 +371,12 @@ def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title
     bar_colors = []
     for label in labels:
         family = model_family(label)
-        if family == "QRA":
-            bar_colors.append("tab:blue")
-        elif family == "pretrain":
-            bar_colors.append("tab:orange")
+        if family == "pretrain":
+            bar_colors.append(PRETRAIN_COLOR)
+        elif family == "QRA":
+            bar_colors.append(QRA_COLOR)
         else:
-            bar_colors.append("0.65")
+            bar_colors.append(OTHER_COLOR)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(10.5, 5.2))
@@ -363,8 +384,8 @@ def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title
 
     baseline_values = find_baseline_values(rows, metric)
     baseline_style = {
-        "pretrain start": ("tab:orange", "--"),
-        "QRA start": ("tab:blue", "-.")
+        "pretrain start": (PRETRAIN_COLOR, "--"),
+        "QRA start": (QRA_COLOR, "-.")
     }
     for name, value in baseline_values.items():
         color, linestyle = baseline_style.get(name, ("0.3", ":"))
@@ -403,12 +424,12 @@ def plot_test_loss_reward_pair(rows: List[Dict[str, str]], out_path: Path) -> bo
 
     loss_vals = [0.0 if p[1] is None else p[1] for p in pairs]
     reward_vals = [0.0 if p[2] is None else p[2] for p in pairs]
-    ax_loss.bar([x - width / 2 for x in xs], loss_vals, width=width, color="tab:red", alpha=0.70, label="test_loss")
-    ax_reward.bar([x + width / 2 for x in xs], reward_vals, width=width, color="tab:green", alpha=0.55, label="test_rollout_reward")
+    ax_loss.bar([x - width / 2 for x in xs], loss_vals, width=width, color=LOSS_COLOR, alpha=0.82, label="test_loss")
+    ax_reward.bar([x + width / 2 for x in xs], reward_vals, width=width, color=REWARD_COLOR, alpha=0.72, label="test_rollout_reward")
 
     for metric, axis, style_map in [
-        ("test_loss", ax_loss, {"pretrain start": ("tab:orange", "--"), "QRA start": ("tab:blue", "-.")}),
-        ("test_rollout_reward", ax_reward, {"pretrain start": ("tab:orange", ":"), "QRA start": ("tab:blue", ":")}),
+        ("test_loss", ax_loss, {"pretrain start": (PRETRAIN_COLOR, "--"), "QRA start": (QRA_COLOR, "-.")}),
+        ("test_rollout_reward", ax_reward, {"pretrain start": (PRETRAIN_COLOR, ":"), "QRA start": (QRA_COLOR, ":")}),
     ]:
         for name, value in find_baseline_values(rows, metric).items():
             color, linestyle = style_map.get(name, ("0.3", ":"))
@@ -484,11 +505,7 @@ def main() -> None:
         "num_training_runs": len(training_summary),
         "test": test_summary,
         "plots": [
-            "rl_pretrain_loss.png",
-            "rl_pretrain_reward.png",
             "rl_pretrain_loss_reward_overlay.png",
-            "rl_QRA_loss.png",
-            "rl_QRA_reward.png",
             "rl_QRA_loss_reward_overlay.png",
             "test_loss_compare.png",
             "test_reward_compare.png",
