@@ -72,6 +72,8 @@ METRIC_FIELDS = [
     "eval_rollout_anchor_loss",
     "best_metric_value",
     "is_best_eval",
+    "reward_best_metric_value",
+    "is_best_reward_eval",
 ]
 
 
@@ -145,337 +147,6 @@ def cycle_samples(samples: List[Dict], seed: int) -> Iterable[Dict]:
         rng.shuffle(order)
         for item in order:
             yield item
-
-def cycle_random_batches(samples: List[Dict], seed: int, samples_per_update: int) -> Iterable[List[Dict]]:
-    """Yield random per-update batches forever.
-
-    This helper keeps make_update_batch_iter as a normal function that returns
-    an iterable.  Do not inline a ``yield`` inside make_update_batch_iter,
-    otherwise Python turns that function into a generator and ``return
-    other_generator`` will immediately raise StopIteration with that generator
-    as its value.
-    """
-    sample_iter = cycle_samples(samples, seed)
-    while True:
-        yield [next(sample_iter) for _ in range(max(1, int(samples_per_update)))]
-
-
-DEFAULT_KIND_ORDER = [
-    "interval",
-    "decimal",
-    "integer",
-    "letter",
-    "symbolic",
-    "unit_decimal",
-    "equation",
-    "inequality",
-]
-
-
-def normalize_answer_kind(kind: Any) -> str:
-    k = str(kind or "").strip().lower().replace("-", "_").replace(" ", "_")
-    aliases = {
-        "single_integer": "integer",
-        "int": "integer",
-        "number": "integer",
-        "single_letter": "letter",
-        "choice": "letter",
-        "multiple_choice": "letter",
-        "unit": "unit_decimal",
-        "unit_number": "unit_decimal",
-        "units": "unit_decimal",
-        "ineq": "inequality",
-        "expr": "symbolic",
-    }
-    return aliases.get(k, k or "other")
-
-
-def infer_answer_kind(sample: Dict[str, Any]) -> str:
-    # Prefer explicit metadata if preparation code already tagged the answer.
-    for key in ("answer_kind", "answer_type", "kind", "type"):
-        if sample.get(key):
-            return normalize_answer_kind(sample.get(key))
-    for parent_key in ("meta", "base_meta", "answer_meta"):
-        meta = sample.get(parent_key)
-        if isinstance(meta, dict):
-            for key in ("answer_kind", "answer_type", "kind", "type"):
-                if meta.get(key):
-                    return normalize_answer_kind(meta.get(key))
-
-    # Synthetic ids usually contain the type name.
-    sid = str(sample.get("id", "")).lower()
-    for kind in DEFAULT_KIND_ORDER:
-        if f"_{kind}_" in sid or sid.endswith(f"_{kind}"):
-            return kind
-
-    # Fallback heuristic from answer text.  This is only for sampling balance,
-    # not for reward correctness.
-    import re
-    ans = str(sample.get("answer", "") or "").strip()
-    compact = re.sub(r"\s+", "", ans)
-    if re.fullmatch(r"[A-E]", compact):
-        return "letter"
-    if re.fullmatch(r"[\(\[][+-]?\d+(?:\.\d+)?,[+-]?\d+(?:\.\d+)?[\)\]]", compact):
-        return "interval"
-    if re.search(r"(?:<=|>=|<|>|\\leq|\\geq)", compact):
-        return "inequality"
-    if "=" in compact:
-        return "equation"
-    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?[a-zA-Z\\/%°]+", compact) or re.fullmatch(r"[+-]?\d+(?:\.\d+)?[a-zA-Z].*", compact):
-        return "unit_decimal"
-    if re.fullmatch(r"[+-]?\d+", compact):
-        return "integer"
-    if re.fullmatch(r"[+-]?\d*\.\d+", compact):
-        return "decimal"
-    if any(ch in compact for ch in ["/", "^", "\\", "_", "{"]):
-        return "symbolic"
-    return "other"
-
-
-def make_kind_buckets(samples: List[Dict[str, Any]], seed: int) -> Dict[str, List[Dict[str, Any]]]:
-    rng = random.Random(seed)
-    buckets: Dict[str, List[Dict[str, Any]]] = {}
-    for sample in samples:
-        kind = infer_answer_kind(sample)
-        buckets.setdefault(kind, []).append(sample)
-    for bucket in buckets.values():
-        rng.shuffle(bucket)
-    return buckets
-
-
-def cycle_kind_balanced_batches(
-    samples: List[Dict[str, Any]],
-    seed: int,
-    samples_per_update: int,
-    kind_order: List[str] | None = None,
-) -> Iterable[List[Dict[str, Any]]]:
-    """Yield update batches with approximately balanced answer kinds.
-
-    For samples_per_update=8 and the default 8 kinds, this tries to draw
-    one sample per kind.  For samples_per_update=16, it draws two rounds of
-    the same kind order.  Missing/empty kinds are skipped and the remaining
-    kinds are cycled.  Every selected sample has equal update weight later;
-    this function only controls which samples enter the update.
-    """
-    rng = random.Random(seed)
-    buckets = make_kind_buckets(samples, seed)
-    configured = [normalize_answer_kind(k) for k in (kind_order or DEFAULT_KIND_ORDER)]
-    ordered_kinds = [k for k in configured if buckets.get(k)]
-    # Append any remaining detected kinds so they are not silently ignored.
-    ordered_kinds.extend(k for k in sorted(buckets) if k not in ordered_kinds and buckets.get(k))
-    if not ordered_kinds:
-        random_iter = cycle_samples(samples, seed)
-        while True:
-            yield [next(random_iter) for _ in range(samples_per_update)]
-
-    ptr = {k: 0 for k in ordered_kinds}
-    offset = 0
-    while True:
-        batch: List[Dict[str, Any]] = []
-        round_kinds = ordered_kinds[offset:] + ordered_kinds[:offset]
-        while len(batch) < samples_per_update:
-            for kind in round_kinds:
-                bucket = buckets[kind]
-                if ptr[kind] >= len(bucket):
-                    rng.shuffle(bucket)
-                    ptr[kind] = 0
-                batch.append(bucket[ptr[kind]])
-                ptr[kind] += 1
-                if len(batch) >= samples_per_update:
-                    break
-        offset = (offset + 1) % max(1, len(ordered_kinds))
-        yield batch
-
-
-
-def _positive_int(value: Any, default: int = 0) -> int:
-    try:
-        return max(0, int(value))
-    except Exception:
-        return int(default)
-
-
-def make_kind_quota_plan(train_cfg: Dict[str, Any], rollout_cfg: Dict[str, Any], samples_per_update: int) -> Tuple[List[str], Dict[str, int], str]:
-    """Build a per-update kind quota plan.
-
-    The quota sampler is meant for QRA refine: simple answer kinds should be
-    over-represented and hard symbolic/equation/inequality samples should be
-    capped.  The explicit sample_kind_quota is the source of truth.  If its
-    total differs from samples_per_update, we scale/fill/truncate while
-    respecting optional per-kind caps.
-    """
-    quota_cfg = train_cfg.get("sample_kind_quota", rollout_cfg.get("sample_kind_quota", {})) or {}
-    weight_cfg = train_cfg.get("sample_kind_weights", rollout_cfg.get("sample_kind_weights", {})) or {}
-    cap_cfg = train_cfg.get("sample_kind_max_per_update", rollout_cfg.get("sample_kind_max_per_update", {})) or {}
-    kind_order = train_cfg.get("sample_kind_order", rollout_cfg.get("sample_kind_order", DEFAULT_KIND_ORDER)) or DEFAULT_KIND_ORDER
-    kind_order = [normalize_answer_kind(k) for k in list(kind_order)]
-
-    # Default simple-focused quota for 16 samples/update.  This intentionally
-    # gives integer/decimal/letter more mass and caps hard kinds at 1 each.
-    if not quota_cfg and not weight_cfg:
-        quota_cfg = {
-            "integer": 4,
-            "decimal": 3,
-            "letter": 3,
-            "interval": 2,
-            "unit_decimal": 1,
-            "symbolic": 1,
-            "equation": 1,
-            "inequality": 1,
-        }
-        cap_cfg = {**{"symbolic": 1, "equation": 1, "inequality": 1}, **dict(cap_cfg)}
-
-    quotas: Dict[str, int] = {}
-    for k in kind_order:
-        nk = normalize_answer_kind(k)
-        if nk in quota_cfg:
-            quotas[nk] = _positive_int(quota_cfg.get(nk), 0)
-        elif nk in weight_cfg:
-            quotas[nk] = _positive_int(weight_cfg.get(nk), 0)
-        else:
-            quotas[nk] = 0
-    # Include any explicitly configured kinds that are not in sample_kind_order.
-    for raw_k, raw_v in {**dict(weight_cfg), **dict(quota_cfg)}.items():
-        nk = normalize_answer_kind(raw_k)
-        if nk not in quotas:
-            quotas[nk] = _positive_int(raw_v, 0)
-            kind_order.append(nk)
-
-    caps = {normalize_answer_kind(k): _positive_int(v, samples_per_update) for k, v in dict(cap_cfg).items()}
-
-    # If the requested update size differs from the quota total, adjust using
-    # weights from the same simple-first order.  This keeps 8/16/32 usable from
-    # one config.
-    total = sum(quotas.values())
-    if total <= 0:
-        quotas = {k: 1 for k in kind_order}
-        total = sum(quotas.values())
-
-    def can_add(k: str) -> bool:
-        return quotas.get(k, 0) < caps.get(k, samples_per_update)
-
-    if total < samples_per_update:
-        # Fill extra slots by cycling simple-first kinds. Hard kinds with cap=1
-        # will not grow unless the user raises their cap.
-        idx = 0
-        fill_order = [k for k in kind_order if k in quotas and quotas[k] > 0] or list(quotas)
-        while sum(quotas.values()) < samples_per_update and fill_order:
-            k = fill_order[idx % len(fill_order)]
-            if can_add(k):
-                quotas[k] += 1
-            idx += 1
-            if idx > samples_per_update * max(4, len(fill_order) * 4):
-                # Caps may prevent filling; relax by adding to the first kind.
-                quotas[fill_order[0]] += 1
-    elif total > samples_per_update:
-        # Truncate from the tail first, so hard/later kinds lose slots before
-        # easy/front kinds. Keep one slot for a kind as long as possible.
-        reduce_order = list(reversed(kind_order))
-        idx = 0
-        while sum(quotas.values()) > samples_per_update and reduce_order:
-            k = reduce_order[idx % len(reduce_order)]
-            if quotas.get(k, 0) > 0:
-                quotas[k] -= 1
-            idx += 1
-
-    plan: List[str] = []
-    for k in kind_order:
-        plan.extend([k] * quotas.get(k, 0))
-    # Fallback if a weird config produced too few entries.
-    while len(plan) < samples_per_update:
-        plan.append(kind_order[0] if kind_order else DEFAULT_KIND_ORDER[0])
-    plan = plan[:samples_per_update]
-    return plan, quotas, ",".join(f"{k}:{quotas.get(k,0)}" for k in kind_order if quotas.get(k, 0) > 0)
-
-
-def cycle_kind_quota_batches(
-    samples: List[Dict[str, Any]],
-    seed: int,
-    samples_per_update: int,
-    cfg: Dict[str, Any],
-) -> Iterable[List[Dict[str, Any]]]:
-    """Yield per-update batches following explicit simple-focused quotas.
-
-    This differs from kind_balanced: it can intentionally oversample easy kinds
-    such as integer/decimal/letter and cap hard kinds such as equation and
-    inequality to at most one sample per update.
-    """
-    rng = random.Random(seed)
-    train_cfg = cfg.get("training", {}) or {}
-    rollout_cfg = cfg.get("rollout", {}) or {}
-    buckets = make_kind_buckets(samples, seed)
-    plan, quotas, plan_label = make_kind_quota_plan(train_cfg, rollout_cfg, samples_per_update)
-
-    # Keep known kinds in plan order, but if a requested kind is absent we will
-    # substitute from available simple-first kinds instead of failing.
-    fallback_order = [normalize_answer_kind(k) for k in (train_cfg.get("sample_fallback_order") or [
-        "integer", "decimal", "letter", "interval", "unit_decimal", "symbolic", "equation", "inequality", "other"
-    ])]
-    fallback_order.extend(k for k in sorted(buckets) if k not in fallback_order)
-    fallback_order = [k for k in fallback_order if buckets.get(k)]
-    if not fallback_order:
-        random_iter = cycle_samples(samples, seed)
-        while True:
-            yield [next(random_iter) for _ in range(samples_per_update)]
-
-    ptr = {k: 0 for k in buckets}
-
-    def draw_from_kind(kind: str) -> Dict[str, Any]:
-        draw_kind = kind if buckets.get(kind) else None
-        if draw_kind is None:
-            # Substitute with the first available simple-first kind.
-            draw_kind = fallback_order[0]
-        bucket = buckets[draw_kind]
-        if ptr[draw_kind] >= len(bucket):
-            rng.shuffle(bucket)
-            ptr[draw_kind] = 0
-        item = bucket[ptr[draw_kind]]
-        ptr[draw_kind] += 1
-        return item
-
-    step_offset = 0
-    while True:
-        # Rotate only within the same multiset quota so each kind gets the same
-        # count per update but sample ordering varies a little.
-        rotated = plan[step_offset:] + plan[:step_offset]
-        batch = [draw_from_kind(k) for k in rotated[:samples_per_update]]
-        step_offset = (step_offset + 1) % max(1, len(plan))
-        yield batch
-
-def make_update_batch_iter(samples: List[Dict[str, Any]], cfg: Dict[str, Any], seed: int, samples_per_update: int) -> Iterable[List[Dict[str, Any]]]:
-    """Return an infinite iterable of per-update sample batches.
-
-    Important: this function must NOT contain a ``yield`` statement.  If it
-    does, Python treats the whole function as a generator; then statements like
-    ``return cycle_kind_quota_batches(...)`` do not return that iterable to the
-    caller, but instead stop the generator immediately.  That was the cause of
-    the runtime error:
-
-        StopIteration: <generator object cycle_kind_quota_batches ...>
-    """
-    train_cfg = cfg.get("training", {}) or {}
-    rollout_cfg = cfg.get("rollout", {}) or {}
-    selector = str(
-        train_cfg.get(
-            "sample_selector",
-            train_cfg.get("sampler", rollout_cfg.get("sample_selector", rollout_cfg.get("sampler", "random"))),
-        )
-    ).strip().lower()
-    selector = selector.replace("-", "_")
-    if selector in {"kind_quota", "quota", "simple_focused", "easy_focused", "qra_simple_focused"}:
-        return cycle_kind_quota_batches(samples, seed, samples_per_update, cfg)
-    if selector in {"kind_balanced", "balanced", "answer_kind_balanced", "type_balanced"}:
-        kind_order = train_cfg.get("sample_kind_order", rollout_cfg.get("sample_kind_order", DEFAULT_KIND_ORDER))
-        return cycle_kind_balanced_batches(samples, seed, samples_per_update, list(kind_order or DEFAULT_KIND_ORDER))
-    return cycle_random_batches(samples, seed, samples_per_update)
-
-
-def summarize_batch_kinds(samples: List[Dict[str, Any]]) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-    for sample in samples:
-        kind = infer_answer_kind(sample)
-        out[kind] = out.get(kind, 0) + 1
-    return out
 
 
 def load_samples(cfg: Dict, split: str, tokenizer) -> List[Dict]:
@@ -891,7 +562,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     samples = load_samples(cfg, split, tokenizer)
     if not samples:
         raise RuntimeError("No training samples loaded.")
-    # The update sampler is created after samples_per_update is resolved below.
+    sample_iter = cycle_samples(samples, seed)
 
     # Load validation samples once.  Best checkpoints are selected by mean validation metrics,
     # never by the single training sample loss from an update step.
@@ -899,25 +570,7 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
 
     lr = float(cfg["training"].get("lr", 2e-6))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=float(cfg["training"].get("weight_decay", 0.0)))
-    train_cfg = cfg.get("training", {})
-    # Effective number of different training samples used before one optimizer.step().
-    # Keep backward compatibility: old configs can still use training.batch_size.
-    samples_per_update = int(
-        train_cfg.get(
-            "samples_per_update",
-            train_cfg.get("rl_samples_per_update", train_cfg.get("batch_size", 1)),
-        )
-    )
-    samples_per_update = max(1, samples_per_update)
-    # Split the effective update batch into smaller chunks for memory testing.
-    # With rollout.memory_safe_replay=true this mostly controls logging/control flow,
-    # because each rollout action is replayed/backwarded one by one.
-    micro_batch_size = int(train_cfg.get("micro_batch_size", train_cfg.get("rl_micro_batch_size", samples_per_update)))
-    micro_batch_size = max(1, min(samples_per_update, micro_batch_size))
-    sample_selector = str(train_cfg.get("sample_selector", train_cfg.get("sampler", cfg.get("rollout", {}).get("sample_selector", "random")))).strip().lower()
-    batch_iter = make_update_batch_iter(samples, cfg, seed, samples_per_update)
-    # Backward-compatible alias used below.
-    batch_size = samples_per_update
+    batch_size = int(cfg["training"].get("batch_size", 1))
     steps = int(cfg["training"].get("steps", 1000))
     grad_clip = float(cfg["training"].get("grad_clip", 1.0))
     save_every = int(cfg["training"].get("save_every", 100))
@@ -930,6 +583,18 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     eval_limit_for_logs = eval_limit_label(eval_limit)
     best_metric_name = str(cfg["training"].get("best_metric", "eval_loss"))
     best_mode = str(cfg["training"].get("best_mode", "min")).lower()
+    best_reward_metric_name = str(
+        cfg["training"].get(
+            "best_reward_metric",
+            cfg["training"].get("reward_best_metric", "eval_rollout_reward"),
+        )
+    )
+    best_reward_mode = str(
+        cfg["training"].get(
+            "best_reward_mode",
+            cfg["training"].get("reward_best_mode", "max"),
+        )
+    ).lower()
     rrpi_cfg = cfg.get("rrpi", cfg.get("guided", {}))
     rollout_cfg = cfg.get("rollout", {})
     mode_for_debug = str(cfg.get("rl", {}).get("mode", rrpi_cfg.get("mode", "rrpi")))
@@ -948,16 +613,14 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "run_dir": str(out_dir),
         "loaded_from": loaded_from,
         "num_samples": len(samples),
-        "samples_per_update": samples_per_update,
-        "micro_batch_size": micro_batch_size,
-        "sample_selector": sample_selector,
-        "sample_kind_order": train_cfg.get("sample_kind_order", cfg.get("rollout", {}).get("sample_kind_order", DEFAULT_KIND_ORDER)),
         "data_split": split,
         "eval_split": eval_split,
         "eval_limit": eval_limit_for_logs,
         "eval_every": eval_every,
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
+        "best_reward_metric_name": best_reward_metric_name,
+        "best_reward_mode": best_reward_mode,
         "device": str(device),
         "cli_gpu": cli_gpu,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
@@ -969,15 +632,22 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
     debug_path = out_dir / "rollout_debug.jsonl"
 
     best_metric_value = initial_best_value(best_mode)
+    best_reward_metric_value = initial_best_value(best_reward_mode)
     best_step = 0
+    best_reward_step = 0
     best_row: Dict[str, Any] = {}
+    best_reward_row: Dict[str, Any] = {}
     best_eval_info: Dict[str, Any] = {}
+    best_reward_eval_info: Dict[str, Any] = {}
     best_path = out_dir / "best_run.pth"
+    best_reward_path = out_dir / "best_reward.pth"
+    best_reward_legacy_path = out_dir / "best_reward_run.pth"
     last_path = out_dir / "last_run.pth"
+    last_alias_path = out_dir / "last.pth"
 
     numeric_keys = [
         k for k in METRIC_FIELDS
-        if k not in {"step", "loss", "lr", "best_metric_value", "is_best_eval"}
+        if k not in {"step", "loss", "lr", "best_metric_value", "is_best_eval", "reward_best_metric_value", "is_best_reward_eval"}
         and not k.startswith("eval_")
     ]
     last_debug_records: List[Dict[str, Any]] = []
@@ -992,53 +662,33 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         valid = 0
         already_backward_count = 0
         logged_loss_values: List[float] = []
-        try:
-            update_samples = next(batch_iter)
-        except StopIteration:
-            # Defensive fallback: a batch iterator should be infinite.  If a
-            # future sampler accidentally stops, recreate it instead of killing
-            # a long server run.
-            print("[warn] sample batch iterator stopped; recreating it", flush=True)
-            batch_iter = make_update_batch_iter(samples, cfg, seed + step, samples_per_update)
-            update_samples = next(batch_iter)
-        batch_kind_counts = summarize_batch_kinds(update_samples)
-        for micro_start in range(0, len(update_samples), micro_batch_size):
-            micro_samples = update_samples[micro_start: micro_start + micro_batch_size]
-            for sample in micro_samples:
-                # For memory_safe_replay rollout_chain_loss calls backward internally.
-                # This temporary config field keeps gradient magnitude invariant when
-                # samples_per_update is changed from 1 -> 8/16/32.
-                cfg_i = cfg
-                if mode_for_debug in {"rollout", "rollout_chain", "chain"} and bool(rollout_cfg.get("memory_safe_replay", True)):
-                    cfg_i = copy.deepcopy(cfg)
-                    cfg_i.setdefault("rollout", {})["loss_normalizer"] = float(samples_per_update)
-                    cfg_i["rollout"]["micro_batch_size"] = int(micro_batch_size)
-                    cfg_i["rollout"]["samples_per_update"] = int(samples_per_update)
+        for _ in range(batch_size):
+            sample = next(sample_iter)
+            try:
+                loss_i, stats_i = compute_rl_loss(model, graph, noise, tokenizer, sample, cfg, device)
+            except Exception as exc:
+                print(f"[warn] skip sample {sample.get('id', '')}: {exc}", flush=True)
+                continue
+            if bool(stats_i.get("_already_backward", False)):
+                already_backward_count += 1
                 try:
-                    loss_i, stats_i = compute_rl_loss(model, graph, noise, tokenizer, sample, cfg_i, device)
-                except Exception as exc:
-                    print(f"[warn] skip sample {sample.get('id', '')}: {exc}", flush=True)
-                    continue
-                if bool(stats_i.get("_already_backward", False)):
-                    already_backward_count += 1
+                    logged_loss_values.append(float(loss_i.detach().item()))
+                except Exception:
+                    pass
+            else:
+                losses.append(loss_i)
+                try:
+                    logged_loss_values.append(float(loss_i.detach().item()))
+                except Exception:
+                    pass
+            valid += 1
+            for k in numeric_keys:
+                if k in stats_i:
                     try:
-                        logged_loss_values.append(float(loss_i.detach().item()))
+                        agg[k] += float(stats_i.get(k, 0.0))
                     except Exception:
                         pass
-                else:
-                    losses.append(loss_i)
-                    try:
-                        logged_loss_values.append(float(loss_i.detach().item()))
-                    except Exception:
-                        pass
-                valid += 1
-                for k in numeric_keys:
-                    if k in stats_i:
-                        try:
-                            agg[k] += float(stats_i.get(k, 0.0))
-                        except Exception:
-                            pass
-                debug_records.extend(stats_i.get("debug_records", []) or [])
+            debug_records.extend(stats_i.get("debug_records", []) or [])
         if not losses and valid <= 0:
             continue
 
@@ -1099,6 +749,43 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                     {"best_metric_name": best_metric_name, "best_mode": best_mode, "best_metric_value": metric_value, **row},
                 )
                 dump_json(out_dir / "best_eval.json", best_eval_info)
+
+            reward_metric_value = get_metric_value(
+                eval_info_step,
+                best_reward_metric_name,
+                get_metric_value(eval_info_step, "eval_rollout_reward", get_metric_value(row, "rollout_reward", initial_best_value(best_reward_mode))),
+            )
+            row["reward_best_metric_value"] = reward_metric_value
+            improved_reward_eval = metric_better(reward_metric_value, best_reward_metric_value, best_reward_mode)
+            row["is_best_reward_eval"] = 1.0 if improved_reward_eval else 0.0
+            if improved_reward_eval:
+                best_reward_metric_value = reward_metric_value
+                best_reward_step = step
+                best_reward_row = dict(row)
+                best_reward_eval_info = dict(eval_info_step)
+                best_reward_eval_info.update({
+                    "best_reward_metric_name": best_reward_metric_name,
+                    "best_reward_mode": best_reward_mode,
+                    "best_reward_metric_value": reward_metric_value,
+                    "best_reward_step": best_reward_step,
+                })
+                save_checkpoint(
+                    best_reward_path,
+                    model,
+                    ema,
+                    optimizer,
+                    cfg,
+                    step,
+                    {
+                        "best_metric_name": best_reward_metric_name,
+                        "best_mode": best_reward_mode,
+                        "best_metric_value": reward_metric_value,
+                        "reward_best_metric_value": reward_metric_value,
+                        **row,
+                    },
+                )
+                sync_checkpoint(best_reward_path, best_reward_legacy_path)
+                dump_json(out_dir / "best_reward_eval.json", best_reward_eval_info)
             print(
                 f"[eval step={step}] {best_metric_name}={metric_value:.6g} mode={best_mode} "
                 f"eval_loss={row['eval_loss']:.6g} evalR={row.get('eval_rollout_reward', 0.0):+.3f} "
@@ -1116,7 +803,6 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
                 eval_msg = f" eval_loss={float(row.get('eval_loss')):.4f}"
             print(
                 f"step={step} loss={row['loss']:.4f} "
-                f"batch={valid}/{samples_per_update} micro={micro_batch_size} "
                 f"target_logp={row.get('target_logp', 0.0):.4f} "
                 f"modelR={row.get('model_reward', 0.0):+.3f} "
                 f"Rstd={row.get('rollout_reward_std', 0.0):.3f} "
@@ -1135,9 +821,11 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
 
         if save_every > 0 and step % save_every == 0:
             save_checkpoint(last_path, model, ema, optimizer, cfg, step, row)
+            sync_checkpoint(last_path, last_alias_path)
 
     if not last_path.exists():
         save_checkpoint(last_path, model, ema, optimizer, cfg, steps, last_row or {"loss": float("inf")})
+    sync_checkpoint(last_path, last_alias_path)
 
     # If periodic eval was disabled or never produced a valid best, select by one final validation pass.
     if not best_path.exists():
@@ -1175,6 +863,22 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         )
         dump_json(out_dir / "best_eval.json", best_eval_info)
 
+    # If eval was disabled or no reward-best checkpoint was selected, recover a
+    # per-run best_reward.pth from the latest training checkpoint.  The selector
+    # can then still compare it against other runs instead of silently missing it.
+    if not best_reward_path.exists():
+        sync_checkpoint(last_path, best_reward_path)
+        sync_checkpoint(best_reward_path, best_reward_legacy_path)
+        best_reward_step = steps
+        best_reward_row = dict(last_row or {})
+        best_reward_eval_info = {
+            "recovered_from": str(last_path),
+            "best_reward_metric_name": best_reward_metric_name,
+            "best_reward_mode": best_reward_mode,
+            "best_reward_step": best_reward_step,
+        }
+        dump_json(out_dir / "best_reward_eval.json", best_reward_eval_info)
+
     # Evaluate the run's validation-selected best checkpoint, then compete for root global best.
     try:
         state = torch.load(best_path, map_location=device)
@@ -1198,6 +902,11 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
         "best_metric_value": best_metric_value,
+        "best_reward_step": best_reward_step,
+        "best_reward_metric_name": best_reward_metric_name,
+        "best_reward_mode": best_reward_mode,
+        "best_reward_metric_value": best_reward_metric_value,
+        "best_reward_checkpoint": str(best_reward_path),
     })
     dump_json(out_dir / "eval.json", eval_info)
 
@@ -1208,13 +917,20 @@ def train(cfg: Dict, run_name: str = "rollout_slotalign", start_name: str = "QRA
         "best_metric_name": best_metric_name,
         "best_mode": best_mode,
         "best_metric_value": best_metric_value,
+        "best_reward_step": best_reward_step,
+        "best_reward_metric_name": best_reward_metric_name,
+        "best_reward_mode": best_reward_mode,
+        "best_reward_metric_value": best_reward_metric_value,
+        "best_reward_checkpoint": str(best_reward_path),
         "last_train_loss": float(last_row.get("loss", float("inf"))) if last_row else float("inf"),
         "eval_loss": float(eval_info.get("eval_loss", float("inf"))),
         "eval_split": eval_split,
         "eval_count": int(eval_info.get("eval_count", 0)),
         "last_row": last_row,
         "best_row": best_row,
+        "best_reward_row": best_reward_row,
         "best_eval_metrics": best_eval_info,
+        "best_reward_eval_metrics": best_reward_eval_info,
         "eval_metrics": eval_info,
     }
     dump_json(out_dir / "metrics.json", metrics_json)

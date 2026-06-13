@@ -10,6 +10,8 @@ Default output:
     experiment/sample_chain/<timestamp>_<run_name>/
         trace.jsonl
         trace.log
+        chain.csv
+        chains/<sample_id>_chain.csv
         summary.json
 
 The implementation uses the same core objects as the RL pipeline:
@@ -63,66 +65,6 @@ from state_builder import (  # noqa: E402
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 
 
-# Output safety:
-# - utf-8-sig lets Windows Excel detect UTF-8 reliably when double-clicking CSV.
-# - Keep the visual square mask (□) for readability.
-# - Convert real control characters to visible literals, so a generated "\n" token
-#   appears as two characters backslash+n and never breaks one CSV record into two rows.
-CSV_ENCODING = "utf-8-sig"
-VISIBLE_MASK = "□"
-
-
-def visible_text(value: object) -> str:
-    """Return a display-safe string for CSV/Markdown/log output.
-
-    This preserves ordinary text, but makes control characters visible:
-      real newline -> "\\n"
-      real tab     -> "\\t"
-      real CR      -> "\\r"
-      other control chars -> "\\xNN"
-    It keeps the Unicode square mask (□), relying on UTF-8-BOM CSV output for Excel.
-    """
-    if value is None:
-        return ""
-    s = str(value)
-    # Keep the visual square mask. Do not rewrite it to [MASK].
-    out: List[str] = []
-    for ch in s:
-        o = ord(ch)
-        if ch == "\n":
-            out.append(r"\n")
-        elif ch == "\r":
-            out.append(r"\r")
-        elif ch == "\t":
-            out.append(r"\t")
-        elif ch == "\f":
-            out.append(r"\f")
-        elif ch == "\v":
-            out.append(r"\v")
-        elif o < 32 or o == 127:
-            out.append(f"\\x{o:02x}")
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-def visible_obj(obj: Any) -> Any:
-    """Recursively sanitize strings while preserving JSON/list/dict structure."""
-    if isinstance(obj, str) or obj is None:
-        return visible_text(obj)
-    if isinstance(obj, dict):
-        return {str(k): visible_obj(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [visible_obj(v) for v in obj]
-    return obj
-
-
-def csv_cell(value: Any) -> str:
-    if isinstance(value, (dict, list, tuple)):
-        return json.dumps(visible_obj(value), ensure_ascii=False)
-    return visible_text(value)
-
-
 # ----------------------------- basic utilities -----------------------------
 
 def load_config(path: str | Path) -> Dict[str, Any]:
@@ -143,7 +85,43 @@ def dump_json(path: Path, obj: Any) -> None:
 def append_jsonl(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(visible_obj(obj), ensure_ascii=False) + "\n")
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def safe_name(text: str, fallback: str = "sample") -> str:
+    s = str(text or fallback)
+    s = re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
+    return s[:120] or fallback
+
+
+def make_control_chars_visible(value: object) -> str:
+    """Make generated text safe for one-line CSV/log display.
+
+    We keep the visual mask square (□), but render real control characters as
+    literal escape sequences.  Thus a generated newline is shown as the two
+    characters \n instead of splitting the CSV row in VSCode/Excel.
+    """
+    text = str(value if value is not None else "")
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if ch == "\n":
+            out.append(r"\n")
+        elif ch == "\r":
+            out.append(r"\r")
+        elif ch == "\t":
+            out.append(r"\t")
+        elif code < 32 or code == 127:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def csv_cell(value: object) -> str:
+    if isinstance(value, (list, dict, tuple)):
+        value = json.dumps(value, ensure_ascii=False)
+    return make_control_chars_visible(value)
 
 
 def set_seed(seed: int) -> None:
@@ -394,12 +372,12 @@ def visible_answer_tokens(
     for tok in ids:
         ti = int(tok)
         if ti == int(mask_id) or ti < 0 or ti >= vocab_size:
-            pieces.append(VISIBLE_MASK)
-            token_texts.append(VISIBLE_MASK)
+            txt = "□"
         else:
-            txt = visible_text(tokenizer.decode([ti]))
-            pieces.append(txt)
-            token_texts.append(txt)
+            txt = tokenizer.decode([ti])
+        txt = make_control_chars_visible(txt)
+        pieces.append(txt)
+        token_texts.append(txt)
     return "".join(pieces), token_texts
 
 
@@ -466,7 +444,7 @@ def topk_for_positions(
             if token_id < 0 or token_id >= vocab_size:
                 token = "[MASK/OUT]"
             else:
-                token = visible_text(tokenizer.decode([token_id]))
+                token = make_control_chars_visible(tokenizer.decode([token_id]))
             rows.append({"token_id": token_id, "token": token, "prob": float(v)})
         out.append({"position": int(pos), "topk": rows})
     return out
@@ -609,33 +587,31 @@ def trace_one_sample(
     }
 
 
+# ------------------------------- CSV output --------------------------------
 
-# -------------------------------- CSV output --------------------------------
-
-CHAIN_CSV_FIELDS = [
-    "model", "sample_index", "sample_id", "answer_kind", "gt_answer",
-    "step", "t", "answer_text", "exact_text_match", "exact_token_match",
+CHAIN_FIELDS = [
+    "sample_index", "sample_id", "answer_kind", "model", "step", "t",
+    "answer", "gt_answer", "exact_text_match", "exact_token_match",
     "mask_count", "filled_ratio", "position_match", "token_set_match",
     "stage_score", "stage_score_delta", "changed_answer_indices",
     "answer_token_texts", "answer_token_ids", "gt_answer_token_ids",
 ]
 
 
-def trace_to_csv_rows(result: Dict[str, Any], sample_index: int) -> List[Dict[str, Any]]:
+def result_to_chain_rows(result: Dict[str, Any], sample_index: int) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    gt_answer = visible_text(result.get("gt_answer", ""))
-    gt_norm = normalize_text(str(result.get("gt_answer", "")))
-    for tr in result.get("trace") or []:
-        ans = visible_text(tr.get("answer_text", ""))
+    gt_norm = normalize_text(result.get("gt_answer", ""))
+    for tr in result.get("trace", []) or []:
+        ans = str(tr.get("answer_text", ""))
         rows.append({
-            "model": result.get("model", ""),
-            "sample_index": int(sample_index),
+            "sample_index": sample_index,
             "sample_id": result.get("sample_id", ""),
             "answer_kind": result.get("answer_kind", ""),
-            "gt_answer": gt_answer,
-            "step": int(tr.get("step", 0)),
+            "model": result.get("model", ""),
+            "step": tr.get("step", ""),
             "t": f"{float(tr.get('t', 0.0)):.6f}",
-            "answer_text": ans,
+            "answer": ans,
+            "gt_answer": result.get("gt_answer", ""),
             "exact_text_match": 1 if normalize_text(ans) == gt_norm else 0,
             "exact_token_match": int(float(tr.get("exact_token_match", 0.0))),
             "mask_count": int(float(tr.get("mask_count", 0.0))),
@@ -652,9 +628,9 @@ def trace_to_csv_rows(result: Dict[str, Any], sample_index: int) -> List[Dict[st
     return rows
 
 
-def write_csv(path: Path, rows: List[Dict[str, Any]], fields: Sequence[str] = CHAIN_CSV_FIELDS) -> None:
+def write_csv(path: Path, rows: List[Dict[str, Any]], fields: Sequence[str] = CHAIN_FIELDS) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding=CSV_ENCODING, newline="") as f:
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=list(fields),
@@ -666,8 +642,7 @@ def write_csv(path: Path, rows: List[Dict[str, Any]], fields: Sequence[str] = CH
             writer.writerow({k: csv_cell(row.get(k, "")) for k in fields})
 
 
-
-# ------------------------------- markdown ----------------------------------
+# ------------------------------- markdown/log ------------------------------
 
 def short(s: str, n: int = 900) -> str:
     s = str(s or "")
@@ -676,19 +651,19 @@ def short(s: str, n: int = 900) -> str:
 
 def trace_to_markdown(result: Dict[str, Any], stride: int = 1) -> str:
     lines = []
-    lines.append(f"## {visible_text(result['model'])} | {visible_text(result['sample_id'])} | {visible_text(result['answer_kind'])}")
+    lines.append(f"## {result['model']} | {result['sample_id']} | {result['answer_kind']}")
     lines.append("")
-    lines.append(f"**GT answer:** `{visible_text(result['gt_answer'])}`")
+    lines.append(f"**GT answer:** `{result['gt_answer']}`")
     lines.append("")
     if result.get("question"):
         lines.append("**Question:**")
         lines.append("")
-        lines.append(short(visible_text(result["question"]), 700))
+        lines.append(short(result["question"], 700))
         lines.append("")
     if result.get("reasoning"):
         lines.append("**Reasoning excerpt:**")
         lines.append("")
-        lines.append(short(visible_text(result["reasoning"]), 1000))
+        lines.append(short(result["reasoning"], 1000))
         lines.append("")
 
     lines.append("| step | t | answer state | masks | pos_match | token_set | exact | stage_score | Δscore | changed |")
@@ -696,7 +671,7 @@ def trace_to_markdown(result: Dict[str, Any], stride: int = 1) -> str:
     for row in result["trace"]:
         if int(row["step"]) % max(1, stride) != 0 and int(row["step"]) != int(result["num_steps"]):
             continue
-        ans = visible_text(row["answer_text"]).replace("|", "\\|")
+        ans = str(row["answer_text"]).replace("|", "\\|")
         if len(ans) > 160:
             ans = ans[:157] + "..."
         lines.append(
@@ -720,9 +695,9 @@ def trace_to_markdown(result: Dict[str, Any], stride: int = 1) -> str:
         topk = row.get("topk_before_transition") or []
         if not topk:
             continue
-        lines.append(f"- step={row['step']} t={row['t']:.3f} answer=`{visible_text(row['answer_text']).replace('`', '')}`")
+        lines.append(f"- step={row['step']} t={row['t']:.3f} answer=`{str(row['answer_text']).replace('`', '')}`")
         for item in topk[:3]:
-            toks = ", ".join([f"{visible_text(x['token'])!r}:{x['prob']:.3g}" for x in item.get("topk", [])])
+            toks = ", ".join([f"{x['token']!r}:{x['prob']:.3g}" for x in item.get("topk", [])])
             lines.append(f"  - pos {item['position']}: {toks}")
     lines.append("\n")
     return "\n".join(lines)
@@ -754,7 +729,7 @@ def main() -> None:
     parser.add_argument("--freeze-filled", action="store_true", help="Diagnostic monotonic-fill mode; not true SEDD reverse chain.")
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--max-topk-positions", type=int, default=4)
-    parser.add_argument("--md-stride", type=int, default=1, help="Only print every N trace rows in trace.log.")
+    parser.add_argument("--md-stride", type=int, default=1, help="Only print every N trace rows in markdown.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -805,7 +780,7 @@ def main() -> None:
 
     all_log = ["# SEDD QRA sample-chain trace", "", f"Output dir: `{out_dir}`", ""]
     all_csv_rows: List[Dict[str, Any]] = []
-    csv_rows_by_sample: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    rows_by_sample: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for model_name, ckpt_path in ckpts:
         print(f"[trace] loading {model_name}: {ckpt_path}", flush=True)
         model, graph, noise = load_model_for_trace(cfg, ckpt_path, device)
@@ -826,12 +801,12 @@ def main() -> None:
                     print(f"[warn] failed sample {sample.get('id','')}: {exc}", flush=True)
                 append_jsonl(trace_jsonl, res)
                 if "trace" in res:
-                    csv_rows = trace_to_csv_rows(res, i + 1)
+                    csv_rows = result_to_chain_rows(res, sample_index=i + 1)
                     all_csv_rows.extend(csv_rows)
-                    csv_rows_by_sample[str(res.get("sample_id", sample.get("id", "")))].extend(csv_rows)
+                    rows_by_sample[str(res.get("sample_id", sample.get("id", f"sample_{i+1}")))].extend(csv_rows)
                     all_log.append(trace_to_markdown(res, stride=int(args.md_stride)))
                 else:
-                    all_log.append(f"## {visible_text(model_name)} | {visible_text(res.get('sample_id'))}\n\nERROR: `{visible_text(res.get('error'))}`\n")
+                    all_md.append(f"## {model_name} | {res.get('sample_id')}\n\nERROR: `{res.get('error')}`\n")
         finally:
             del model, graph, noise
             gc.collect()
@@ -839,13 +814,13 @@ def main() -> None:
                 torch.cuda.empty_cache()
 
     write_csv(chain_csv, all_csv_rows)
-    for sid, rows in csv_rows_by_sample.items():
-        safe_sid = safe_name(sid, 'sample')
-        write_csv(chains_dir / f"{safe_sid}_chain.csv", rows)
+    for sid, rows in rows_by_sample.items():
+        write_csv(chains_dir / f"{safe_name(sid, 'sample')}_chain.csv", rows)
     trace_log.write_text("\n".join(all_log), encoding="utf-8-sig")
     print(f"[trace] wrote {trace_jsonl}", flush=True)
-    print(f"[trace] wrote {trace_log}", flush=True)
     print(f"[trace] wrote {chain_csv}", flush=True)
+    print(f"[trace] wrote {chains_dir}/<sample_id>_chain.csv", flush=True)
+    print(f"[trace] wrote {trace_log}", flush=True)
 
 
 if __name__ == "__main__":
