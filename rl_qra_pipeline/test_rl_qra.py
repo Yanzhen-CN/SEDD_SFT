@@ -3,8 +3,8 @@ from __future__ import annotations
 """Evaluate RL-QRA checkpoints on the test set.
 
 Default comparison models are exactly six:
-    pretrain_start, pretrain_loss_best, pretrain_reward_best,
-    QRA_start, QRA_loss_best, QRA_reward_best
+    pretrain_start, pretrain_mini_loss_best, pretrain_reward_best,
+    QRA_start, QRA_mini_loss_best, QRA_reward_best
 
 Outputs are written under:
     rl_qra_pipeline/modelparameter/test_result/
@@ -56,10 +56,10 @@ from train_rl_qra import (  # noqa: E402
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 DEFAULT_MODELS = [
     "pretrain_start",
-    "pretrain_loss_best",
+    "pretrain_mini_loss_best",
     "pretrain_reward_best",
     "QRA_start",
-    "QRA_loss_best",
+    "QRA_mini_loss_best",
     "QRA_reward_best",
 ]
 DEFAULT_OUT_DIR = SCRIPT_DIR / "modelparameter" / "test_result"
@@ -157,9 +157,9 @@ def resolve_model_plan(cfg: Dict[str, Any], model_names: Sequence[str]) -> List[
             continue
 
         pre_root = start_output_dir(cfg, "pretrain")
-        if name_l in {"pretrain_loss_best", "rl_pretrain", "rl_pretrain_best"}:
+        if name_l in {"pretrain_mini_loss_best", "rl_pretrain", "rl_pretrain_best"}:
             specs.append({
-                "name": "pretrain_loss_best",
+                "name": "pretrain_mini_loss_best",
                 "checkpoint": pre_root / "best.pth",
                 "pretrained": model_pretrained_name(cfg, "pretrain"),
                 "source": "rl_root_loss_best",
@@ -188,9 +188,9 @@ def resolve_model_plan(cfg: Dict[str, Any], model_names: Sequence[str]) -> List[
             continue
 
         qra_root = start_output_dir(cfg, "QRA")
-        if name_l in {"qra_loss_best", "rl_qra", "rl_qra_best"}:
+        if name_l in {"qra_mini_loss_best", "rl_qra", "rl_qra_best"}:
             specs.append({
-                "name": "QRA_loss_best",
+                "name": "QRA_mini_loss_best",
                 "checkpoint": qra_root / "best.pth",
                 "pretrained": model_pretrained_name(cfg, "QRA"),
                 "source": "rl_root_loss_best",

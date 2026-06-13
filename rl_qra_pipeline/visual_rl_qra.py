@@ -8,12 +8,8 @@ Outputs:
    - per-group reward curves
    - per-group combined loss/reward overlay with twin y-axes
 2. Test comparison plots from modelparameter/test_result/test_rl_qra.csv
-   - test loss bar chart with pretrain/QRA start baselines
-   - test reward bar chart with pretrain/QRA start baselines
-
-The combined plots are meant to make the reward/loss tradeoff visible.
-Separate training loss-only/reward-only plots are intentionally not generated,
-so the output stays compact and comparison-focused.
+   - test loss bar chart with pretrain/QRA start baselines and reward_best loss lines
+   - test reward bar chart with pretrain/QRA start baselines and reward_best reward lines
 """
 
 import argparse
@@ -57,7 +53,6 @@ MARKERS = ["", "o", "s", "^"]
 def read_csv(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
-    # utf-8-sig handles files written for Excel compatibility.
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
 
@@ -110,7 +105,6 @@ def collect_metric_files(run_root: Path) -> List[Tuple[str, Path]]:
 
 
 def choose_metric_series(rows: List[Dict[str, str]], preferred: Sequence[str]) -> Tuple[str, List[Tuple[float, float]]]:
-    """Return the first available metric series from a preference list."""
     for metric in preferred:
         pts: List[Tuple[float, float]] = []
         for i, row in enumerate(rows):
@@ -131,7 +125,6 @@ def plot_group_overlay(
     title: str,
     ylabel: str,
 ) -> bool:
-    """One compact curve plot per RL group for one metric family."""
     plotted = False
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(9, 5))
@@ -164,12 +157,6 @@ def plot_group_loss_reward_overlay(
     out_path: Path,
     title: str,
 ) -> bool:
-    """Plot loss and reward in one figure with twin y-axes.
-
-    Loss is always blue and reward is always orange.  Multiple runs are
-    distinguished only by linestyle/marker, so the visual comparison stays
-    obvious: blue curve family = loss, orange curve family = reward.
-    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax_loss = plt.subplots(figsize=(10.8, 5.8))
     ax_reward = ax_loss.twinx()
@@ -238,6 +225,7 @@ def plot_group_loss_reward_overlay(
     plt.close(fig)
     return True
 
+
 def summarize_metric_file(run_name: str, path: Path) -> Dict[str, object]:
     rows = read_csv(path)
     summary: Dict[str, object] = {"run": run_name, "metrics_path": str(path), "rows": len(rows), "run_dir": str(path.parent)}
@@ -297,15 +285,12 @@ def group_name_from_root(run_root: Path) -> str:
 
 
 def visualize_training(run_roots: Sequence[Path], out_dir: Path) -> List[Dict[str, object]]:
-    """Visualize both RL groups by default: rl_pretrain and rl_QRA."""
     summaries: List[Dict[str, object]] = []
     loss_preferred = ["full_eval_loss", "eval_loss", "loss"]
     reward_preferred = ["full_eval_rollout_reward", "eval_rollout_reward", "rollout_reward", "reward_best_metric_value"]
 
     for run_root in run_roots:
         group = group_name_from_root(run_root)
-        # Remove stale separate training plots from older visualizer versions.
-        # This keeps the output directory focused on the combined comparison plot.
         for stale in (out_dir / f"{group}_loss.png", out_dir / f"{group}_reward.png"):
             try:
                 stale.unlink()
@@ -354,7 +339,16 @@ def find_baseline_values(rows: List[Dict[str, str]], metric: str) -> Dict[str, f
     return baselines
 
 
-def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title: str, ylabel: str, higher_better: bool) -> bool:
+def plot_test_bar(
+    rows: List[Dict[str, str]],
+    metric: str,
+    out_path: Path,
+    title: str,
+    ylabel: str,
+    higher_better: bool,
+    extra_hlines: Optional[List[Tuple[str, float, str, str]]] = None,  # (label, value, color, linestyle)
+) -> bool:
+    """Draw test bar chart; optionally add extra horizontal lines with custom colors."""
     pairs = []
     for r in rows:
         if str(r.get("status", "ok")) not in {"", "ok"}:
@@ -385,17 +379,22 @@ def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title
     baseline_values = find_baseline_values(rows, metric)
     baseline_style = {
         "pretrain start": (PRETRAIN_COLOR, "--"),
-        "QRA start": (QRA_COLOR, "-.")
+        "QRA start": (QRA_COLOR, "-."),
     }
     for name, value in baseline_values.items():
         color, linestyle = baseline_style.get(name, ("0.3", ":"))
         plt.axhline(value, color=color, linestyle=linestyle, linewidth=1.4, label=f"{name}: {value:.4g}")
 
+    if extra_hlines:
+        for label, value, color, linestyle in extra_hlines:
+            if value is not None:
+                plt.axhline(value, color=color, linestyle=linestyle, linewidth=1.2, label=f"{label}: {value:.4g}")
+
     plt.xticks(rotation=25, ha="right")
     plt.ylabel(ylabel)
     direction = "higher is better" if higher_better else "lower is better"
     plt.title(f"{title} ({direction})")
-    if baseline_values:
+    if baseline_values or extra_hlines:
         plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(out_path, dpi=180)
@@ -403,57 +402,9 @@ def plot_test_bar(rows: List[Dict[str, str]], metric: str, out_path: Path, title
     return True
 
 
-def plot_test_loss_reward_pair(rows: List[Dict[str, str]], out_path: Path) -> bool:
-    valid = [r for r in rows if str(r.get("status", "ok")) in {"", "ok"}]
-    pairs = []
-    for r in valid:
-        loss = to_float(r.get("test_loss"))
-        reward = to_float(r.get("test_rollout_reward"))
-        if loss is None and reward is None:
-            continue
-        pairs.append((str(r.get("model", "model")), loss, reward))
-    if not pairs:
-        return False
-
-    labels = [p[0] for p in pairs]
-    xs = list(range(len(labels)))
-    width = 0.38
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax_loss = plt.subplots(figsize=(11, 5.4))
-    ax_reward = ax_loss.twinx()
-
-    loss_vals = [0.0 if p[1] is None else p[1] for p in pairs]
-    reward_vals = [0.0 if p[2] is None else p[2] for p in pairs]
-    ax_loss.bar([x - width / 2 for x in xs], loss_vals, width=width, color=LOSS_COLOR, alpha=0.82, label="test_loss")
-    ax_reward.bar([x + width / 2 for x in xs], reward_vals, width=width, color=REWARD_COLOR, alpha=0.72, label="test_rollout_reward")
-
-    for metric, axis, style_map in [
-        ("test_loss", ax_loss, {"pretrain start": (PRETRAIN_COLOR, "--"), "QRA start": (QRA_COLOR, "-.")}),
-        ("test_rollout_reward", ax_reward, {"pretrain start": (PRETRAIN_COLOR, ":"), "QRA start": (QRA_COLOR, ":")}),
-    ]:
-        for name, value in find_baseline_values(rows, metric).items():
-            color, linestyle = style_map.get(name, ("0.3", ":"))
-            axis.axhline(value, color=color, linestyle=linestyle, linewidth=1.1, label=f"{name} {metric}: {value:.4g}")
-
-    ax_loss.set_xticks(xs)
-    ax_loss.set_xticklabels(labels, rotation=25, ha="right")
-    ax_loss.set_ylabel("test loss")
-    ax_reward.set_ylabel("test rollout reward")
-    ax_loss.set_title("Test loss and reward comparison")
-    h1, l1 = ax_loss.get_legend_handles_labels()
-    h2, l2 = ax_reward.get_legend_handles_labels()
-    ax_loss.legend(h1 + h2, l1 + l2, fontsize=7, loc="best")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=180)
-    plt.close(fig)
-    return True
-
-
 def visualize_test_results(test_result_dir: Path, out_dir: Path) -> Dict[str, object]:
     csv_path = test_result_dir / "test_rl_qra.csv"
     rows = read_csv(csv_path)
-    # Backward compatibility only: old temporary script wrote test_rl_qa.csv.
-    # New workflow should run test_rl_qra.py and produce test_rl_qra.csv.
     if not rows:
         legacy = test_result_dir / "test_rl_qa.csv"
         legacy_rows = read_csv(legacy)
@@ -463,12 +414,65 @@ def visualize_test_results(test_result_dir: Path, out_dir: Path) -> Dict[str, ob
     summary: Dict[str, object] = {"test_result_csv": str(csv_path), "rows": len(rows)}
     if not rows:
         return summary
-    plot_test_bar(rows, "test_loss", out_dir / "test_loss_compare.png", "Test set loss comparison", "test loss", higher_better=False)
-    plot_test_bar(rows, "test_rollout_reward", out_dir / "test_reward_compare.png", "Test set rollout reward comparison", "test rollout reward", higher_better=True)
-    plot_test_loss_reward_pair(rows, out_dir / "test_all_compare.png")
+
+    valid_rows = [r for r in rows if str(r.get("status", "ok")) in {"", "ok"}]
+    pretrain_rows = [r for r in valid_rows if model_family(r.get("model", "")) == "pretrain"]
+    qra_rows = [r for r in valid_rows if model_family(r.get("model", "")) == "QRA"]
+
+    # Find best reward (max test_rollout_reward) for each family
+    pretrain_best_reward_loss = None
+    qra_best_reward_loss = None
+    pretrain_best_reward_value = None
+    qra_best_reward_value = None
+
+    if pretrain_rows:
+        best = max(pretrain_rows, key=lambda r: to_float(r.get("test_rollout_reward")) or -float("inf"))
+        pretrain_best_reward_loss = to_float(best.get("test_loss"))
+        pretrain_best_reward_value = to_float(best.get("test_rollout_reward"))
+    if qra_rows:
+        best = max(qra_rows, key=lambda r: to_float(r.get("test_rollout_reward")) or -float("inf"))
+        qra_best_reward_loss = to_float(best.get("test_loss"))
+        qra_best_reward_value = to_float(best.get("test_rollout_reward"))
+
+    # Build extra lines for loss plot: (label, value, color, linestyle)
+    extra_loss_lines = []
+    if pretrain_best_reward_loss is not None:
+        extra_loss_lines.append(("pretrain best reward loss", pretrain_best_reward_loss, PRETRAIN_COLOR, ":"))
+    if qra_best_reward_loss is not None:
+        extra_loss_lines.append(("QRA best reward loss", qra_best_reward_loss, QRA_COLOR, ":"))
+
+    # Build extra lines for reward plot: (label, value, color, linestyle)
+    extra_reward_lines = []
+    if pretrain_best_reward_value is not None:
+        extra_reward_lines.append(("pretrain best reward", pretrain_best_reward_value, PRETRAIN_COLOR, ":"))
+    if qra_best_reward_value is not None:
+        extra_reward_lines.append(("QRA best reward", qra_best_reward_value, QRA_COLOR, ":"))
+
+    # Loss bar chart
+    plot_test_bar(
+        rows,
+        "test_loss",
+        out_dir / "test_loss_compare.png",
+        "Test set loss comparison",
+        "test loss",
+        higher_better=False,
+        extra_hlines=extra_loss_lines,
+    )
+
+    # Reward bar chart
+    plot_test_bar(
+        rows,
+        "test_rollout_reward",
+        out_dir / "test_reward_compare.png",
+        "Test set rollout reward comparison",
+        "test rollout reward",
+        higher_better=True,
+        extra_hlines=extra_reward_lines,
+    )
+
     write_summary([{k: v for k, v in r.items()} for r in rows], out_dir / "test_summary.csv")
     (out_dir / "test_summary.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-    # compact winners
+
     valid = [r for r in rows if str(r.get("status", "ok")) in {"", "ok"}]
     if valid:
         best_loss = min(valid, key=lambda r: to_float(r.get("test_loss")) if to_float(r.get("test_loss")) is not None else float("inf"))
@@ -509,7 +513,6 @@ def main() -> None:
             "rl_QRA_loss_reward_overlay.png",
             "test_loss_compare.png",
             "test_reward_compare.png",
-            "test_loss_reward_compare.png",
         ],
     }
     (out_dir / "visual_summary.json").write_text(json.dumps(final, ensure_ascii=False, indent=2), encoding="utf-8")
