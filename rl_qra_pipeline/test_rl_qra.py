@@ -3,8 +3,8 @@ from __future__ import annotations
 """Evaluate RL-QRA checkpoints on the test set.
 
 Default comparison models are exactly six:
-    pretrain_start, pretrain_mini_loss_best, pretrain_reward_best,
-    QRA_start, QRA_mini_loss_best, QRA_reward_best
+    pretrain, pretrain_mini_loss_best, pretrain_reward_best,
+    QRA, QRA_mini_loss_best, QRA_reward_best
 
 Outputs are written under:
     rl_qra_pipeline/modelparameter/test_result/
@@ -55,10 +55,10 @@ from train_rl_qra import (  # noqa: E402
 
 DEFAULT_CONFIG = SCRIPT_DIR / "rl_qra_config.yaml"
 DEFAULT_MODELS = [
-    "pretrain_start",
+    "pretrain",
     "pretrain_mini_loss_best",
     "pretrain_reward_best",
-    "QRA_start",
+    "QRA",
     "QRA_mini_loss_best",
     "QRA_reward_best",
 ]
@@ -148,7 +148,7 @@ def resolve_model_plan(cfg: Dict[str, Any], model_names: Sequence[str]) -> List[
 
         if name_l in {"pretrain", "pretrain_start", "start_pretrain"}:
             specs.append({
-                "name": "pretrain_start",
+                "name": "pretrain",
                 "checkpoint": None,
                 "pretrained": model_pretrained_name(cfg, "pretrain"),
                 "source": "start_pretrained_or_cache",
@@ -157,7 +157,7 @@ def resolve_model_plan(cfg: Dict[str, Any], model_names: Sequence[str]) -> List[
             continue
 
         pre_root = start_output_dir(cfg, "pretrain")
-        if name_l in {"pretrain_mini_loss_best", "rl_pretrain", "rl_pretrain_best"}:
+        if name_l in {"pretrain_mini_loss_best", "pretrain_loss_best", "rl_pretrain", "rl_pretrain_best"}:
             specs.append({
                 "name": "pretrain_mini_loss_best",
                 "checkpoint": pre_root / "best.pth",
@@ -179,7 +179,7 @@ def resolve_model_plan(cfg: Dict[str, Any], model_names: Sequence[str]) -> List[
 
         if name_l in {"qra", "qra_start", "start_qra"}:
             specs.append({
-                "name": "QRA_start",
+                "name": "QRA",
                 "checkpoint": init_checkpoint_path(cfg, "QRA"),
                 "pretrained": model_pretrained_name(cfg, "QRA"),
                 "source": "start_init_checkpoint",
@@ -188,7 +188,7 @@ def resolve_model_plan(cfg: Dict[str, Any], model_names: Sequence[str]) -> List[
             continue
 
         qra_root = start_output_dir(cfg, "QRA")
-        if name_l in {"qra_mini_loss_best", "rl_qra", "rl_qra_best"}:
+        if name_l in {"qra_mini_loss_best", "qra_loss_best", "rl_qra", "rl_qra_best"}:
             specs.append({
                 "name": "QRA_mini_loss_best",
                 "checkpoint": qra_root / "best.pth",
